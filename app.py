@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
 st.set_page_config(page_title="Faisal Screener", page_icon="🎯", layout="wide")
 
-PROXY_URL = "https://turki-proxy.onrender.com"
+PROXY_URL = "https://stock-8i7g.onrender.com"
 FINNHUB_KEY = "demn1c9r01qnf8fq7jc0demn1c9r01qnf8fq7jcg"
 
 st.markdown("""
@@ -20,51 +20,48 @@ h1,h2,h3 { direction: rtl; text-align: right; }
 .info-box { background: #e8f4f8; padding: 12px; border-radius: 8px; margin: 8px 0; border-right: 4px solid #0984e3; }
 .warn-box { background: #fff3cd; padding: 12px; border-radius: 8px; margin: 8px 0; border-right: 4px solid #fdcb6e; }
 .success-box { background: #d4edda; padding: 12px; border-radius: 8px; margin: 8px 0; border-right: 4px solid #00b894; }
+.danger-box { background: #f8d7da; padding: 12px; border-radius: 8px; margin: 8px 0; border-right: 4px solid #d63031; }
+.split-box { background: #ffe5e5; padding: 12px; border-radius: 8px; margin: 8px 0; border-right: 4px solid #d63031; }
+a { color: #0984e3; text-decoration: none; }
+a:hover { text-decoration: underline; }
 </style>
 """, unsafe_allow_html=True)
 
 LOCAL_UNIVERSE = [
-    "AEMD", "AKAN", "LFS", "GDHG", "BJDX", "DXST", "VSME", "CLIK",
-    "DGHG", "CPOP", "HTCR", "MBRX", "MWC", "NXTS", "SVRE", "YYAI",
-    "BFRG", "BIAF", "BNKK", "CDTG", "SHPH", "SONN", "TNXP", "PHIO",
-    "SNPX", "AVGR", "BDRX", "BIOR", "CLRB", "CRKN", "CYTX", "DTSS",
-    "EEIQ", "ELAB", "EVGN", "EYEN", "FWBI", "GCTK", "GNPX", "HCDI",
-    "HILS", "HOTH", "IMCC", "INBS", "INDP", "IPDN", "IVDA", "JWEL",
-    "KITT", "KRKR", "LGMK", "LGVN", "LUCY", "LUXH", "MEGL", "MLGO",
-    "MNPR", "MRIN", "MTNB", "MYNZ", "NEXI", "NITO", "NKGN", "NUKK",
-    "NVOS", "OMQS", "ONCO", "OPGN", "OPTT", "PAVM", "PHGE", "PLRX",
-    "PMN", "PRFX", "PRST", "PXMD", "QNRX", "RDHL", "RIME", "RKDA",
-    "RSLS", "SBFM", "SCPX", "SEEL", "SGBX", "SLXN", "SNDL", "SOBR",
-    "SPRB", "STAF", "STI", "SXTP", "SYRA", "TCON", "TCRT", "THMO",
-    "TIVC", "TNON", "TOMZ", "TRNR", "TRVN", "TSBX", "UPC", "USEG",
-    "VBIV", "VERO", "VINO", "VIRI", "VRPX", "VTVT", "WATT", "WISA",
-    "WKEY", "XELB", "XERS", "XLO", "XRTX", "YCBD", "ZAPP", "ZCMD",
-    "ZJYL", "SOPA", "PRSO", "ELYM", "ALLR", "AGRI", "ALZN", "AMST",
-    "APRE", "AUID", "AUUD", "AVTX", "AXLA", "BCDA", "BCLI", "BEAT",
-    "BIVI", "BLBX", "BMEA", "BNOX", "BOLT", "BRTX", "BTBT", "BTCS",
-    "BTTR", "BYSI", "CANF", "CARV", "CASI", "CBIH", "CCCC", "CELZ",
-    "CFRX", "CGEN", "CHRS", "CLVR", "CNTB", "CNTX", "COCP", "COEP",
-    "CRBP", "CREX", "CRGE", "CTSO", "CUEN", "CVKD", "CVM", "CYCC",
-    "CYTO", "DBGI", "DCTH", "DFLI", "DMAC", "DRMA", "DRRX", "EFTR",
-    "EIGR", "ELDN", "ENG", "ENSC", "EPIX", "ERNA", "EVFM", "EVLO",
-    "EXPR", "FBRX", "FFIE", "FGEN", "FHTX", "FLGC", "FPAY", "FRES",
-    "FREQ", "FRGE", "GANX", "GENE", "GHSI", "GLMD", "GLTO", "GMBL",
-    "GOVX", "GRNA", "GRTS", "GTBP", "GTHX", "HCWB", "HGEN", "HOLO",
-    "HOOK", "HOWL", "HPCO", "ICCM", "ICU", "IGC", "IMNN", "IMPL",
-    "IMRX", "INAB", "INCR", "INM", "INOD", "INVO", "IPHA", "IPSC",
-    "ISPC", "ISUN", "JAGX", "JSPR", "KALA", "KAVL", "KERN", "KPRX",
-    "KRON", "KTRA", "KTTA", "LASE", "LBPH", "LCTX", "LFLY", "LIPO",
-    "LIXT", "LNSR", "LPTH", "LPTX", "LRMR", "LSTA", "LTBR", "LTRN",
-    "LUNR", "LVLU", "LVO", "LXEO", "LYEL", "LYRA", "MAIA", "MBIO",
-    "MBOT", "MDGL", "MDNA", "MEIP", "METX", "MGRM", "MIGI", "MIST",
-    "MKUL", "MNOV", "MOVE", "MPLN", "MRKR", "MRM", "MTEM", "MURA",
-    "MYMD", "NAOV", "NBRV", "NCPL", "NDRA", "NKLA", "NKTR", "NLSP",
-    "NMTR", "NRIX", "NSYS", "NURO", "NUVB", "NVAX", "NVIV", "NVNO",
-    "NXGL", "NXTC", "OBLG", "OCEA", "OCGN", "OCUL", "OGEN", "OGI",
-    "OMER", "OMGA", "ONCT", "ONCY", "ONVO", "ORGN", "ORGS", "ORMP",
-    "OTLK", "OTMO", "OTRK", "PALI", "PASG", "PBLA", "PCSA", "PDSB",
-    "PEV", "PIRS", "PLAB",
+    "AEMD","AKAN","LFS","GDHG","BJDX","DXST","VSME","CLIK","DGHG","CPOP",
+    "HTCR","MBRX","MWC","NXTS","SVRE","YYAI","BFRG","BIAF","BNKK","CDTG",
+    "SHPH","SONN","TNXP","PHIO","SNPX","AVGR","BDRX","BIOR","CLRB","CRKN",
+    "CYTX","DTSS","EEIQ","ELAB","EVGN","EYEN","FWBI","GCTK","GNPX","HCDI",
+    "HILS","HOTH","IMCC","INBS","INDP","IPDN","IVDA","JWEL","KITT","KRKR",
+    "LGMK","LGVN","LUCY","LUXH","MEGL","MLGO","MNPR","MRIN","MTNB","MYNZ",
+    "NEXI","NITO","NKGN","NUKK","NVOS","OMQS","ONCO","OPGN","OPTT","PAVM",
+    "PHGE","PLRX","PMN","PRFX","PRST","PXMD","QNRX","RDHL","RIME","RKDA",
+    "RSLS","SBFM","SCPX","SEEL","SGBX","SLXN","SNDL","SOBR","SPRB","STAF",
+    "STI","SXTP","SYRA","TCON","TCRT","THMO","TIVC","TNON","TOMZ","TRNR",
+    "TRVN","TSBX","UPC","USEG","VBIV","VERO","VINO","VIRI","VRPX","VTVT",
+    "WATT","WISA","WKEY","XELB","XERS","XLO","XRTX","YCBD","ZAPP","ZCMD",
+    "ZJYL","SOPA","PRSO","ELYM","ALLR","AGRI","ALZN","AMST","APRE","AUID",
+    "AUUD","AVTX","AXLA","BCDA","BCLI","BEAT","BIVI","BLBX","BMEA","BNOX",
+    "BOLT","BRTX","BTBT","BTCS","BTTR","BYSI","CANF","CARV","CASI","CBIH",
+    "CCCC","CELZ","CFRX","CGEN","CHRS","CLVR","CNTB","CNTX","COCP","COEP",
+    "CRBP","CREX","CRGE","CTSO","CUEN","CVKD","CVM","CYCC","CYTO","DBGI",
+    "DCTH","DFLI","DMAC","DRMA","DRRX","EFTR","EIGR","ELDN","ENG","ENSC",
+    "EPIX","ERNA","EVFM","EVLO","EXPR","FBRX","FGEN","FHTX","FLGC","FPAY",
+    "FRES","FREQ","FRGE","GANX","GENE","GHSI","GLMD","GLTO","GMBL","GOVX",
+    "GRNA","GRTS","GTBP","GTHX","HCWB","HGEN","HOLO","HOOK","HOWL","HPCO",
+    "ICCM","ICU","IGC","IMNN","IMPL","IMRX","INAB","INCR","INM","INOD",
+    "INVO","IPHA","IPSC","ISPC","ISUN","JAGX","JSPR","KALA","KAVL","KERN",
+    "KPRX","KRON","KTRA","KTTA","LASE","LBPH","LCTX","LFLY","LIPO","LIXT",
+    "LNSR","LPTH","LPTX","LRMR","LSTA","LTBR","LTRN","LUNR","LVLU","LVO",
+    "LXEO","LYEL","LYRA","MAIA","MBIO","MBOT","MDGL","MDNA","MEIP","METX",
+    "MGRM","MIGI","MIST","MKUL","MNOV","MOVE","MPLN","MRKR","MRM","MTEM",
+    "MURA","MYMD","NAOV","NBRV","NCPL","NDRA","NKLA","NKTR","NLSP","NMTR",
+    "NRIX","NSYS","NURO","NUVB","NVAX","NVIV","NVNO","NXGL","NXTC","OBLG",
+    "OCEA","OCGN","OCUL","OGEN","OGI","OMER","OMGA","ONCT","ONCY","ONVO",
+    "ORGN","ORGS","ORMP","OTLK","OTMO","OTRK","PALI","PASG","PBLA","PCSA",
+    "PDSB","PEV","PIRS","PLAB",
 ]
+
 
 def yahoo_candles(symbol, period="6mo"):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -79,56 +76,68 @@ def yahoo_candles(symbol, period="6mo"):
                     df["date"] = pd.to_datetime(df["date"])
                     df = df.set_index("date").sort_index()
                     df.columns = [c.capitalize() for c in df.columns]
-                    return df
+                    return df, data.get("splits", [])
         except Exception:
             pass
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol
-        r = requests.get(url, params={"range": period, "interval": "1d"}, headers=headers, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            result = data.get("chart", {}).get("result", [])
-            if result:
-                chart = result[0]
-                ts = chart.get("timestamp", [])
-                q = chart["indicators"]["quote"][0]
-                rows = []
-                for i, t in enumerate(ts):
-                    if i < len(q["close"]) and q["close"][i] is not None:
-                        rows.append({
-                            "Date": pd.Timestamp(t, unit="s"),
-                            "Open": q["open"][i],
-                            "High": q["high"][i],
-                            "Low": q["low"][i],
-                            "Close": q["close"][i],
-                            "Volume": q["volume"][i] or 0,
-                        })
-                if rows:
-                    return pd.DataFrame(rows).set_index("Date").sort_index()
-    except Exception:
-        pass
-    return pd.DataFrame()
+    return pd.DataFrame(), []
 
 
 def finnhub_metrics(symbol):
-    info = {"floatShares": 0, "shortPercentOfFloat": 0, "averageVolume": 0}
+    info = {"floatShares": 0, "shortPercentOfFloat": 0, "sharesShort": 0}
     if not FINNHUB_KEY:
         return info
     try:
         url = "https://finnhub.io/api/v1/stock/metric"
         r = requests.get(url, params={"symbol": symbol, "metric": "all", "token": FINNHUB_KEY}, timeout=15)
         if r.status_code == 200:
-            data = r.json()
-            m = data.get("metric", {})
+            m = r.json().get("metric", {})
             ff = m.get("freeFloat") or 0
             info["floatShares"] = ff * 1000000 if ff and ff < 1000 else ff
             sp = m.get("shortPercentOfFloat") or 0
             info["shortPercentOfFloat"] = sp / 100 if sp > 1 else sp
-            av = m.get("10DayAverageVolume") or 0
-            info["averageVolume"] = av * 1000000 if av and av < 1000 else av
+            info["sharesShort"] = m.get("sharesShort") or 0
     except Exception:
         pass
     return info
+
+
+def check_offering(symbol):
+    try:
+        cik_map_url = "https://www.sec.gov/files/company_tickers.json"
+        headers = {"User-Agent": "FaisalBot contact@example.com"}
+        r = requests.get(cik_map_url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return {"has_offering": False, "status": "unknown"}
+        data = r.json()
+        cik = None
+        for v in data.values():
+            if v["ticker"].upper() == symbol.upper():
+                cik = str(v["cik_str"]).zfill(10)
+                break
+        if not cik:
+            return {"has_offering": False, "status": "no_cik"}
+        import time
+        time.sleep(0.15)
+        r = requests.get("https://data.sec.gov/submissions/CIK" + cik + ".json", headers=headers, timeout=10)
+        if r.status_code != 200:
+            return {"has_offering": False, "status": "unknown"}
+        recent = r.json().get("filings", {}).get("recent", {})
+        forms = recent.get("form", [])
+        dates = recent.get("filingDate", [])
+        cutoff = datetime.now() - timedelta(days=30)
+        offering_forms = {"S-1", "S-3", "424B3", "424B5"}
+        for form, date_str in zip(forms, dates):
+            if form in offering_forms:
+                try:
+                    fdate = datetime.strptime(date_str, "%Y-%m-%d")
+                    if fdate >= cutoff:
+                        days = (datetime.now() - fdate).days
+                        return {"has_offering": True, "form": form, "days": days, "status": "found"}
+                except Exception:
+                    continue
+        return {"has_offering": False, "status": "clean"}
+    except Exception:
+        return {"has_offering": False, "status": "error"}
 
 
 def rsi(close, period=14):
@@ -174,36 +183,119 @@ def sr(hist, w=20):
     return float(hist["Low"].rolling(w).min().iloc[-1]), float(hist["High"].rolling(w).max().iloc[-1])
 
 
-def detect_retest(hist):
-    if len(hist) < 30:
+def detect_former_runner(hist):
+    if len(hist) < 20:
+        return False
+    returns = hist["Close"].pct_change()
+    return bool((returns > 0.5).any())
+
+
+def detect_w_pattern(hist):
+    if len(hist) < 40:
         return None
-    low20 = hist["Low"].tail(40)
-    bottom = low20.min()
-    bottom_date = low20.idxmin()
-    after = hist.loc[bottom_date:]
-    if len(after) < 5:
+    h = hist["Close"].tail(60)
+    lows = h[(h.shift(1) > h) & (h.shift(-1) > h)]
+    if len(lows) < 2:
         return None
-    rally_high = after["High"].max()
-    rally_pct = (rally_high - bottom) / bottom * 100
-    if rally_pct < 10:
-        return None
-    price = hist["Close"].iloc[-1]
-    dist_to_bottom = abs(price - bottom) / bottom * 100
-    if dist_to_bottom < 5:
-        return {"status": "قرب القاع", "bottom": bottom, "rally_pct": round(rally_pct, 1), "dist": round(dist_to_bottom, 1)}
-    elif dist_to_bottom < 10 and rally_pct > 10:
-        return {"status": "اختبار ناجح", "bottom": bottom, "rally_pct": round(rally_pct, 1), "dist": round(dist_to_bottom, 1)}
+    last_two = lows.tail(2)
+    diff = abs(last_two.iloc[0] - last_two.iloc[1]) / last_two.iloc[0] * 100
+    if diff < 4:
+        neckline = float(h.loc[last_two.index[0]:last_two.index[1]].max())
+        return {
+            "bottom1": round(float(last_two.iloc[0]), 3),
+            "bottom2": round(float(last_two.iloc[1]), 3),
+            "neckline": round(neckline, 3),
+        }
     return None
 
 
+def detect_bull_trap(hist):
+    if len(hist) < 25:
+        return False
+    resistance = hist["High"].tail(20).max()
+    recent = hist.tail(5)
+    broke = (recent["High"] > resistance * 0.98).any()
+    if not broke:
+        return False
+    current = hist["Close"].iloc[-1]
+    return current < resistance * 0.97
+
+
+def detect_gap_fill(hist):
+    if len(hist) < 10:
+        return None
+    for i in range(len(hist) - 10, len(hist) - 1):
+        try:
+            prev_close = hist["Close"].iloc[i]
+            curr_open = hist["Open"].iloc[i + 1]
+            gap_pct = (curr_open - prev_close) / prev_close * 100
+            if abs(gap_pct) > 5:
+                gap_price = curr_open
+                current = hist["Close"].iloc[-1]
+                if gap_pct < 0 and current < gap_price:
+                    return {"direction": "down", "gap_price": round(gap_price, 3), "gap_pct": round(gap_pct, 1)}
+                elif gap_pct > 0 and current > gap_price:
+                    return {"direction": "up", "gap_price": round(gap_price, 3), "gap_pct": round(gap_pct, 1)}
+        except Exception:
+            continue
+    return None
+
+
+def detect_candle_patterns(hist):
+    if len(hist) < 5:
+        return None
+    patterns = []
+    for i in range(-3, 0):
+        try:
+            o = hist["Open"].iloc[i]
+            c = hist["Close"].iloc[i]
+            hi = hist["High"].iloc[i]
+            lo = hist["Low"].iloc[i]
+            body = abs(c - o)
+            range_total = hi - lo
+            if range_total == 0:
+                continue
+            upper_wick = hi - max(o, c)
+            lower_wick = min(o, c) - lo
+            if lower_wick > body * 2 and upper_wick < body * 0.5 and body < range_total * 0.3:
+                patterns.append("Hammer 🔨")
+            if i > -len(hist):
+                prev_o = hist["Open"].iloc[i - 1]
+                prev_c = hist["Close"].iloc[i - 1]
+                if prev_c < prev_o and c > o and c > prev_o and o < prev_c:
+                    patterns.append("Bullish Engulfing 🕯️")
+        except Exception:
+            continue
+    return patterns if patterns else None
+
+
+def detect_reverse_split(splits):
+    if not splits:
+        return {"has_split": False, "days_since": 9999}
+    cutoff = datetime.now() - timedelta(days=365)
+    for sp in splits:
+        try:
+            sp_date = datetime.strptime(sp["date"], "%Y-%m-%d")
+            if sp_date >= cutoff:
+                num = sp.get("numerator", 1)
+                den = sp.get("denominator", 1)
+                days_since = (datetime.now() - sp_date).days
+                return {
+                    "has_split": num < den,
+                    "date": sp["date"],
+                    "ratio": f"{num}:{den}",
+                    "days_since": days_since,
+                }
+        except Exception:
+            continue
+    return {"has_split": False, "days_since": 9999}
+
+
 def rebound_progress(hist, support, resistance):
-    if not support or not resistance:
+    if not support or not resistance or resistance == support:
         return None
     price = hist["Close"].iloc[-1]
-    if resistance == support:
-        return None
-    progress = (price - support) / (resistance - support) * 100
-    return round(progress, 1)
+    return round((price - support) / (resistance - support) * 100, 1)
 
 
 def detect_liquidity_sweep(hist):
@@ -225,38 +317,33 @@ def detect_spring(hist):
     last10 = hist.tail(10)
     broke = last10["Low"].min() < support * 0.97
     recovered = last10["Close"].iloc[-1] > support
-    if broke and recovered:
-        return {"detected": True, "support": support}
-    return None
+    return {"detected": True} if (broke and recovered) else None
 
 
-def detect_lps(hist):
+def detect_lps(hist":):
     if len(hist) < 40:
         return None
     resistance = hist["High"].tail(30).max()
     recent = hist.tail(15)
-    broke_up = recent["High"].max() > resistance * 0.98
-    if not broke_up:
+    if not (recent["High"].max() > resistance * 0.98):
         return None
     pullback = recent["Low"].min()
     price = hist["Close"].iloc[-1]
-    if pullback > resistance * 0.95 and price > pullback:
-        return {"detected": True, "resistance": resistance, "pullback": pullback}
-    return None
+    return {"detected": True} if (pullback > resistance * 0.95 and price > pullback) else None
 
 
-def score(symbol, hist, info):
+def score(symbol, hist, info, splits=None):
     close, high, low, vol = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
     price = float(close.iloc[-1])
     r = rsi(close)
-    mp, mi = macd(close)
+    mp, mi = macd( miclose)
     sk = stoch(high, low, close)
-    s20, s30, s50 = sma(close, 20), sma(close, 30), sma(close, 50)
+   , " s20s, s30, s50 = sma(maclose, 20), sma(close, 30), sma(close, 50)
     sup, res = sr(hist, 20)
     fs = info.get("floatShares", 0) or 0
-    av = info.get("averageVolume", 0) or 0
     cv = int(vol.iloc[-1]) if len(vol) else 0
-    rv = round(cv / av, 2) if av > 0 else 0
+    avg_vol = float(vol.tail(20).mean()) if len(vol) >= 20 else 0
+    rv = round(cv / avg_vol, 2) if avg_vol > 0 else 0
 
     bd = {}
     if 23 <= r <= 27:
@@ -270,7 +357,17 @@ def score(symbol, hist, info):
     else:
         bd["RSI"] = 0
 
-    bd["Split"] = 0
+    split_info = detect_reverse_split(splits)
+    if split_info["has_split"]:
+        d = split_info["days_since"]
+        if d <= 180:
+            bd["Split"] = 20
+        elif d <= 365:
+            bd["Split"] = 10
+        else:
+            bd["Split"] = 0
+    else:
+        bd["Split"] = 0
 
     if fs:
         if fs < 1000000:
@@ -323,6 +420,8 @@ def score(symbol, hist, info):
             bd["Support"] = 0
         else:
             bd["Support"] = -15
+    else:
+        bd["Support"] = 0
 
     if rv > 5:
         bd["RVOL"] = 5
@@ -340,6 +439,12 @@ def score(symbol, hist, info):
         else:
             bd["Rebound"] = -10
 
+    is_runner = detect_former_runner(hist)
+    bd["Runner"] = 5 if is_runner else 0
+
+    w_pat = detect_w_pattern(hist)
+    bd["W_Pattern"] = 10 if w_pat else 0
+
     total = max(0, min(sum(bd.values()), 100))
 
     if total >= 80:
@@ -355,42 +460,28 @@ def score(symbol, hist, info):
 
     return {
         "symbol": symbol, "price": price, "rsi": round(r, 2), "stoch": round(sk, 2),
-        "macd_pos": mp, "macd_imp": mi, "sma20": s20, "sma50": s50,
+        "macd_pos": mp, "macd_imp20": s20, "sma50": s50,
         "support": sup, "resistance": res, "dist_sup": ds, "float": fs, "rvol": rv,
+        "short_pct": info.get("shortPercentOfFloat", 0) or 0,
         "breakdown": bd, "total": total, "verdict": v, "color": c,
-        "rebound": rebound, "retest": detect_retest(hist),
+        "rebound": rebound, "split_info": split_info,
         "sweep": detect_liquidity_sweep(hist), "spring": detect_spring(hist),
-        "lps": detect_lps(hist),
+        "lps": detect_lps(hist), "w_pattern": w_pat, "runner": is_runner,
+        "bull_trap": detect_bull_trap(hist), "gap": detect_gap_fill(hist),
+        "candles": detect_candle_patterns(hist),
     }
 
 
-def chart(hist, symbol):
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=hist.index, open=hist["Open"], high=hist["High"],
-        low=hist["Low"], close=hist["Close"], name=symbol,
-        increasing_line_color="#00b894", decreasing_line_color="#d63031"))
-    if len(hist) >= 20:
-        fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"].rolling(20).mean(),
-                                 name="MA20", line=dict(color="orange", width=1)))
-    if len(hist) >= 50:
-        fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"].rolling(50).mean(),
-                                 name="MA50", line=dict(color="blue", width=1)))
-    fig.update_layout(height=400, xaxis_rangeslider_visible=False,
-                     margin=dict(l=10, r=10, t=30, b=10), template="plotly_white")
-    return fig
-
-
 st.markdown("# 🎯 Faisal Stock Screener")
-st.markdown("**مراقب استراتيجية فيصل + وايكوف**")
+st.markdown("**استراتيجية فيصل + وايكوف + كشف الفرص**")
 st.markdown("---")
 
-tab1, tab2, tab3 = st.tabs(["🔬 تحليل سهم", "🎯 أفضل 10", "💣 رادار الاكتشاف"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔬 تحليل سهم", "🔀 أسهم التقسيم", "🎯 أفضل 10", "💣 رادار الاكتشاف"])
 
 with tab1:
     col1, col2 = st.columns([3, 1])
     with col1:
-        sym = st.text_input("رمز السهم", "AEMD").upper()
+        sym = st.text_input("رمز السهم", "INBS").upper()
     with col2:
         st.write("")
         st.write("")
@@ -398,16 +489,29 @@ with tab1:
 
     if btn and sym:
         with st.spinner("جاري تحليل " + sym + "..."):
-            hist = yahoo_candles(sym, "6mo")
+            hist, splits = yahoo_candles(sym, "6mo")
             if hist.empty:
                 st.error("❌ لا بيانات لـ " + sym)
             else:
                 info = finnhub_metrics(sym)
-                if not info["averageVolume"] and len(hist) >= 20:
-                    info["averageVolume"] = int(hist["Volume"].tail(20).mean())
-                r = score(sym, hist, info)
+                offering = check_offering(sym)
+                r = score(sym, hist, info, splits)
 
                 st.markdown('<div class="score-card"><div class="score-big" style="color: ' + r['color'] + ';">' + str(r['total']) + '/100</div><div class="verdict">' + r['verdict'] + '</div></div>', unsafe_allow_html=True)
+
+                if offering.get("has_offering"):
+                    st.markdown('<div class="danger-box">🚨 <b>طرح حديث:</b> ' + offering.get("form", "") + ' قبل ' + str(offering.get("days", 0)) + ' يوم — تجنب!</div>', unsafe_allow_html=True)
+
+                if r["bull_trap"]:
+                    st.markdown('<div class="danger-box">⚠️ <b>Bull Trap:</b> كسر مقاومة ثم فشل — خطر!</div>', unsafe_allow_html=True)
+
+                if r["split_info"].get("has_split"):
+                    d = r["split_info"]["days_since"]
+                    label = " 🔥 حديث!" if d <= 180 else ""
+                    st.markdown('<div class="split-box">🔀 <b>Reverse Split:</b> ' + r["split_info"]["ratio"] + ' — قبل ' + str(d) + ' يوم' + label + '</div>', unsafe_allow_html=True)
+
+                if r["short_pct"] > 0:
+                    st.markdown('<div class="info-box">🔥 <b>Short Float:</b> ' + str(round(r["short_pct"]*100, 2)) + '%</div>', unsafe_allow_html=True)
 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("💰 السعر", "$" + str(round(r['price'], 3)))
@@ -421,45 +525,90 @@ with tab1:
                 c3.metric("📏 الدعم", "$" + str(round(r['support'], 3)) if r['support'] else "—")
                 c4.metric("🚀 المقاومة", "$" + str(round(r['resistance'], 3)) if r['resistance'] else "—")
 
-                if r["retest"]:
-                    st.markdown('<div class="success-box">✅ <b>اختبار دعم:</b> ' + r['retest']['status'] + ' (ارتداد ' + str(r['retest']['rally_pct']) + '%)</div>', unsafe_allow_html=True)
+                if r["runner"]:
+                    st.markdown('<div class="success-box">🏆 <b>Former Runner:</b> سبق أن انفجر +50% في يوم!</div>', unsafe_allow_html=True)
+                if r["w_pattern"]:
+                    wp = r["w_pattern"]
+                    st.markdown('<div class="success-box">📐 <b>W Pattern:</b> قاعان $' + str(wp['bottom1']) + ' / $' + str(wp['bottom2']) + ' — خط العنق: $' + str(wp['neckline']) + '</div>', unsafe_allow_html=True)
                 if r["sweep"]:
-                    st.markdown('<div class="success-box">🎯 <b>سحب سيولة:</b> تم كشفه — إشارة إيجابية!</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="success-box">🎯 <b>سحب سيولة:</b> تم كشفه!</div>', unsafe_allow_html=True)
                 if r["spring"]:
-                    st.markdown('<div class="success-box">🌊 <b>Spring (وايكوف):</b> كسر ثم استرداد — فرصة قوية!</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="success-box">🌊 <b>Spring (وايكوف):</b> كسر ثم استرداد!</div>', unsafe_allow_html=True)
                 if r["lps"]:
                     st.markdown('<div class="success-box">📈 <b>LPS (وايكوف):</b> اختراق ثم اختبار ناجح!</div>', unsafe_allow_html=True)
+                if r["candles"]:
+                    st.markdown('<div class="success-box">🕯️ <b>شموع انعكاسية:</b> ' + ", ".join(r["candles"]) + '</div>', unsafe_allow_html=True)
+                if r["gap"]:
+                    g = r["gap"]
+                    direction = "هبوط" if g["direction"] == "down" else "صعود"
+                    st.markdown('<div class="info-box">🕳️ <b>فجوة ' + direction + ':</b> ' + str(g["gap_pct"]) + '% عند $' + str(g["gap_price"]) + '</div>', unsafe_allow_html=True)
                 if r["rebound"] is not None:
                     if r["rebound"] > 60:
-                        st.markdown('<div class="warn-box">⚠️ <b>الارتداد:</b> ' + str(r['rebound']) + '% — متأخر، انتظر العودة للدعم</div>', unsafe_allow_html=True)
+                        st.markdown('<div class="warn-box">⚠️ <b>الارتداد:</b> ' + str(r['rebound']) + '% — متأخر</div>', unsafe_allow_html=True)
                     else:
                         st.markdown('<div class="info-box">📊 <b>تقدم الارتداد:</b> ' + str(r['rebound']) + '% — مبكر</div>', unsafe_allow_html=True)
 
                 if r["float"]:
                     st.info("📦 Free Float: **" + str(round(r['float']/1000000, 2)) + "M سهم**")
 
-                st.plotly_chart(chart(hist, sym), use_container_width=True)
-
                 st.markdown("### 📊 تفصيل النقاط")
                 st.dataframe(pd.DataFrame(list(r["breakdown"].items()), columns=["المعيار", "النقاط"]),
                              use_container_width=True, hide_index=True)
 
+                st.markdown('<a href="https://fintel.io/s/us/' + sym.lower() + '" target="_blank">📊 عرض تفاصيل الشورت على Fintel</a>', unsafe_allow_html=True)
+
 with tab2:
+    st.markdown("### 🔀 أسهم Reverse Split حديثة")
+    st.caption("فحص " + str(len(LOCAL_UNIVERSE)) + " سهماً — قد يستغرق 5-10 دقائق")
+    if st.button("🔀 ابدأ البحث", key="sp"):
+        pg = st.progress(0)
+        res = []
+        for i, s in enumerate(LOCAL_UNIVERSE):
+            pg.progress((i + 1) / len(LOCAL_UNIVERSE))
+            try:
+                h, sps = yahoo_candles(s, "1y")
+                if h.empty or len(h) < 30:
+                    continue
+                sp_info = detect_reverse_split(sps)
+                if sp_info.get("has_split"):
+                    inf = finnhub_metrics(s)
+                    r = score(s, h, inf, sps)
+                    r["split_details"] = sp_info
+                    res.append(r)
+            except Exception:
+                continue
+        pg.empty()
+        if res:
+            res.sort(key=lambda x: (x["split_details"]["days_since"], -x["total"]))
+            st.success("✅ " + str(len(res)) + " سهم بتقسيم عكسي")
+            for r in res[:20]:
+                sp = r["split_details"]
+                with st.expander("🔀 **" + r['symbol'] + "** — " + str(r['total']) + "/100 " + r['verdict']):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("النسبة", sp["ratio"])
+                    c2.metric("قبل", str(sp["days_since"]) + " يوم")
+                    c3.metric("النقاط", str(r['total']))
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("السعر", "$" + str(round(r['price'], 3)))
+                    c2.metric("RSI", str(r['rsi']))
+                    c3.metric("Stoch", str(r['stoch']))
+        else:
+            st.warning("لا توجد أسهم بتقسيم عكسي.")
+
+with tab3:
     st.markdown("### 🎯 أفضل 10 أسهم")
-    st.caption("فحص " + str(len(LOCAL_UNIVERSE)) + " سهماً (قد يستغرق 5-10 دقائق)")
+    st.caption("فحص " + str(len(LOCAL_UNIVERSE)) + " سهماً")
     if st.button("🔍 ابدأ الفحص", key="t"):
         pg = st.progress(0)
         res = []
         for i, s in enumerate(LOCAL_UNIVERSE):
             pg.progress((i + 1) / len(LOCAL_UNIVERSE))
             try:
-                h = yahoo_candles(s, "3mo")
+                h, sps = yahoo_candles(s, "3mo")
                 if h.empty or len(h) < 30:
                     continue
                 inf = finnhub_metrics(s)
-                if not inf["averageVolume"] and len(h) >= 20:
-                    inf["averageVolume"] = int(h["Volume"].tail(20).mean())
-                r = score(s, h, inf)
+                r = score(s, h, inf, sps)
                 if r["total"] >= 30:
                     res.append(r)
             except Exception:
@@ -476,25 +625,25 @@ with tab2:
                     c3.metric("Stoch", str(r['stoch']))
                     if r["support"]:
                         st.write("📏 الدعم: $" + str(round(r['support'], 3)) + " (على بعد " + str(r['dist_sup']) + "%)")
+                    if r["split_info"].get("has_split"):
+                        st.write("🔀 Reverse Split: " + r["split_info"]["ratio"] + " قبل " + str(r["split_info"]["days_since"]) + " يوم")
         else:
             st.warning("لا نتائج.")
 
-with tab3:
+with tab4:
     st.markdown("### 💣 رادار الاكتشاف المبكر")
-    st.caption("أسهم Squeeze محتملة (RSI منخفض + Float صغير)")
+    st.caption("أسهم Squeeze محتملة")
     if st.button("🎯 ابحث", key="h"):
         pg = st.progress(0)
         res = []
         for i, s in enumerate(LOCAL_UNIVERSE):
             pg.progress((i + 1) / len(LOCAL_UNIVERSE))
             try:
-                h = yahoo_candles(s, "3mo")
+                h, sps = yahoo_candles(s, "3mo")
                 if h.empty or len(h) < 30:
                     continue
                 inf = finnhub_metrics(s)
-                if not inf["averageVolume"] and len(h) >= 20:
-                    inf["averageVolume"] = int(h["Volume"].tail(20).mean())
-                r = score(s, h, inf)
+                r = score(s, h, inf, sps)
                 if r["rsi"] > 35 or r["total"] < 30:
                     continue
                 res.append(r)
@@ -509,6 +658,8 @@ with tab3:
                     c1.metric("السعر", "$" + str(round(r['price'], 3)))
                     c2.metric("RSI", str(r['rsi']))
                     c3.metric("Stoch", str(r['stoch']))
+                    if r["short_pct"] > 0:
+                        st.write("🔥 Short Float: " + str(round(r["short_pct"]*100, 2)) + "%")
         else:
             st.info("لا فرص حالياً.")
 
