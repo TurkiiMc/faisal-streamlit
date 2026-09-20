@@ -4,12 +4,12 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Faisal Screener", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Stock Screener", page_icon="🎯", layout="wide")
 
 PROXY_URL = "https://faisal-proxy.onrender.com"
 FINNHUB_KEY = "demn1c9r01qnf8fq7jc0demn1c9r01qnf8fq7jcg"
 
-st.markdown("<style>.main{direction:rtl}h1,h2,h3{direction:rtl;text-align:right}.score-card{background:linear-gradient(135deg,#f8f9fa,#e9ecef);padding:25px;border-radius:15px;text-align:center;margin:15px 0}.score-big{font-size:56px;font-weight:bold;margin:0}.verdict{font-size:22px;margin-top:10px}.stButton>button{width:100%;background:linear-gradient(90deg,#00b894,#0984e3);color:white;font-weight:bold;border-radius:10px;padding:12px;border:none}.info-box{background:#e8f4f8;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #0984e3}.warn-box{background:#fff3cd;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #fdcb6e}.success-box{background:#d4edda;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #00b894}.danger-box{background:#f8d7da;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #d63031}.split-box{background:#ffe5e5;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #d63031}a{color:#0984e3;text-decoration:none}</style>", unsafe_allow_html=True)
+st.markdown("<style>.main{direction:rtl}h1,h2,h3{direction:rtl;text-align:right}.score-card{background:linear-gradient(135deg,#f8f9fa,#e9ecef);padding:25px;border-radius:15px;text-align:center;margin:15px 0}.score-big{font-size:56px;font-weight:bold;margin:0}.verdict{font-size:22px;margin-top:10px}.stButton>button{width:100%;background:linear-gradient(90deg,#00b894,#0984e3);color:white;font-weight:bold;border-radius:10px;padding:12px;border:none}.info-box{background:#e8f4f8;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #0984e3}.warn-box{background:#fff3cd;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #fdcb6e}.success-box{background:#d4edda;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #00b894}.danger-box{background:#f8d7da;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #d63031}.split-box{background:#ffe5e5;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #d63031}.plan-box{background:#f0f7ff;padding:15px;border-radius:10px;margin:10px 0;border:2px solid #0984e3}a{color:#0984e3;text-decoration:none}.plan-table{width:100%;border-collapse:collapse;margin-top:10px}.plan-table td{padding:8px;border-bottom:1px solid #d0e4f5;font-size:16px}</style>", unsafe_allow_html=True)
 
 LOCAL_UNIVERSE = [
     "AEMD","AKAN","LFS","GDHG","BJDX","DXST","VSME","CLIK","DGHG","CPOP",
@@ -137,13 +137,27 @@ def rsi(close, period=14):
 
 def macd(close):
     if len(close) < 26:
-        return False, False
+        return False, False, 0.0
     e12 = close.ewm(span=12, adjust=False).mean()
     e26 = close.ewm(span=26, adjust=False).mean()
     m = e12 - e26
     s = m.ewm(span=9, adjust=False).mean()
     h = m - s
-    return m.iloc[-1] > s.iloc[-1], h.iloc[-1] > (h.iloc[-3] if len(h) > 3 else h.iloc[-1])
+    macd_val = float(m.iloc[-1])
+    signal_val = float(s.iloc[-1])
+    hist_val = float(h.iloc[-1])
+    return m.iloc[-1] > s.iloc[-1], h.iloc[-1] > (h.iloc[-3] if len(h) > 3 else h.iloc[-1]), hist_val
+
+
+def macd_status(mp, mi, hist):
+    if mp and mi:
+        return "إيجابي ويتحسن ✅", "#00b894"
+    elif mp:
+        return "إيجابي لكن يضعف 🟡", "#fdcb6e"
+    elif mi:
+        return "سلبي لكن يتحسن 🟡", "#fdcb6e"
+    else:
+        return "سلبي ويضعف ❌", "#d63031"
 
 
 def sma(close, p):
@@ -257,8 +271,8 @@ def detect_reverse_split(splits):
         try:
             sp_date = datetime.strptime(sp["date"], "%Y-%m-%d")
             if sp_date >= cutoff:
-                num = sp.get("numerator", 1)
-                den = sp.get("denominator", 1)
+                num = int(sp.get("numerator", 1))
+                den = int(sp.get("denominator", 1))
                 ds = (datetime.now() - sp_date).days
                 return {"has_split": num < den, "date": sp["date"], "ratio": str(num) + ":" + str(den), "days_since": ds}
         except Exception:
@@ -314,7 +328,8 @@ def score(symbol, hist, info, splits=None):
     vol = hist["Volume"]
     price = float(close.iloc[-1])
     r = rsi(close)
-    mp, mi = macd(close)
+    mp, mi, macd_hist = macd(close)
+    macd_txt, macd_color = macd_status(mp, mi, macd_hist)
     sk = stoch(high, low, close)
     s20 = sma(close, 20)
     s30 = sma(close, 30)
@@ -445,7 +460,9 @@ def score(symbol, hist, info, splits=None):
 
     return {
         "symbol": symbol, "price": price, "rsi": round(r, 2), "stoch": round(sk, 2),
-        "macd_pos": mp, "macd_imp": mi, "sma20": s20, "sma50": s50,
+        "macd_pos": mp, "macd_imp": mi, "macd_hist": round(macd_hist, 4),
+        "macd_txt": macd_txt, "macd_color": macd_color,
+        "sma20": s20, "sma50": s50,
         "support": sup, "resistance": res, "dist_sup": ds, "float": fs, "rvol": rv,
         "short_pct": info.get("shortPercentOfFloat", 0) or 0,
         "breakdown": bd, "total": total, "verdict": v, "color": c,
@@ -457,8 +474,7 @@ def score(symbol, hist, info, splits=None):
     }
 
 
-st.markdown("# Faisal Stock Screener")
-st.markdown("**استراتيجية فيصل + وايكوف + كشف الفرص**")
+st.markdown("# Stock Screener")
 st.markdown("---")
 
 tab1, tab2, tab3, tab4 = st.tabs(["تحليل سهم", "أسهم التقسيم", "أفضل 10", "رادار الاكتشاف"])
@@ -496,7 +512,12 @@ with tab1:
                     st.markdown('<div class="split-box">Reverse Split: ' + r["split_info"]["ratio"] + ' - قبل ' + str(d) + ' يوم' + label + '</div>', unsafe_allow_html=True)
 
                 if r["short_pct"] > 0:
-                    st.markdown('<div class="info-box">Short Float: ' + str(round(r["short_pct"]*100, 2)) + '%</div>', unsafe_allow_html=True)
+                    short_warn = ""
+                    if r["short_pct"] > 0.20:
+                        short_warn = " - مرتفع! Squeeze محتمل"
+                    st.markdown('<div class="info-box">Short Float: ' + str(round(r["short_pct"]*100, 2)) + '%' + short_warn + '</div>', unsafe_allow_html=True)
+
+                st.markdown('<div class="info-box" style="border-right-color:' + r["macd_color"] + '"><b>MACD:</b> ' + r["macd_txt"] + ' (قيمة: ' + str(r["macd_hist"]) + ')</div>', unsafe_allow_html=True)
 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("السعر", "$" + str(round(r['price'], 3)))
@@ -535,11 +556,40 @@ with tab1:
 
                 if r["float"]:
                     st.info("Free Float: " + str(round(r['float']/1000000, 2)) + "M سهم")
+                else:
+                    st.info("Free Float: غير متوفر")
+
+                if r["support"] and r["resistance"]:
+                    sup_val = r["support"]
+                    res_val = r["resistance"]
+                    stop = round(sup_val * 0.94, 3)
+                    target1 = round(res_val, 3)
+                    target2 = round(res_val * 1.20, 3)
+                    target3 = round(res_val * 1.50, 3)
+                    risk = round((r["price"] - stop) / r["price"] * 100, 2)
+                    reward1 = round((target1 - r["price"]) / r["price"] * 100, 2)
+                    rr = round((target1 - r["price"]) / (r["price"] - stop), 2) if r["price"] > stop else 0
+
+                    st.markdown("### خطة الدخول والخروج")
+                    st.markdown(
+                        '<div class="plan-box">'
+                        '<table class="plan-table">'
+                        '<tr><td><b>الدخول المقترح</b></td><td>$' + str(round(r["price"], 3)) + '</td></tr>'
+                        '<tr><td><b>الوقف</b></td><td style="color:#d63031"><b>$' + str(stop) + '</b> (مخاطرة ' + str(risk) + '%)</td></tr>'
+                        '<tr><td><b>هدف 1</b></td><td style="color:#00b894"><b>$' + str(target1) + '</b> (+' + str(reward1) + '%)</td></tr>'
+                        '<tr><td><b>هدف 2</b></td><td style="color:#00b894">$' + str(target2) + '</td></tr>'
+                        '<tr><td><b>هدف 3</b></td><td style="color:#00b894">$' + str(target3) + '</td></tr>'
+                        '<tr><td><b>نسبة المخاطرة/المكافأة</b></td><td><b>1 : ' + str(rr) + '</b></td></tr>'
+                        '<tr><td><b>حجم المخاطرة</b></td><td>1-2% من المحفظة</td></tr>'
+                        '</table>'
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
 
                 st.markdown("### تفصيل النقاط")
                 st.dataframe(pd.DataFrame(list(r["breakdown"].items()), columns=["المعيار", "النقاط"]), use_container_width=True, hide_index=True)
 
-                st.markdown('<a href="https://fintel.io/s/us/' + sym.lower() + '" target="_blank">عرض تفاصيل الشورت على Fintel</a>', unsafe_allow_html=True)
+                st.markdown('<a href="https://fintel.io/ss/us/' + sym.lower() + '" target="_blank">عرض تفاصيل Short Interest على Fintel</a>', unsafe_allow_html=True)
 
 with tab2:
     st.markdown("### أسهم Reverse Split حديثة")
@@ -576,6 +626,7 @@ with tab2:
                     c1.metric("السعر", "$" + str(round(r['price'], 3)))
                     c2.metric("RSI", str(r['rsi']))
                     c3.metric("Stoch", str(r['stoch']))
+                    st.markdown('<a href="https://fintel.io/ss/us/' + r['symbol'].lower() + '" target="_blank">Fintel Short Interest</a>', unsafe_allow_html=True)
         else:
             st.warning("لا توجد أسهم بتقسيم عكسي.")
 
