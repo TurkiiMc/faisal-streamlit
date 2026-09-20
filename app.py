@@ -283,7 +283,7 @@ def detect_reverse_split(splits):
                 return {
                     "has_split": num < den,
                     "date": sp["date"],
-                    "ratio": f"{num}:{den}",
+                    "ratio": str(num) + ":" + str(den),
                     "days_since": days_since,
                 }
         except Exception:
@@ -320,7 +320,7 @@ def detect_spring(hist):
     return {"detected": True} if (broke and recovered) else None
 
 
-def detect_lps(hist":):
+def detect_lps(hist):
     if len(hist) < 40:
         return None
     resistance = hist["High"].tail(30).max()
@@ -336,9 +336,9 @@ def score(symbol, hist, info, splits=None):
     close, high, low, vol = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
     price = float(close.iloc[-1])
     r = rsi(close)
-    mp, mi = macd( miclose)
+    mp, mi = macd(close)
     sk = stoch(high, low, close)
-   , " s20s, s30, s50 = sma(maclose, 20), sma(close, 30), sma(close, 50)
+    s20, s30, s50 = sma(close, 20), sma(close, 30), sma(close, 50)
     sup, res = sr(hist, 20)
     fs = info.get("floatShares", 0) or 0
     cv = int(vol.iloc[-1]) if len(vol) else 0
@@ -460,7 +460,7 @@ def score(symbol, hist, info, splits=None):
 
     return {
         "symbol": symbol, "price": price, "rsi": round(r, 2), "stoch": round(sk, 2),
-        "macd_pos": mp, "macd_imp20": s20, "sma50": s50,
+        "macd_pos": mp, "macd_imp": mi, "sma20": s20, "sma50": s50,
         "support": sup, "resistance": res, "dist_sup": ds, "float": fs, "rvol": rv,
         "short_pct": info.get("shortPercentOfFloat", 0) or 0,
         "breakdown": bd, "total": total, "verdict": v, "color": c,
