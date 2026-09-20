@@ -9,27 +9,11 @@ st.set_page_config(page_title="Faisal Screener", page_icon="🎯", layout="wide"
 PROXY_URL = "https://faisal-proxy.onrender.com"
 FINNHUB_KEY = "demn1c9r01qnf8fq7jc0demn1c9r01qnf8fq7jcg"
 
-st.markdown("""
-<style>
-.main { direction: rtl; }
-h1,h2,h3 { direction: rtl; text-align: right; }
-.score-card { background: linear-gradient(135deg, #f8f9fa, #e9ecef); padding: 25px; border-radius: 15px; text-align: center; margin: 15px 0; }
-.score-big { font-size: 56px; font-weight: bold; margin: 0; }
-.verdict { font-size: 22px; margin-top: 10px; color: #2d3436; }
-.stButton > button { width: 100%; background: linear-gradient(90deg, #00b894, #0984e3); color: white; font-weight: bold; border-radius: 10px; padding: 12px; border: none; }
-.info-box { background: #e8f4f8; padding: 12px; border-radius: 8px; margin: 8px 0; border-right: 4px solid #0984e3; }
-.warn-box { background: #fff3cd; padding: 12px; border-radius: 8px; margin: 8px 0; border-right: 4px solid #fdcb6e; }
-.success-box { background: #d4edda; padding: 12px; border-radius: 8px; margin: 8px 0; border-right: 4px solid #00b894; }
-.danger-box { background: #f8d7da; padding: 12px; border-radius: 8px; margin: 8px 0; border-right: 4px solid #d63031; }
-.split-box { background: #ffe5e5; padding: 12px; border-radius: 8px; margin: 8px 0; border-right: 4px solid #d63031; }
-a { color: #0984e3; text-decoration: none; }
-a:hover { text-decoration: underline; }
-</style>
-""", unsafe_allow_html=True)
+st.markdown("<style>.main{direction:rtl}h1,h2,h3{direction:rtl;text-align:right}.score-card{background:linear-gradient(135deg,#f8f9fa,#e9ecef);padding:25px;border-radius:15px;text-align:center;margin:15px 0}.score-big{font-size:56px;font-weight:bold;margin:0}.verdict{font-size:22px;margin-top:10px}.stButton>button{width:100%;background:linear-gradient(90deg,#00b894,#0984e3);color:white;font-weight:bold;border-radius:10px;padding:12px;border:none}.info-box{background:#e8f4f8;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #0984e3}.warn-box{background:#fff3cd;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #fdcb6e}.success-box{background:#d4edda;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #00b894}.danger-box{background:#f8d7da;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #d63031}.split-box{background:#ffe5e5;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #d63031}a{color:#0984e3;text-decoration:none}</style>", unsafe_allow_html=True)
 
 LOCAL_UNIVERSE = [
     "AEMD","AKAN","LFS","GDHG","BJDX","DXST","VSME","CLIK","DGHG","CPOP",
-    "HTCR","MBRX","MWC","NXTS","SVRE","YYAI","BG","BIAF","BNKK","CDTG",
+    "HTCR","MBRX","MWC","NXTS","SVRE","YYAI","BFRG","BIAF","BNKK","CDTG",
     "SHPH","SONN","TNXP","PHIO","SNPX","AVGR","BDRX","BIOR","CLRB","CRKN",
     "CYTX","DTSS","EEIQ","ELAB","EVGN","EYEN","FWBI","GCTK","GNPX","HCDI",
     "HILS","HOTH","IMCC","INBS","INDP","IPDN","IVDA","JWEL","KITT","KRKR",
@@ -59,7 +43,7 @@ LOCAL_UNIVERSE = [
     "NRIX","NSYS","NURO","NUVB","NVAX","NVIV","NVNO","NXGL","NXTC","OBLG",
     "OCEA","OCGN","OCUL","OGEN","OGI","OMER","OMGA","ONCT","ONCY","ONVO",
     "ORGN","ORGS","ORMP","OTLK","OTMO","OTRK","PALI","PASG","PBLA","PCSA",
-    "PDSB","PEV","PIRS","PLAB",
+    "PDSB","PEV","PIRS","PLAB"
 ]
 
 
@@ -107,7 +91,7 @@ def check_offering(symbol):
         headers = {"User-Agent": "FaisalBot contact@example.com"}
         r = requests.get(cik_map_url, headers=headers, timeout=10)
         if r.status_code != 200:
-            return {"has_offering": False, "status": "unknown"}
+            return {"has_offering": False}
         data = r.json()
         cik = None
         for v in data.values():
@@ -115,29 +99,29 @@ def check_offering(symbol):
                 cik = str(v["cik_str"]).zfill(10)
                 break
         if not cik:
-            return {"has_offering": False, "status": "no_cik"}
+            return {"has_offering": False}
         import time
         time.sleep(0.15)
         r = requests.get("https://data.sec.gov/submissions/CIK" + cik + ".json", headers=headers, timeout=10)
         if r.status_code != 200:
-            return {"has_offering": False, "status": "unknown"}
+            return {"has_offering": False}
         recent = r.json().get("filings", {}).get("recent", {})
         forms = recent.get("form", [])
         dates = recent.get("filingDate", [])
         cutoff = datetime.now() - timedelta(days=30)
-        offering_forms = {"S-1", "S-3", "424B3", "424B5"}
+        of = {"S-1", "S-3", "424B3", "424B5"}
         for form, date_str in zip(forms, dates):
-            if form in offering_forms:
+            if form in of:
                 try:
                     fdate = datetime.strptime(date_str, "%Y-%m-%d")
                     if fdate >= cutoff:
                         days = (datetime.now() - fdate).days
-                        return {"has_offering": True, "form": form, "days": days, "status": "found"}
+                        return {"has_offering": True, "form": form, "days": days}
                 except Exception:
                     continue
-        return {"has_offering": False, "status": "clean"}
+        return {"has_offering": False}
     except Exception:
-        return {"has_offering": False, "status": "error"}
+        return {"has_offering": False}
 
 
 def rsi(close, period=14):
@@ -187,25 +171,21 @@ def detect_former_runner(hist):
     if len(hist) < 20:
         return False
     returns = hist["Close"].pct_change()
-    return bool((returns > 0).5).any())
+    return bool((returns > 0.5).any())
 
 
 def detect_w_pattern(hist):
     if len(hist) < 40:
         return None
     h = hist["Close"].tail(60)
-    lows = h[(h.shift(1) > h) & (h.shift(-1 > h)]
+    lows = h[(h.shift(1) > h) & (h.shift(-1) > h)]
     if len(lows) < 2:
         return None
     last_two = lows.tail(2)
     diff = abs(last_two.iloc[0] - last_two.iloc[1]) / last_two.iloc[0] * 100
     if diff < 4:
         neckline = float(h.loc[last_two.index[0]:last_two.index[1]].max())
-        return {
-            "bottom1": round(float(last_two.iloc[0]), 3),
-            "bottom2": round(float(last_two.iloc[1]), 3),
-            "neckline": round(neckline, 3),
-        }
+        return {"bottom1": round(float(last_two.iloc[0]), 3), "bottom2": round(float(last_two.iloc[1]), 3), "neckline": round(neckline, 3)}
     return None
 
 
@@ -252,18 +232,18 @@ def detect_candle_patterns(hist):
             hi = hist["High"].iloc[i]
             lo = hist["Low"].iloc[i]
             body = abs(c - o)
-            range_total = hi - lo
-            if range_total == 0:
+            rt = hi - lo
+            if rt == 0:
                 continue
-            upper_wick = hi - max(o, c)
-            lower_wick = min(o, c) - lo
-            if lower_wick > body * 2 and upper_wick < body * 0.5 and body < range_total * 0.3:
-                patterns.append("Hammer 🔨")
+            uw = hi - max(o, c)
+            lw = min(o, c) - lo
+            if lw > body * 2 and uw < body * 0.5 and body < rt * 0.3:
+                patterns.append("Hammer")
             if i > -len(hist):
-                prev_o = hist["Open"].iloc[i - 1]
-                prev_c = hist["Close"].iloc[i - 1]
-                if prev_c < prev_o and c > o and c > prev_o and o < prev_c:
-                    patterns.append("Bullish Engulfing 🕯️")
+                po = hist["Open"].iloc[i - 1]
+                pc = hist["Close"].iloc[i - 1]
+                if pc < po and c > o and c > po and o < pc:
+                    patterns.append("Bullish Engulfing")
         except Exception:
             continue
     return patterns if patterns else None
@@ -279,13 +259,8 @@ def detect_reverse_split(splits):
             if sp_date >= cutoff:
                 num = sp.get("numerator", 1)
                 den = sp.get("denominator", 1)
-                days_since = (datetime.now() - sp_date).days
-                return {
-                    "has_split": num < den,
-                    "date": sp["date"],
-                    "ratio": str(num) + ":" + str(den),
-                    "days_since": days_since,
-                }
+                ds = (datetime.now() - sp_date).days
+                return {"has_split": num < den, "date": sp["date"], "ratio": str(num) + ":" + str(den), "days_since": ds}
         except Exception:
             continue
     return {"has_split": False, "days_since": 9999}
@@ -333,12 +308,17 @@ def detect_lps(hist):
 
 
 def score(symbol, hist, info, splits=None):
-    close, high, low, vol = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
+    close = hist["Close"]
+    high = hist["High"]
+    low = hist["Low"]
+    vol = hist["Volume"]
     price = float(close.iloc[-1])
     r = rsi(close)
     mp, mi = macd(close)
     sk = stoch(high, low, close)
-    s20, s30, s50 = sma(close, 20), sma(close, 30), sma(close, 50)
+    s20 = sma(close, 20)
+    s30 = sma(close, 30)
+    s50 = sma(close, 50)
     sup, res = sr(hist, 20)
     fs = info.get("floatShares", 0) or 0
     cv = int(vol.iloc[-1]) if len(vol) else 0
@@ -448,15 +428,20 @@ def score(symbol, hist, info, splits=None):
     total = max(0, min(sum(bd.values()), 100))
 
     if total >= 80:
-        v, c = "🏆 مثالي", "#00b894"
+        v = "مثالي"
+        c = "#00b894"
     elif total >= 65:
-        v, c = "🟢 ممتاز", "#00b894"
+        v = "ممتاز"
+        c = "#00b894"
     elif total >= 50:
-        v, c = "🟡 جيد", "#fdcb6e"
+        v = "جيد"
+        c = "#fdcb6e"
     elif total >= 35:
-        v, c = "🟠 ضعيف", "#e17055"
+        v = "ضعيف"
+        c = "#e17055"
     else:
-        v, c = "🔴 مرفوض", "#d63031"
+        v = "مرفوض"
+        c = "#d63031"
 
     return {
         "symbol": symbol, "price": price, "rsi": round(r, 2), "stoch": round(sk, 2),
@@ -468,15 +453,15 @@ def score(symbol, hist, info, splits=None):
         "sweep": detect_liquidity_sweep(hist), "spring": detect_spring(hist),
         "lps": detect_lps(hist), "w_pattern": w_pat, "runner": is_runner,
         "bull_trap": detect_bull_trap(hist), "gap": detect_gap_fill(hist),
-        "candles": detect_candle_patterns(hist),
+        "candles": detect_candle_patterns(hist)
     }
 
 
-st.markdown("# 🎯 Faisal Stock Screener")
+st.markdown("# Faisal Stock Screener")
 st.markdown("**استراتيجية فيصل + وايكوف + كشف الفرص**")
 st.markdown("---")
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔬 تحليل سهم", "🔀 أسهم التقسيم", "🎯 أفضل 10", "💣 رادار الاكتشاف"])
+tab1, tab2, tab3, tab4 = st.tabs(["تحليل سهم", "أسهم التقسيم", "أفضل 10", "رادار الاكتشاف"])
 
 with tab1:
     col1, col2 = st.columns([3, 1])
@@ -485,82 +470,81 @@ with tab1:
     with col2:
         st.write("")
         st.write("")
-        btn = st.button("🔬 تحليل", key="a")
+        btn = st.button("تحليل", key="a")
 
     if btn and sym:
-        with st.spinner("جاري تحليل " + sym + "..."):
+        with st.spinner("جاري تحليل " + sym):
             hist, splits = yahoo_candles(sym, "6mo")
             if hist.empty:
-                st.error("❌ لا بيانات لـ " + sym)
+                st.error("لا بيانات لـ " + sym)
             else:
                 info = finnhub_metrics(sym)
                 offering = check_offering(sym)
                 r = score(sym, hist, info, splits)
 
-                st.markdown('<div class="score-card"><div class="score-big" style="color: ' + r['color'] + ';">' + str(r['total']) + '/100</div><div class="verdict">' + r['verdict'] + '</div></div>', unsafe_allow_html=True)
+                st.markdown('<div class="score-card"><div class="score-big" style="color:' + r['color'] + '">' + str(r['total']) + '/100</div><div class="verdict">' + r['verdict'] + '</div></div>', unsafe_allow_html=True)
 
                 if offering.get("has_offering"):
-                    st.markdown('<div class="danger-box">🚨 <b>طرح حديث:</b> ' + offering.get("form", "") + ' قبل ' + str(offering.get("days", 0)) + ' يوم — تجنب!</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="danger-box">طرح حديث: ' + offering.get("form", "") + ' قبل ' + str(offering.get("days", 0)) + ' يوم - تجنب!</div>', unsafe_allow_html=True)
 
                 if r["bull_trap"]:
-                    st.markdown('<div class="danger-box">⚠️ <b>Bull Trap:</b> كسر مقاومة ثم فشل — خطر!</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="danger-box">Bull Trap: كسر مقاومة ثم فشل - خطر!</div>', unsafe_allow_html=True)
 
                 if r["split_info"].get("has_split"):
                     d = r["split_info"]["days_since"]
-                    label = " 🔥 حديث!" if d <= 180 else ""
-                    st.markdown('<div class="split-box">🔀 <b>Reverse Split:</b> ' + r["split_info"]["ratio"] + ' — قبل ' + str(d) + ' يوم' + label + '</div>', unsafe_allow_html=True)
+                    label = " - حديث!" if d <= 180 else ""
+                    st.markdown('<div class="split-box">Reverse Split: ' + r["split_info"]["ratio"] + ' - قبل ' + str(d) + ' يوم' + label + '</div>', unsafe_allow_html=True)
 
                 if r["short_pct"] > 0:
-                    st.markdown('<div class="info-box">🔥 <b>Short Float:</b> ' + str(round(r["short_pct"]*100, 2)) + '%</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="info-box">Short Float: ' + str(round(r["short_pct"]*100, 2)) + '%</div>', unsafe_allow_html=True)
 
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("💰 السعر", "$" + str(round(r['price'], 3)))
-                c2.metric("📊 RSI", str(r['rsi']))
-                c3.metric("📈 Stoch", str(r['stoch']))
-                c4.metric("📊 RVOL", str(r['rvol']))
+                c1.metric("السعر", "$" + str(round(r['price'], 3)))
+                c2.metric("RSI", str(r['rsi']))
+                c3.metric("Stoch", str(r['stoch']))
+                c4.metric("RVOL", str(r['rvol']))
 
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("📉 MA20", "$" + str(round(r['sma20'], 2)) if r['sma20'] else "—")
-                c2.metric("📉 MA50", "$" + str(round(r['sma50'], 2)) if r['sma50'] else "—")
-                c3.metric("📏 الدعم", "$" + str(round(r['support'], 3)) if r['support'] else "—")
-                c4.metric("🚀 المقاومة", "$" + str(round(r['resistance'], 3)) if r['resistance'] else "—")
+                c1.metric("MA20", "$" + str(round(r['sma20'], 2)) if r['sma20'] else "-")
+                c2.metric("MA50", "$" + str(round(r['sma50'], 2)) if r['sma50'] else "-")
+                c3.metric("الدعم", "$" + str(round(r['support'], 3)) if r['support'] else "-")
+                c4.metric("المقاومة", "$" + str(round(r['resistance'], 3)) if r['resistance'] else "-")
 
                 if r["runner"]:
-                    st.markdown('<div class="success-box">🏆 <b>Former Runner:</b> سبق أن انفجر +50% في يوم!</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="success-box">Former Runner: سبق أن انفجر +50% في يوم!</div>', unsafe_allow_html=True)
                 if r["w_pattern"]:
                     wp = r["w_pattern"]
-                    st.markdown('<div class="success-box">📐 <b>W Pattern:</b> قاعان $' + str(wp['bottom1']) + ' / $' + str(wp['bottom2']) + ' — خط العنق: $' + str(wp['neckline']) + '</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="success-box">W Pattern: قاعان $' + str(wp['bottom1']) + ' / $' + str(wp['bottom2']) + ' - خط العنق: $' + str(wp['neckline']) + '</div>', unsafe_allow_html=True)
                 if r["sweep"]:
-                    st.markdown('<div class="success-box">🎯 <b>سحب سيولة:</b> تم كشفه!</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="success-box">سحب سيولة: تم كشفه!</div>', unsafe_allow_html=True)
                 if r["spring"]:
-                    st.markdown('<div class="success-box">🌊 <b>Spring (وايكوف):</b> كسر ثم استرداد!</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="success-box">Spring (وايكوف): كسر ثم استرداد!</div>', unsafe_allow_html=True)
                 if r["lps"]:
-                    st.markdown('<div class="success-box">📈 <b>LPS (وايكوف):</b> اختراق ثم اختبار ناجح!</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="success-box">LPS (وايكوف): اختراق ثم اختبار ناجح!</div>', unsafe_allow_html=True)
                 if r["candles"]:
-                    st.markdown('<div class="success-box">🕯️ <b>شموع انعكاسية:</b> ' + ", ".join(r["candles"]) + '</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="success-box">شموع انعكاسية: ' + ", ".join(r["candles"]) + '</div>', unsafe_allow_html=True)
                 if r["gap"]:
                     g = r["gap"]
                     direction = "هبوط" if g["direction"] == "down" else "صعود"
-                    st.markdown('<div class="info-box">🕳️ <b>فجوة ' + direction + ':</b> ' + str(g["gap_pct"]) + '% عند $' + str(g["gap_price"]) + '</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="info-box">فجوة ' + direction + ': ' + str(g["gap_pct"]) + '% عند $' + str(g["gap_price"]) + '</div>', unsafe_allow_html=True)
                 if r["rebound"] is not None:
                     if r["rebound"] > 60:
-                        st.markdown('<div class="warn-box">⚠️ <b>الارتداد:</b> ' + str(r['rebound']) + '% — متأخر</div>', unsafe_allow_html=True)
+                        st.markdown('<div class="warn-box">الارتداد: ' + str(r['rebound']) + '% - متأخر</div>', unsafe_allow_html=True)
                     else:
-                        st.markdown('<div class="info-box">📊 <b>تقدم الارتداد:</b> ' + str(r['rebound']) + '% — مبكر</div>', unsafe_allow_html=True)
+                        st.markdown('<div class="info-box">تقدم الارتداد: ' + str(r['rebound']) + '% - مبكر</div>', unsafe_allow_html=True)
 
                 if r["float"]:
-                    st.info("📦 Free Float: **" + str(round(r['float']/1000000, 2)) + "M سهم**")
+                    st.info("Free Float: " + str(round(r['float']/1000000, 2)) + "M سهم")
 
-                st.markdown("### 📊 تفصيل النقاط")
-                st.dataframe(pd.DataFrame(list(r["breakdown"].items()), columns=["المعيار", "النقاط"]),
-                             use_container_width=True, hide_index=True)
+                st.markdown("### تفصيل النقاط")
+                st.dataframe(pd.DataFrame(list(r["breakdown"].items()), columns=["المعيار", "النقاط"]), use_container_width=True, hide_index=True)
 
-                st.markdown('<a href="https://fintel.io/s/us/' + sym.lower() + '" target="_blank">📊 عرض تفاصيل الشورت على Fintel</a>', unsafe_allow_html=True)
+                st.markdown('<a href="https://fintel.io/s/us/' + sym.lower() + '" target="_blank">عرض تفاصيل الشورت على Fintel</a>', unsafe_allow_html=True)
 
 with tab2:
-    st.markdown("### 🔀 أسهم Reverse Split حديثة")
-    st.caption("فحص " + str(len(LOCAL_UNIVERSE)) + " سهماً — قد يستغرق 5-10 دقائق")
-    if st.button("🔀 ابدأ البحث", key="sp"):
+    st.markdown("### أسهم Reverse Split حديثة")
+    st.caption("فحص " + str(len(LOCAL_UNIVERSE)) + " سهماً")
+    if st.button("ابدأ البحث", key="sp"):
         pg = st.progress(0)
         res = []
         for i, s in enumerate(LOCAL_UNIVERSE):
@@ -580,10 +564,10 @@ with tab2:
         pg.empty()
         if res:
             res.sort(key=lambda x: (x["split_details"]["days_since"], -x["total"]))
-            st.success("✅ " + str(len(res)) + " سهم بتقسيم عكسي")
+            st.success(str(len(res)) + " سهم بتقسيم عكسي")
             for r in res[:20]:
                 sp = r["split_details"]
-                with st.expander("🔀 **" + r['symbol'] + "** — " + str(r['total']) + "/100 " + r['verdict']):
+                with st.expander("**" + r['symbol'] + "** - " + str(r['total']) + "/100 " + r['verdict']):
                     c1, c2, c3 = st.columns(3)
                     c1.metric("النسبة", sp["ratio"])
                     c2.metric("قبل", str(sp["days_since"]) + " يوم")
@@ -596,9 +580,9 @@ with tab2:
             st.warning("لا توجد أسهم بتقسيم عكسي.")
 
 with tab3:
-    st.markdown("### 🎯 أفضل 10 أسهم")
+    st.markdown("### أفضل 10 أسهم")
     st.caption("فحص " + str(len(LOCAL_UNIVERSE)) + " سهماً")
-    if st.button("🔍 ابدأ الفحص", key="t"):
+    if st.button("ابدأ الفحص", key="t"):
         pg = st.progress(0)
         res = []
         for i, s in enumerate(LOCAL_UNIVERSE):
@@ -617,23 +601,23 @@ with tab3:
         if res:
             res.sort(key=lambda x: x["total"], reverse=True)
             for i, r in enumerate(res[:10], 1):
-                m = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "•"
-                with st.expander(m + " **" + r['symbol'] + "** — " + str(r['total']) + "/100 " + r['verdict']):
+                m = "1." if i == 1 else "2." if i == 2 else "3." if i == 3 else str(i) + "."
+                with st.expander(m + " **" + r['symbol'] + "** - " + str(r['total']) + "/100 " + r['verdict']):
                     c1, c2, c3 = st.columns(3)
                     c1.metric("السعر", "$" + str(round(r['price'], 3)))
                     c2.metric("RSI", str(r['rsi']))
                     c3.metric("Stoch", str(r['stoch']))
                     if r["support"]:
-                        st.write("📏 الدعم: $" + str(round(r['support'], 3)) + " (على بعد " + str(r['dist_sup']) + "%)")
+                        st.write("الدعم: $" + str(round(r['support'], 3)) + " (على بعد " + str(r['dist_sup']) + "%)")
                     if r["split_info"].get("has_split"):
-                        st.write("🔀 Reverse Split: " + r["split_info"]["ratio"] + " قبل " + str(r["split_info"]["days_since"]) + " يوم")
+                        st.write("Reverse Split: " + r["split_info"]["ratio"] + " قبل " + str(r["split_info"]["days_since"]) + " يوم")
         else:
             st.warning("لا نتائج.")
 
 with tab4:
-    st.markdown("### 💣 رادار الاكتشاف المبكر")
+    st.markdown("### رادار الاكتشاف المبكر")
     st.caption("أسهم Squeeze محتملة")
-    if st.button("🎯 ابحث", key="h"):
+    if st.button("ابحث", key="h"):
         pg = st.progress(0)
         res = []
         for i, s in enumerate(LOCAL_UNIVERSE):
@@ -653,15 +637,15 @@ with tab4:
         if res:
             res.sort(key=lambda x: x["total"], reverse=True)
             for r in res[:10]:
-                with st.expander("💣 **" + r['symbol'] + "** — " + str(r['total']) + "/100"):
+                with st.expander("**" + r['symbol'] + "** - " + str(r['total']) + "/100"):
                     c1, c2, c3 = st.columns(3)
                     c1.metric("السعر", "$" + str(round(r['price'], 3)))
                     c2.metric("RSI", str(r['rsi']))
                     c3.metric("Stoch", str(r['stoch']))
                     if r["short_pct"] > 0:
-                        st.write("🔥 Short Float: " + str(round(r["short_pct"]*100, 2)) + "%")
+                        st.write("Short Float: " + str(round(r["short_pct"]*100, 2)) + "%")
         else:
             st.info("لا فرص حالياً.")
 
 st.markdown("---")
-st.caption("⚠️ تعليمي فقط — ليس توصية استثمارية")
+st.caption("تعليمي فقط - ليس توصية استثمارية")
