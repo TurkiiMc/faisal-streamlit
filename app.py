@@ -9,9 +9,17 @@ st.set_page_config(page_title="Stock Screener", page_icon="🎯", layout="wide")
 PROXY_URL = "https://faisal-proxy.onrender.com"
 FINNHUB_KEY = "demn1c9r01qnf8fq7jc0demn1c9r01qnf8fq7jcg"
 
-st.markdown("<style>.main{direction:rtl}h1,h2,h3{direction:rtl;text-align:right}.score-card{background:linear-gradient(135deg,#f8f9fa,#e9ecef);padding:25px;border-radius:15px;text-align:center;margin:15px 0}.score-big{font-size:56px;font-weight:bold;margin:0}.verdict{font-size:22px;margin-top:10px}.stButton>button{width:100%;background:linear-gradient(90deg,#00b894,#0984e3);color:white;font-weight:bold;border-radius:10px;padding:12px;border:none}.info-box{background:#e8f4f8;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #0984e3}.warn-box{background:#fff3cd;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #fdcb6e}.success-box{background:#d4edda;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #00b894}.danger-box{background:#f8d7da;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #d63031}.split-box{background:#ffe5e5;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #d63031}.plan-box{background:#f0f7ff;padding:15px;border-radius:10px;margin:10px 0;border:2px solid #0984e3}.news-item{background:#fff;padding:10px;border-radius:6px;margin:5px 0;border-right:3px solid #0984e3;font-size:14px}a{color:#0984e3;text-decoration:none}.plan-table{width:100%;border-collapse:collapse;margin-top:10px}.plan-table td{padding:8px;border-bottom:1px solid #d0e4f5;font-size:16px}</style>", unsafe_allow_html=True)
+# ===== فلاتر السوق =====
+MARKET_CAP_MAX = 20_000_000
+FLOAT_MAX = 5_000_000
+PRICE_MAX = 5.0
+VOLUME_MIN = 100_000
+SPLIT_MAX_DAYS = 50
 
-LOCAL_UNIVERSE = [
+st.markdown("<style>.main{direction:rtl}h1,h2,h3{direction:rtl;text-align:right}.score-card{background:linear-gradient(135deg,#f8f9fa,#e9ecef);padding:25px;border-radius:15px;text-align:center;margin:15px 0}.score-big{font-size:56px;font-weight:bold;margin:0}.verdict{font-size:22px;margin-top:10px}.stButton>button{width:100%;background:linear-gradient(90deg,#00b894,#0984e3);color:white;font-weight:bold;border-radius:10px;padding:12px;border:none}.info-box{background:#e8f4f8;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #0984e3}.warn-box{background:#fff3cd;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #fdcb6e}.success-box{background:#d4edda;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #00b894}.danger-box{background:#f8d7da;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #d63031}.split-box{background:#ffe5e5;padding:12px;border-radius:8px;margin:8px 0;border-right:4px solid #d63031}.plan-box{background:#f0f7ff;padding:15px;border-radius:10px;margin:10px 0;border:2px solid #0984e3}.news-item{background:#fff;padding:10px;border-radius:6px;margin:5px 0;border-right:3px solid #0984e3;font-size:14px}a{color:#0984e3;text-decoration:none}.plan-table{width:100%;border-collapse:collapse;margin-top:10px}.plan-table td{padding:8px;border-bottom:1px solid #d0e4f5;font-size:16px}.filter-box{background:#fff8e1;padding:15px;border-radius:10px;margin:10px 0;border:2px solid #fdcb6e}</style>", unsafe_allow_html=True)
+
+# ===== قائمة احتياطية (في حال فشل TradingView) =====
+FALLBACK_UNIVERSE = [
     "AEMD","AKAN","LFS","GDHG","BJDX","DXST","VSME","CLIK","DGHG","CPOP",
     "HTCR","MBRX","MWC","NXTS","SVRE","YYAI","BFRG","BIAF","BNKK","CDTG",
     "SHPH","SONN","TNXP","PHIO","SNPX","AVGR","BDRX","BIOR","CLRB","CRKN",
@@ -46,6 +54,56 @@ LOCAL_UNIVERSE = [
     "PDSB","PEV","PIRS","PLAB"
 ]
 
+# Cache للقائمة الديناميكية
+_universe_cache = {"data": None, "ts": 0}
+
+
+def get_dynamic_universe(limit=500):
+    """
+    جلب قائمة الأسهم ديناميكياً من TradingView
+    الفلاتر: NASDAQ + Market Cap ≤ 20M + Float < 5M + Price < 5 + Volume > 100K
+    """
+    now = datetime.now().timestamp()
+    # Cache لمدة ساعة
+    if _universe_cache["data"] and (now - _universe_cache["ts"]) < 3600:
+        return _universe_cache["data"]
+    
+    try:
+        from tradingview_screener import Query, col
+        
+        q = (Query()
+            .select('name', 'close', 'volume', 'market_cap_basic', 'float_shares')
+            .where(
+                col('exchange') == 'NASDAQ',
+                col('market_cap_basic') <= MARKET_CAP_MAX,
+                col('float_shares') < FLOAT_MAX,
+                col('close') < PRICE_MAX,
+                col('volume') > VOLUME_MIN,
+                col('type') == 'stock'
+            )
+            .order_by('market_cap_basic', ascending=True)
+            .limit(limit))
+        
+        df, _ = q.get_scanner_data()
+        
+        if df is not None and not df.empty:
+            tickers = df['ticker'].tolist() if 'ticker' in df.columns else df['name'].tolist()
+            # إزالة البادئة (NASDAQ:XXX → XXX)
+            tickers = [t.split(':')[-1] if ':' in t else t for t in tickers]
+            tickers = list(dict.fromkeys(tickers))  # إزالة التكرار
+            _universe_cache["data"] = tickers
+            _universe_cache["ts"] = now
+            return tickers
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
+    # Fallback
+    _universe_cache["data"] = FALLBACK_UNIVERSE
+    _universe_cache["ts"] = now
+    return FALLBACK_UNIVERSE
+
 
 def yahoo_candles(symbol, period="6mo"):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -67,7 +125,7 @@ def yahoo_candles(symbol, period="6mo"):
 
 
 def finnhub_metrics(symbol):
-    info = {"floatShares": 0, "shortPercentOfFloat": 0, "sharesShort": 0}
+    info = {"floatShares": 0, "shortPercentOfFloat": 0, "sharesShort": 0, "marketCap": 0}
     if not FINNHUB_KEY:
         return info
     try:
@@ -80,6 +138,8 @@ def finnhub_metrics(symbol):
             sp = m.get("shortPercentOfFloat") or 0
             info["shortPercentOfFloat"] = sp / 100 if sp > 1 else sp
             info["sharesShort"] = m.get("sharesShort") or 0
+            mc = m.get("marketCapitalization") or 0
+            info["marketCap"] = mc * 1000000 if mc and mc < 100000 else mc
     except Exception:
         pass
     return info
@@ -125,27 +185,22 @@ def check_offering(symbol):
 
 
 def check_negative_news(symbol):
-    """فحص الأخبار السلبية من Finnhub"""
     if not FINNHUB_KEY:
         return {"has_negative": False, "items": [], "status": "no_key"}
     try:
         today = datetime.now().strftime("%Y-%m-%d")
         week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         url = "https://finnhub.io/api/v1/company-news"
-        r = requests.get(url, params={
-            "symbol": symbol, "from": week_ago, "to": today, "token": FINNHUB_KEY
-        }, timeout=15)
+        r = requests.get(url, params={"symbol": symbol, "from": week_ago, "to": today, "token": FINNHUB_KEY}, timeout=15)
         if r.status_code != 200:
             return {"has_negative": False, "items": [], "status": "error"}
         news = r.json()
         if not news:
             return {"has_negative": False, "items": [], "status": "no_news"}
-        
         neg_critical = ["bankruptcy", "chapter 11", "chapter 7", "delisting", "delisted", "fraud", "sec investigation", "sec probe", "halted", "trading halt", "going concern"]
         neg_high = ["lawsuit", "class action", "sued", "net loss", "layoffs", "layoff", "restructuring", "downgrade", "downgraded", "price target cut", "misses", "missed estimates", "revenue decline", "warns", "warning", "guidance cut"]
         neg_offering = ["public offering", "private placement", "registered direct", "dilution", "shelf offering", "atm offering", "stock offering"]
         neg_medium = ["investigation", "probe", "subpoena", "recall", "delay", "rejected", "cancellation"]
-        
         matches = []
         for item in news[:30]:
             headline = (item.get("headline") or "").lower()
@@ -170,22 +225,8 @@ def check_negative_news(symbol):
                     date_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
                 except Exception:
                     date_str = "?"
-                matches.append({
-                    "headline": item.get("headline", "")[:120],
-                    "source": item.get("source", "?"),
-                    "date": date_str,
-                    "level": level,
-                    "keyword": keyword,
-                    "url": item.get("url", "")
-                })
-        return {
-            "has_negative": len(matches) > 0,
-            "items": matches[:5],
-            "status": "done",
-            "critical_count": sum(1 for m in matches if m["level"] == "CRITICAL"),
-            "offering_count": sum(1 for m in matches if m["level"] == "OFFERING"),
-            "high_count": sum(1 for m in matches if m["level"] == "HIGH"),
-        }
+                matches.append({"headline": item.get("headline", "")[:120], "source": item.get("source", "?"), "date": date_str, "level": level, "keyword": keyword, "url": item.get("url", "")})
+        return {"has_negative": len(matches) > 0, "items": matches[:5], "status": "done", "critical_count": sum(1 for m in matches if m["level"] == "CRITICAL"), "offering_count": sum(1 for m in matches if m["level"] == "OFFERING"), "high_count": sum(1 for m in matches if m["level"] == "HIGH")}
     except Exception:
         return {"has_negative": False, "items": [], "status": "error"}
 
@@ -213,14 +254,10 @@ def macd(close):
 
 
 def macd_status(mp, mi, hist):
-    if mp and mi:
-        return "إيجابي ويتحسن ✅", "#00b894"
-    elif mp:
-        return "إيجابي لكن يضعف 🟡", "#fdcb6e"
-    elif mi:
-        return "سلبي لكن يتحسن 🟡", "#fdcb6e"
-    else:
-        return "سلبي ويضعف ❌", "#d63031"
+    if mp and mi: return "إيجابي ويتحسن ✅", "#00b894"
+    elif mp: return "إيجابي لكن يضعف 🟡", "#fdcb6e"
+    elif mi: return "سلبي لكن يتحسن 🟡", "#fdcb6e"
+    else: return "سلبي ويضعف ❌", "#d63031"
 
 
 def sma(close, p):
@@ -228,8 +265,7 @@ def sma(close, p):
 
 
 def stoch(high, low, close, kp=14, dp=3):
-    if len(close) < kp:
-        return 50.0
+    if len(close) < kp: return 50.0
     ll = low.rolling(kp).min()
     hh = high.rolling(kp).max()
     d = (hh - ll).replace(0, np.nan)
@@ -239,25 +275,21 @@ def stoch(high, low, close, kp=14, dp=3):
 
 
 def sr(hist, w=20):
-    if hist.empty or len(hist) < w:
-        return None, None
+    if hist.empty or len(hist) < w: return None, None
     return float(hist["Low"].rolling(w).min().iloc[-1]), float(hist["High"].rolling(w).max().iloc[-1])
 
 
 def detect_former_runner(hist):
-    if len(hist) < 20:
-        return False
+    if len(hist) < 20: return False
     returns = hist["Close"].pct_change()
     return bool((returns > 0.5).any())
 
 
 def detect_w_pattern(hist):
-    if len(hist) < 40:
-        return None
+    if len(hist) < 40: return None
     h = hist["Close"].tail(60)
     lows = h[(h.shift(1) > h) & (h.shift(-1) > h)]
-    if len(lows) < 2:
-        return None
+    if len(lows) < 2: return None
     last_two = lows.tail(2)
     diff = abs(last_two.iloc[0] - last_two.iloc[1]) / last_two.iloc[0] * 100
     if diff < 4:
@@ -267,20 +299,33 @@ def detect_w_pattern(hist):
 
 
 def detect_bull_trap(hist):
-    if len(hist) < 25:
-        return False
+    if len(hist) < 25: return False
     resistance = hist["High"].tail(20).max()
     recent = hist.tail(5)
     broke = (recent["High"] > resistance * 0.98).any()
-    if not broke:
-        return False
+    if not broke: return False
     current = hist["Close"].iloc[-1]
     return current < resistance * 0.97
 
 
+def detect_failed_spike(hist):
+    """كشف السهم الذي انفجر ثم هبط (مؤخراً)"""
+    if len(hist) < 20: return None
+    recent = hist.tail(20)
+    max_high = float(recent["High"].max())
+    min_low = float(recent["Low"].min())
+    current = float(hist["Close"].iloc[-1])
+    if min_low <= 0: return None
+    spike_pct = (max_high - min_low) / min_low * 100
+    drop_from_high = (max_high - current) / max_high * 100
+    # انفجر > 50% ثم هبط > 40%
+    if spike_pct > 50 and drop_from_high > 40:
+        return {"spike_pct": round(spike_pct, 1), "drop_pct": round(drop_from_high, 1), "peak": round(max_high, 3)}
+    return None
+
+
 def detect_gap_fill(hist):
-    if len(hist) < 10:
-        return None
+    if len(hist) < 10: return None
     for i in range(len(hist) - 10, len(hist) - 1):
         try:
             prev_close = hist["Close"].iloc[i]
@@ -299,8 +344,7 @@ def detect_gap_fill(hist):
 
 
 def detect_candle_patterns(hist):
-    if len(hist) < 5:
-        return None
+    if len(hist) < 5: return None
     patterns = []
     for i in range(-3, 0):
         try:
@@ -310,8 +354,7 @@ def detect_candle_patterns(hist):
             lo = hist["Low"].iloc[i]
             body = abs(c - o)
             rt = hi - lo
-            if rt == 0:
-                continue
+            if rt == 0: continue
             uw = hi - max(o, c)
             lw = min(o, c) - lo
             if lw > body * 2 and uw < body * 0.5 and body < rt * 0.3:
@@ -326,10 +369,10 @@ def detect_candle_patterns(hist):
     return patterns if patterns else None
 
 
-def detect_reverse_split(splits):
+def detect_reverse_split(splits, max_days=365):
     if not splits:
         return {"has_split": False, "days_since": 9999}
-    cutoff = datetime.now() - timedelta(days=365)
+    cutoff = datetime.now() - timedelta(days=max_days)
     for sp in splits:
         try:
             sp_date = datetime.strptime(sp["date"], "%Y-%m-%d")
@@ -344,51 +387,37 @@ def detect_reverse_split(splits):
 
 
 def detect_stability(hist, support, min_sessions=2):
-    if not support or len(hist) < min_sessions + 2:
-        return None
+    if not support or len(hist) < min_sessions + 2: return None
     recent = hist.tail(min_sessions + 3)
     threshold = support * 0.98
     closes = recent["Close"].values
     lows = recent["Low"].values
     sessions_held = 0
     for c in reversed(closes):
-        if c >= threshold:
-            sessions_held += 1
-        else:
-            break
-    if sessions_held < min_sessions:
-        return None
+        if c >= threshold: sessions_held += 1
+        else: break
+    if sessions_held < min_sessions: return None
     recent_lows = lows[-sessions_held:]
     higher_lows = all(recent_lows[i] >= recent_lows[i-1] * 0.99 for i in range(1, len(recent_lows))) if len(recent_lows) > 1 else False
     if sessions_held >= 3 and higher_lows:
-        strength = "🔥 ثبات قوي"
-        color = "#00b894"
-        points = 10
+        strength, color, points = "🔥 ثبات قوي", "#00b894", 10
     elif sessions_held >= 2 and higher_lows:
-        strength = "✅ ثبات جيد"
-        color = "#00b894"
-        points = 7
+        strength, color, points = "✅ ثبات جيد", "#00b894", 7
     elif sessions_held >= 2:
-        strength = "🟡 ثبات مقبول"
-        color = "#fdcb6e"
-        points = 5
+        strength, color, points = "🟡 ثبات مقبول", "#fdcb6e", 5
     else:
-        strength = "⚠️ ثبات ضعيف"
-        color = "#fdcb6e"
-        points = 0
+        strength, color, points = "⚠️ ثبات ضعيف", "#fdcb6e", 0
     return {"sessions_held": sessions_held, "higher_lows": higher_lows, "strength": strength, "color": color, "points": points}
 
 
 def rebound_progress(hist, support, resistance):
-    if not support or not resistance or resistance == support:
-        return None
+    if not support or not resistance or resistance == support: return None
     price = hist["Close"].iloc[-1]
     return round((price - support) / (resistance - support) * 100, 1)
 
 
 def detect_liquidity_sweep(hist):
-    if len(hist) < 15:
-        return False
+    if len(hist) < 15: return False
     support = hist["Low"].tail(20).min()
     recent = hist.tail(5)
     for i in range(1, len(recent) - 1):
@@ -399,8 +428,7 @@ def detect_liquidity_sweep(hist):
 
 
 def detect_spring(hist):
-    if len(hist) < 40:
-        return None
+    if len(hist) < 40: return None
     support = hist["Low"].tail(40).min()
     last10 = hist.tail(10)
     broke = last10["Low"].min() < support * 0.97
@@ -409,132 +437,90 @@ def detect_spring(hist):
 
 
 def detect_lps(hist):
-    if len(hist) < 40:
-        return None
+    if len(hist) < 40: return None
     resistance = hist["High"].tail(30).max()
     recent = hist.tail(15)
-    if not (recent["High"].max() > resistance * 0.98):
-        return None
+    if not (recent["High"].max() > resistance * 0.98): return None
     pullback = recent["Low"].min()
     price = hist["Close"].iloc[-1]
     return {"detected": True} if (pullback > resistance * 0.95 and price > pullback) else None
 
 
-def score(symbol, hist, info, splits=None, news=None):
-    close = hist["Close"]
-    high = hist["High"]
-    low = hist["Low"]
-    vol = hist["Volume"]
+def score(symbol, hist, info, splits=None, news=None, max_split_days=365):
+    close, high, low, vol = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
     price = float(close.iloc[-1])
     r = rsi(close)
     mp, mi, macd_hist = macd(close)
     macd_txt, macd_color = macd_status(mp, mi, macd_hist)
     sk = stoch(high, low, close)
-    s20 = sma(close, 20)
-    s30 = sma(close, 30)
-    s50 = sma(close, 50)
+    s20, s30, s50 = sma(close, 20), sma(close, 30), sma(close, 50)
     sup, res = sr(hist, 20)
     fs = info.get("floatShares", 0) or 0
+    mc = info.get("marketCap", 0) or 0
     cv = int(vol.iloc[-1]) if len(vol) else 0
     avg_vol = float(vol.tail(20).mean()) if len(vol) >= 20 else 0
     rv = round(cv / avg_vol, 2) if avg_vol > 0 else 0
 
     bd = {}
-    if 23 <= r <= 27:
-        bd["RSI"] = 25
-    elif 20 <= r < 23:
-        bd["RSI"] = 12
-    elif 27 < r <= 30:
-        bd["RSI"] = 15
-    elif 30 < r <= 35:
-        bd["RSI"] = 6
-    else:
-        bd["RSI"] = 0
+    if 23 <= r <= 27: bd["RSI"] = 25
+    elif 20 <= r < 23: bd["RSI"] = 12
+    elif 27 < r <= 30: bd["RSI"] = 15
+    elif 30 < r <= 35: bd["RSI"] = 6
+    else: bd["RSI"] = 0
 
-    split_info = detect_reverse_split(splits)
+    split_info = detect_reverse_split(splits, max_days=max_split_days)
     if split_info["has_split"]:
         d = split_info["days_since"]
-        if d <= 180:
-            bd["Split"] = 20
-        elif d <= 365:
-            bd["Split"] = 10
-        else:
-            bd["Split"] = 0
-    else:
-        bd["Split"] = 0
+        if d <= 180: bd["Split"] = 20
+        elif d <= 365: bd["Split"] = 10
+        else: bd["Split"] = 0
+    else: bd["Split"] = 0
 
     if fs:
-        if fs < 1000000:
-            bd["Float"] = 15
-        elif fs < 5000000:
-            bd["Float"] = 12
-        elif fs < 10000000:
-            bd["Float"] = 8
-        elif fs < 20000000:
-            bd["Float"] = 5
-        else:
-            bd["Float"] = 0
-    else:
-        bd["Float"] = 0
+        if fs < 1000000: bd["Float"] = 15
+        elif fs < 5000000: bd["Float"] = 12
+        elif fs < 10000000: bd["Float"] = 8
+        elif fs < 20000000: bd["Float"] = 5
+        else: bd["Float"] = 0
+    else: bd["Float"] = 0
 
-    if mp and mi:
-        bd["MACD"] = 15
-    elif mi:
-        bd["MACD"] = 8
-    else:
-        bd["MACD"] = 0
+    if mp and mi: bd["MACD"] = 15
+    elif mi: bd["MACD"] = 8
+    else: bd["MACD"] = 0
 
     if s20 and s30 and s50:
         b = sum(1 for x in [s20, s30, s50] if price < x)
         bd["MA"] = {3: 15, 2: 8, 1: 5}.get(b, 0)
-    else:
-        bd["MA"] = 0
+    else: bd["MA"] = 0
 
-    if sk < 20:
-        bd["Stoch"] = 10
-    elif sk < 30:
-        bd["Stoch"] = 8
-    elif sk < 40:
-        bd["Stoch"] = 6
-    elif sk < 50:
-        bd["Stoch"] = 4
-    else:
-        bd["Stoch"] = 0
+    if sk < 20: bd["Stoch"] = 10
+    elif sk < 30: bd["Stoch"] = 8
+    elif sk < 40: bd["Stoch"] = 6
+    elif sk < 50: bd["Stoch"] = 4
+    else: bd["Stoch"] = 0
 
     ds = None
     if sup:
         ds = round((price - sup) / price * 100, 2)
-        if ds < 3:
-            bd["Support"] = 10
-        elif ds < 5:
-            bd["Support"] = 7
-        elif ds < 8:
-            bd["Support"] = 3
-        elif ds < 15:
-            bd["Support"] = 0
-        else:
-            bd["Support"] = -15
-    else:
-        bd["Support"] = 0
+        if ds < 3: bd["Support"] = 10
+        elif ds < 5: bd["Support"] = 7
+        elif ds < 8: bd["Support"] = 3
+        elif ds < 15: bd["Support"] = 0
+        else: bd["Support"] = -15
+    else: bd["Support"] = 0
 
-    if rv > 5:
-        bd["RVOL"] = 5
-    elif rv >= 2:
-        bd["RVOL"] = 3
-    else:
-        bd["RVOL"] = 0
+    if rv > 5: bd["RVOL"] = 5
+    elif rv >= 2: bd["RVOL"] = 3
+    else: bd["RVOL"] = 0
 
     stability = detect_stability(hist, sup, min_sessions=2)
     bd["Stability"] = stability["points"] if stability else 0
 
     rebound = rebound_progress(hist, sup, res)
     if rebound is not None:
-        if rebound < 30:
-            bd["Rebound"] = 5
-        elif rebound < 60:
-            bd["Rebound"] = 0
-        else:
-            bd["Rebound"] = -10
+        if rebound < 30: bd["Rebound"] = 5
+        elif rebound < 60: bd["Rebound"] = 0
+        else: bd["Rebound"] = -10
 
     is_runner = detect_former_runner(hist)
     bd["Runner"] = 5 if is_runner else 0
@@ -546,43 +532,156 @@ def score(symbol, hist, info, splits=None, news=None):
 
     # عقوبات الأخبار
     if news:
-        if news.get("critical_count", 0) > 0:
-            total = max(0, total - 30)
-        if news.get("offering_count", 0) > 0:
-            total = max(0, total - 20)
-        if news.get("high_count", 0) >= 2:
-            total = max(0, total - 10)
+        if news.get("critical_count", 0) > 0: total = max(0, total - 30)
+        if news.get("offering_count", 0) > 0: total = max(0, total - 20)
+        if news.get("high_count", 0) >= 2: total = max(0, total - 10)
 
-    if total >= 80:
-        v = "مثالي"
-        c = "#00b894"
-    elif total >= 65:
-        v = "ممتاز"
-        c = "#00b894"
-    elif total >= 50:
-        v = "جيد"
-        c = "#fdcb6e"
-    elif total >= 35:
-        v = "ضعيف"
-        c = "#e17055"
-    else:
-        v = "مرفوض"
-        c = "#d63031"
+    # عقوبة Failed Spike
+    failed_spike = detect_failed_spike(hist)
+    if failed_spike:
+        total = max(0, total - 25)
+
+    if total >= 80: v, c = "مثالي", "#00b894"
+    elif total >= 65: v, c = "ممتاز", "#00b894"
+    elif total >= 50: v, c = "جيد", "#fdcb6e"
+    elif total >= 35: v, c = "ضعيف", "#e17055"
+    else: v, c = "مرفوض", "#d63031"
 
     return {
         "symbol": symbol, "price": price, "rsi": round(r, 2), "stoch": round(sk, 2),
-        "macd_pos": mp, "macd_imp": mi, "macd_hist": round(macd_hist, 4),
+        "macd_pos": mp, "macd_imp": mi,has "macd_hist": round(macd_hist, 4),
         "macd_txt": macd_txt, "macd_color": macd_color,
         "sma20": s20, "sma50": s50,
-        "support": sup, "resistance": res, "dist_sup": ds, "float": fs, "rvol": rv,
+        "support": sup, "resistance": res, "dist_sup": ds, "float": fs, "marketCap": mc, "rvol": rv,
         "short_pct": info.get("shortPercentOfFloat", 0) or 0,
         "breakdown": bd, "total": total, "verdict": v, "color": c,
         "rebound": rebound, "split_info": split_info, "stability": stability,
         "sweep": detect_liquidity_sweep(hist), "spring": detect_spring(hist),
-        "lps": detect_lps(hist), "w_pattern": w_pat, "runner": is_runner,
-        "bull_trap": detect_bull_trap(hist), "gap": detect_gap_fill(hist),
-        "candles": detect_candle_patterns(hist)
+        "lps": detect_lps(_hist), "w_pattern": w_pat, "runneroff": is_runner,
+        "bull_trapering": detect_bull_trap(hist),"):
+ "failed_spike": failed_spike,
+        "gap":        detect_gap_fill(hist), "candles": detect_candle_patterns(hist)
     }
+
+
+def render_full_analysis(sym, hist, splits, info, news, offering, r):
+    st.markdown('<div class="score-card"><div class="score-big" style="color:' + r['color'] + '">' + str(r['total']) + '/100</div><div class="verdict">' + r['verdict'] + '</div></div>', unsafe_allow_html=True)
+
+    if r.get("failed_spike"):
+        fs = r["failed_spike"]
+        st.markdown('<div class="danger-box">🚨 <b>Failed Spike!</b> السهم انفجر +' + str(fs["spike_pct"]) + '% ثم هبط -' + str(fs["drop_pct"]) + '% من القمة $' + str(fs["peak"]) + ' — تجنب!</div>', unsafe_allow_html=True)
+
+    if news.get("critical_count", 0) > 0:
+        st.markdown('<div class="danger-box">🚨 <b>أخبار حرجة!</b> ' + str(news["critical_count"]) + ' خبر خطير - تجنب السهم!</div>', unsafe_allow_html=True)
+    if news.get("offering_count", 0) > 0:
+        st.markdown('<div class="danger-box">⚠️ <b>طرح جديد محتمل!</b> ' + str(news["offering_count"]) + ' خبر عن طرح/إضعاف - خطر!</div>', unsafe_allow_html=True)
+    if offering.get(" st.markdown('<div class="danger-box">📋 <b>طرح في SEC:</b> ' + offering.get("form", "") + ' قبل ' + str(offering.get("days", 0)) + ' يوم - تجنب!</div>', unsafe_allow_html=True)
+
+    if news.get("items"):
+        st.markdown("#### 📰 آخر الأخبار السلبية")
+        for item in news["items"]:
+            if item["level"] == "CRITICAL": emoji, color = "🚨", "#d63031"
+            elif item["level"] == "OFFERING": emoji, color = "💰", "#d63031"
+            elif item["level"] == "HIGH": emoji, color = "⚠️", "#e17055"
+            else: emoji, color = "🟡", "#fdcb6e"
+            st.markdown('<div class="news-item" style="border-right-color:' + color + '">' + emoji + ' <b>' + item["headline"] + '</b><br><small>' + item["source"] + ' - ' + item["date"] + '</small></div>', unsafe_allow_html=True)
+
+    if r["stability"]:
+        s = r["stability"]
+        hl = " + قيعان أعلى ✅" if s["higher_lows"] else ""
+        st.markdown('<div class="success-box" style="border-right-color:' + s["color"] + '">📊 <b>نموذج الثبات:</b> ' + s["strength"] + ' - ' + str(s["sessions_held"]) + ' جلسات فوق الدعم' + hl + '</div>', unsafe_allow_html=True)
+    elif r["support"]:
+        st.markdown('<div class="warn-box">⚠️ <b>نموذج الثبات:</b> أقل من جلستين فوق الدعم - انتظر</div>', unsafe_allow_html=True)
+
+    if r["bull_trap"]:
+        st.markdown('<div class="danger-box">Bull Trap: كسر مقاومة ثم فشل - خطر!</div>', unsafe_allow_html=True)
+    if r["split_info"].get("has_split"):
+        d = r["split_info"]["days_since"]
+        label = " - حديث!" if d <= 180 else ""
+        st.markdown('<div class="split-box">Reverse Split: ' + r["split_info"]["ratio"] + ' - قبل ' + str(d) + ' يوم' + label + '</div>', unsafe_allow_html=True)
+    if r["short_pct"] > 0:
+        short_warn = " - مرتفع! Squeeze محتمل" if r["short_pct"] > 0.20 else ""
+        st.markdown('<div class="info-box">Short Float: ' + str(round(r["short_pct"]*100, 2)) + '%' + short_warn + '</div>', unsafe_allow_html=True)
+    if r["marketCap"]:
+        st.markdown('<div class="info-box">Market Cap: $' + str(round(r["marketCap"]/1000000, 2)) + 'M</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="info-box" style="border-right-color:' + r["macd_color"] + '"><b>MACD:</b> ' + r["macd_txt"] + ' (قيمة: ' + str(r["macd_hist"]) + ')</div>', unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("السعر", "$" + str(round(r['price'], 3)))
+    c2.metric("RSI", str(r['rsi']))
+    c3.metric("Stoch", str(r['stoch']))
+    c4.metric("RVOL", str(r['rvol']))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("MA20", "$" + str(round(r['sma20'], 2)) if r['sma20'] else "-")
+    c2.metric("MA50", "$" + str(round(r['sma50'], 2)) if r['sma50'] else "-")
+    c3.metric("الدعم", "$" + str(round(r['support'], 3)) if r['support'] else "-")
+    c4.metric("المقاومة", "$" + str(round(r['resistance'], 3)) if r['resistance'] else "-")
+
+    if r["runner"]:
+        st.markdown('<div class="success-box">Former Runner: سبق أن انفجر +50% في يوم!</div>', unsafe_allow_html=True)
+    if r["w_pattern"]:
+        wp = r["w_pattern"]
+        st.markdown('<div class="success-box">W Pattern: قاعان $' + str(wp['bottom1']) + ' / $' + str(wp['bottom2']) + ' - خط العنق: $' + str(wp['neckline']) + '</div>', unsafe_allow_html=True)
+    if r["sweep"]:
+        st.markdown('<div class="success-box">سحب سيولة: تم كشفه!</div>', unsafe_allow_html=True)
+    if r["spring"]:
+        st.markdown('<div class="success-box">Spring (وايكوف): كسر ثم استرداد!</div>', unsafe_allow_html=True)
+    if r["lps"]:
+        st.markdown('<div class="success-box">LPS (وايكوف): اختراق ثم اختبار ناجح!</div>', unsafe_allow_html=True)
+    if r["candles"]:
+        st.markdown('<div class="success-box">شموع انعكاسية: ' + ", ".join(r["candles"]) + '</div>', unsafe_allow_html=True)
+    if r["gap"]:
+        g = r["gap"]
+        direction = "هبوط" if g["direction"] == "down" else "صعود"
+        st.markdown('<div class="info-box">فجوة ' + direction + ': ' + str(g["gap_pct"]) + '% عند $' + str(g["gap_price"]) + '</div>', unsafe_allow_html=True)
+    if r["rebound"] is not None:
+        if r["rebound"] > 60:
+            st.markdown('<div class="warn-box">الارتداد: ' + str(r['rebound']) + '% - متأخر</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="info-box">تقدم الارتداد: ' + str(r['rebound']) + '% - مبكر</div>', unsafe_allow_html=True)
+
+    if r["float"]:
+        st.info("Free Float: " + str(round(r['float']/1000000, 2)) + "M سهم")
+    else:
+        st.info("Free Float: غير متوفر")
+
+    if r["support"] and r["resistance"]:
+        sup_val, res_val, current_price = r["support"], r["resistance"], r["price"]
+        entry = round(sup_val * 1.02, 3)
+        stop = round(sup_val * 0.94, 3)
+        target1 = round(res_val, 3)
+        target2 = round(res_val * 1.20, 3)
+        target3 = round(res_val * 1.50, 3)
+        risk = round((entry - stop) / entry * 100, 2)
+        reward1 = round((target1 - entry) / entry * 100, 2)
+        rr = round((target1 - entry) / (entry - stop), 2) if entry > stop else 0
+        if current_price > entry * 1.03:
+            entry_status, entry_color = " - السعر أعلى من الدخول، انتظر النزول", "#d63031"
+        elif current_price < entry * 0.98:
+            entry_status, entry_color = " - السعر تحت الدخول، فرصة!", "#00b894"
+        else:
+            entry_status, entry_color = " - السعر عند منطقة الدخول", "#0984e3"
+
+        st.markdown("### خطة الدخول والخروج")
+        st.markdown(
+            '<div class="plan-box"><table class="plan-table">'
+            '<tr><td><b>السعر الحالي</b></td><td>$' + str(round(current_price, 3)) + '</td></tr>'
+            '<tr><td><b>الدخول المقترح</b></td><td style="color:' + entry_color + '"><b>$' + str(entry) + '</b>' + entry_status + '</td></tr>'
+            '<tr><td><b>الوقف</b></td><td style="color:#d63031"><b>$' + str(stop) + '</b> (مخاطرة ' + str(risk) + '%)</td></tr>'
+            '<tr><td><b>هدف 1</b></td><td style="color:#00b894"><b>$' + str(target1) + '</b> (+' + str(reward1) + '%)</td></tr>'
+            '<tr><td><b>هدف 2</b></td><td style="color:#00b894">$' + str(target2) + '</td></tr>'
+            '<tr><td><b>هدف 3</b></td><td style="color:#00b894">$' + str(target3) + '</td></tr>'
+            '<tr><td><b>نسبة المخاطرة/المكافأة</b></td><td><b>1 : ' + str(rr) + '</b></td></tr>'
+            '<tr><td><b>حجم المخاطرة</b></td><td>1-2% من المحفظة</td></tr>'
+            '</table></div>',
+            unsafe_allow_html=True
+        )
+
+    st.markdown("### تفصيل النقاط")
+    st.dataframe(pd.DataFrame(list(r["breakdown"].items()), columns=["المعيار", "النقاط"]), use_container_width=True, hide_index=True)
+    else st.markdown('<a href str="https(i://fintel.io)/ss/us/' + sym.lower() + '" target="_blank">عرض تفاصيل Short Interest على Fintel</a>', unsafe_allow_html=True)
 
 
 st.markdown("# Stock Screener")
@@ -609,199 +708,115 @@ with tab1:
                 offering = check_offering(sym)
                 news = check_negative_news(sym)
                 r = score(sym, hist, info, splits, news)
+                render_full_analysis(sym, hist, splits, info, news, offering, r)
 
-                st.markdown('<div class="score-card"><div class="score-big" style="color:' + r['color'] + '">' + str(r['total']) + '/100</div><div class="verdict">' + r['verdict'] + '</div></div>', unsafe_allow_html=True)
-
-                # ====== الأخبار السلبية ======
-                if news.get("critical_count", 0) > 0:
-                    st.markdown('<div class="danger-box">🚨 <b>أخبار حرجة!</b> ' + str(news["critical_count"]) + ' خبر خطير - تجنب السهم!</div>', unsafe_allow_html=True)
-                if news.get("offering_count", 0) > 0:
-                    st.markdown('<div class="danger-box">⚠️ <b>طرح جديد محتمل!</b> ' + str(news["offering_count"]) + ' خبر عن طرح/إضعاف - خطر!</div>', unsafe_allow_html=True)
-
-                if offering.get("has_offering"):
-                    st.markdown('<div class="danger-box">📋 <b>طرح في SEC:</b> ' + offering.get("form", "") + ' قبل ' + str(offering.get("days", 0)) + ' يوم - تجنب!</div>', unsafe_allow_html=True)
-
-                if news.get("items"):
-                    st.markdown("#### 📰 آخر الأخبار السلبية")
-                    for item in news["items"]:
-                        if item["level"] == "CRITICAL":
-                            emoji = "🚨"
-                            color = "#d63031"
-                        elif item["level"] == "OFFERING":
-                            emoji = "💰"
-                            color = "#d63031"
-                        elif item["level"] == "HIGH":
-                            emoji = "⚠️"
-                            color = "#e17055"
-                        else:
-                            emoji = "🟡"
-                            color = "#fdcb6e"
-                        st.markdown(
-                            '<div class="news-item" style="border-right-color:' + color + '">'
-                            + emoji + ' <b>' + item["headline"] + '</b><br>'
-                            '<small>' + item["source"] + ' - ' + item["date"] + '</small>'
-                            '</div>',
-                            unsafe_allow_html=True
-                        )
-
-                # ====== الثبات ======
-                if r["stability"]:
-                    s = r["stability"]
-                    hl = " + قيعان أعلى ✅" if s["higher_lows"] else ""
-                    st.markdown('<div class="success-box" style="border-right-color:' + s["color"] + '">📊 <b>نموذج الثبات:</b> ' + s["strength"] + ' - ' + str(s["sessions_held"]) + ' جلسات فوق الدعم' + hl + '</div>', unsafe_allow_html=True)
-                elif r["support"]:
-                    st.markdown('<div class="warn-box">⚠️ <b>نموذج الثبات:</b> أقل من جلستين فوق الدعم - انتظر</div>', unsafe_allow_html=True)
-
-                if r["bull_trap"]:
-                    st.markdown('<div class="danger-box">Bull Trap: كسر مقاومة ثم فشل - خطر!</div>', unsafe_allow_html=True)
-
-                if r["split_info"].get("has_split"):
-                    d = r["split_info"]["days_since"]
-                    label = " - حديث!" if d <= 180 else ""
-                    st.markdown('<div class="split-box">Reverse Split: ' + r["split_info"]["ratio"] + ' - قبل ' + str(d) + ' يوم' + label + '</div>', unsafe_allow_html=True)
-
-                if r["short_pct"] > 0:
-                    short_warn = " - مرتفع! Squeeze محتمل" if r["short_pct"] > 0.20 else ""
-                    st.markdown('<div class="info-box">Short Float: ' + str(round(r["short_pct"]*100, 2)) + '%' + short_warn + '</div>', unsafe_allow_html=True)
-
-                st.markdown('<div class="info-box" style="border-right-color:' + r["macd_color"] + '"><b>MACD:</b> ' + r["macd_txt"] + ' (قيمة: ' + str(r["macd_hist"]) + ')</div>', unsafe_allow_html=True)
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("السعر", "$" + str(round(r['price'], 3)))
-                c2.metric("RSI", str(r['rsi']))
-                c3.metric("Stoch", str(r['stoch']))
-                c4.metric("RVOL", str(r['rvol']))
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("MA20", "$" + str(round(r['sma20'], 2)) if r['sma20'] else "-")
-                c2.metric("MA50", "$" + str(round(r['sma50'], 2)) if r['sma50'] else "-")
-                c3.metric("الدعم", "$" + str(round(r['support'], 3)) if r['support'] else "-")
-                c4.metric("المقاومة", "$" + str(round(r['resistance'], 3)) if r['resistance'] else "-")
-
-                if r["runner"]:
-                    st.markdown('<div class="success-box">Former Runner: سبق أن انفجر +50% في يوم!</div>', unsafe_allow_html=True)
-                if r["w_pattern"]:
-                    wp = r["w_pattern"]
-                    st.markdown('<div class="success-box">W Pattern: قاعان $' + str(wp['bottom1']) + ' / $' + str(wp['bottom2']) + ' - خط العنق: $' + str(wp['neckline']) + '</div>', unsafe_allow_html=True)
-                if r["sweep"]:
-                    st.markdown('<div class="success-box">سحب سيولة: تم كشفه!</div>', unsafe_allow_html=True)
-                if r["spring"]:
-                    st.markdown('<div class="success-box">Spring (وايكوف): كسر ثم استرداد!</div>', unsafe_allow_html=True)
-                if r["lps"]:
-                    st.markdown('<div class="success-box">LPS (وايكوف): اختراق ثم اختبار ناجح!</div>', unsafe_allow_html=True)
-                if r["candles"]:
-                    st.markdown('<div class="success-box">شموع انعكاسية: ' + ", ".join(r["candles"]) + '</div>', unsafe_allow_html=True)
-                if r["gap"]:
-                    g = r["gap"]
-                    direction = "هبوط" if g["direction"] == "down" else "صعود"
-                    st.markdown('<div class="info-box">فجوة ' + direction + ': ' + str(g["gap_pct"]) + '% عند $' + str(g["gap_price"]) + '</div>', unsafe_allow_html=True)
-                if r["rebound"] is not None:
-                    if r["rebound"] > 60:
-                        st.markdown('<div class="warn-box">الارتداد: ' + str(r['rebound']) + '% - متأخر</div>', unsafe_allow_html=True)
-                    else:
-                        st.markdown('<div class="info-box">تقدم الارتداد: ' + str(r['rebound']) + '% - مبكر</div>', unsafe_allow_html=True)
-
-                if r["float"]:
-                    st.info("Free Float: " + str(round(r['float']/1000000, 2)) + "M سهم")
-                else:
-                    st.info("Free Float: غير متوفر")
-
-                if r["support"] and r["resistance"]:
-                    sup_val = r["support"]
-                    res_val = r["resistance"]
-                    current_price = r["price"]
-                    entry = round(sup_val * 1.02, 3)
-                    stop = round(sup_val * 0.94, 3)
-                    target1 = round(res_val, 3)
-                    target2 = round(res_val * 1.20, 3)
-                    target3 = round(res_val * 1.50, 3)
-                    risk = round((entry - stop) / entry * 100, 2)
-                    reward1 = round((target1 - entry) / entry * 100, 2)
-                    rr = round((target1 - entry) / (entry - stop), 2) if entry > stop else 0
-                    if current_price > entry * 1.03:
-                        entry_status = " - السعر أعلى من الدخول، انتظر النزول"
-                        entry_color = "#d63031"
-                    elif current_price < entry * 0.98:
-                        entry_status = " - السعر تحت الدخول، فرصة!"
-                        entry_color = "#00b894"
-                    else:
-                        entry_status = " - السعر عند منطقة الدخول"
-                        entry_color = "#0984e3"
-
-                    st.markdown("### خطة الدخول والخروج")
-                    st.markdown(
-                        '<div class="plan-box"><table class="plan-table">'
-                        '<tr><td><b>السعر الحالي</b></td><td>$' + str(round(current_price, 3)) + '</td></tr>'
-                        '<tr><td><b>الدخول المقترح</b></td><td style="color:' + entry_color + '"><b>$' + str(entry) + '</b>' + entry_status + '</td></tr>'
-                        '<tr><td><b>الوقف</b></td><td style="color:#d63031"><b>$' + str(stop) + '</b> (مخاطرة ' + str(risk) + '%)</td></tr>'
-                        '<tr><td><b>هدف 1</b></td><td style="color:#00b894"><b>$' + str(target1) + '</b> (+' + str(reward1) + '%)</td></tr>'
-                        '<tr><td><b>هدف 2</b></td><td style="color:#00b894">$' + str(target2) + '</td></tr>'
-                        '<tr><td><b>هدف 3</b></td><td style="color:#00b894">$' + str(target3) + '</td></tr>'
-                        '<tr><td><b>نسبة المخاطرة/المكافأة</b></td><td><b>1 : ' + str(rr) + '</b></td></tr>'
-                        '<tr><td><b>حجم المخاطرة</b></td><td>1-2% من المحفظة</td></tr>'
-                        '</table></div>',
-                        unsafe_allow_html=True
-                    )
-
-                st.markdown("### تفصيل النقاط")
-                st.dataframe(pd.DataFrame(list(r["breakdown"].items()), columns=["المعيار", "النقاط"]), use_container_width=True, hide_index=True)
-
-                st.markdown('<a href="https://fintel.io/ss/us/' + sym.lower() + '" target="_blank">عرض تفاصيل Short Interest على Fintel</a>', unsafe_allow_html=True)
-
+# =============== TAB 2: أسهم التقسيم الديناميكية ===============
 with tab2:
-    st.markdown("### أسهم Reverse Split حديثة")
-    st.caption("فحص " + str(len(LOCAL_UNIVERSE)) + " سهماً")
-    if st.button("ابدأ البحث", key="sp"):
+    st.markdown("### أسهم Reverse Split — حديثة (30-50 يوم)")
+    
+    st.markdown(
+        '<div class="filter-box">'
+        '<b>🎯 الفلاتر المطبقة:</b><br>'
+        '• مصدر الأسهم: <b>TradingView Screener (ديناميكي)</b><br>'
+        '• Reverse Split: خلال آخر <b>50 يوم</b><br>'
+        '• Market Cap: <b>≤ 20M</b><br>'
+        '• Float: <b>< 5M</b><br>'
+        '• Price < $5 | Volume > 100K'
+        '</div>',
+        unsafe_allow_html=True
+    )
+    
+    if st.button("ابدأ البحث الديناميكي", key="sp"):
+        with st.spinner("جاري تحميل قائمة الأسهم من TradingView..."):
+            universe = get_dynamic_universe(limit=500)
+        st.info("📡 تم تحميل " + str(len(universe)) + " سهم من TradingView")
+        
         pg = st.progress(0)
         res = []
-        for i, s in enumerate(LOCAL_UNIVERSE):
-            pg.progress((i + 1) / len(LOCAL_UNIVERSE))
+        skipped_cap = 0
+        skipped_float = 0
+        for i, s in enumerate(universe):
+            pg.progress((i + 1) / len(universe))
             try:
                 h, sps = yahoo_candles(s, "1y")
                 if h.empty or len(h) < 30:
                     continue
-                sp_info = detect_reverse_split(sps)
-                if sp_info.get("has_split"):
-                    inf = finnhub_metrics(s)
-                    r = score(s, h, inf, sps)
-                    r["split_details"] = sp_info
-                    res.append(r)
+                sp_info = detect_reverse_split(sps, max_days=SPLIT_MAX_DAYS)
+                if not sp_info.get("has_split"):
+                    continue
+                inf = finnhub_metrics(s)
+                mc = inf.get("marketCap", 0) or 0
+                fs = inf.get("floatShares", 0) or 0
+                if mc > 0 and mc > MARKET_CAP_MAX:
+                    skipped_cap += 1
+                    continue
+                if fs > 0 and fs >= FLOAT_MAX:
+                    skipped_float += 1
+                    continue
+                r = score(s, h, inf, sps, max_split_days=SPLIT_MAX_DAYS)
+                r["split_details"] = sp_info
+                res.append(r)
             except Exception:
                 continue
         pg.empty()
+        
         if res:
             res.sort(key=lambda x: (x["split_details"]["days_since"], -x["total"]))
-            st.success(str(len(res)) + " سهم بتقسيم عكسي")
+            st.success("✅ " + str(len(res)) + " سهم مطابق (تجاوز " + str(skipped_cap) + " بسبب Market Cap، و " + str(skipped_float) + " بسبب Float)")
+            
             for r in res[:20]:
                 sp = r["split_details"]
-                with st.expander("**" + r['symbol'] + "** - " + str(r['total']) + "/100 " + r['verdict']):
-                    c1, c2, c3 = st.columns(3)
+                mc_display = "$" + str(round(r["marketCap"]/1000000, 2)) + "M" if r["marketCap"] else "?"
+                float_display = str(round(r["float"]/1000000, 2)) + "M" if r["float"] else "?"
+                days_ago = sp["days_since"]
+                age_emoji = "🔥" if days_ago <= 30 else "✅"
+                with st.expander(age_emoji + " **" + r['symbol'] + "** — " + str(r['total']) + "/100 " + r['verdict'] + " | Split " + sp["ratio"] + " (" + str(days_ago) + " يوم) | MC " + mc_display + " | Float " + float_display):
+                    c1, c2, c3, c4 = st.columns(4)
                     c1.metric("النسبة", sp["ratio"])
-                    c2.metric("قبل", str(sp["days_since"]) + " يوم")
-                    c3.metric("النقاط", str(r['total']))
-                    c1, c2, c3 = st.columns(3)
+                    c2.metric("قبل", str(days_ago) + " يوم")
+                    c3.metric("Market Cap", mc_display)
+                    c4.metric("Float", float_display)
+                    
+                    c1, c2, c3, c4 = st.columns(4)
                     c1.metric("السعر", "$" + str(round(r['price'], 3)))
                     c2.metric("RSI", str(r['rsi']))
                     c3.metric("Stoch", str(r['stoch']))
-                    st.markdown('<a href="https://fintel.io/ss/us/' + r['symbol'].lower() + '" target="_blank">Fintel Short Interest</a>', unsafe_allow_html=True)
+                    c4.metric("النقاط", str(r['total']) + "/100")
+                    
+                    if r.get("failed_spike"):
+                        fs = r["failed_spike"]
+                        st.markdown('<div class="danger-box">🚨 Failed Spike: انفجر +' + str(fs["spike_pct"]) + '% ثم هبط -' + str(fs["drop_pct"]) + '%</div>', unsafe_allow_html=True)
+                    
+                    if r["stability"]:
+                        st.write("📊 الثبات: " + r["stability"]["strength"] + " - " + str(r["stability"]["sessions_held"]) + " جلسات")
+                    
+                    if r["support"]:
+                        st.write("📏 الدعم: $" + str(round(r['support'], 3)) + " (على بعد " + str(r['dist_sup']) + "%)")
+                    
+                    st.markdown('<a href="https://fintel.io/ss/us/' + r['symbol'].lower() + '" target="_blank">📊 Fintel Short Interest</a>', unsafe_allow_html=True)
         else:
-            st.warning("لا توجد أسهم بتقسيم عكسي.")
+            st.warning("لا توجد أسهم مطابقة")
 
+# =============== TAB 3: أفضل 10 ديناميكية ===============
 with tab3:
-    st.markdown("### أفضل 10 أسهم")
-    st.caption("فحص " + str(len(LOCAL_UNIVERSE)) + " سهماً")
-    if st.button("ابدأ الفحص", key="t"):
+    st.markdown("### أفضل 10 أسهم — TradingView Screener")
+    st.caption("مصدر ديناميكي من TradingView")
+    if st.button("ابدأ الفحص الديناميكي", key="t"):
+        with st.spinner("جاري تحميل القائمة..."):
+            universe = get_dynamic_universe(limit=300)
+        st.info("📡 " + str(len(universe)) + " سهم")
+        
         pg = st.progress(0)
         res = []
-        for i, s in enumerate(LOCAL_UNIVERSE):
-            pg.progress((i + 1) / len(LOCAL_UNIVERSE))
+        for i, s in enumerate(universe):
+            pg.progress((i + 1) / len(universe))
             try:
                 h, sps = yahoo_candles(s, "3mo")
                 if h.empty or len(h) < 30:
                     continue
                 inf = finnhub_metrics(s)
                 r = score(s, h, inf, sps)
-                if r["total"] >= 30:
+                if r["total"] >= 40:
                     res.append(r)
             except Exception:
                 continue
@@ -809,7 +824,7 @@ with tab3:
         if res:
             res.sort(key=lambda x: x["total"], reverse=True)
             for i, r in enumerate(res[:10], 1):
-                m = "1." if i == 1 else "2." if i == 2 else "3." if i == 3 else str(i) + "."
+                m = "1." if i == 1 else "2." if i == 2 else "3." if i == 3 + "."
                 with st.expander(m + " **" + r['symbol'] + "** - " + str(r['total']) + "/100 " + r['verdict']):
                     c1, c2, c3 = st.columns(3)
                     c1.metric("السعر", "$" + str(round(r['price'], 3)))
@@ -821,24 +836,32 @@ with tab3:
                         st.write("Reverse Split: " + r["split_info"]["ratio"] + " قبل " + str(r["split_info"]["days_since"]) + " يوم")
                     if r["stability"]:
                         st.write("الثبات: " + r["stability"]["strength"] + " - " + str(r["stability"]["sessions_held"]) + " جلسات")
+                    if r.get("failed_spike"):
+                        st.write("🚨 Failed Spike - تجنب!")
         else:
             st.warning("لا نتائج.")
 
+# =============== TAB 4: رادار الاكتشاف ===============
 with tab4:
     st.markdown("### رادار الاكتشاف المبكر")
     st.caption("أسهم Squeeze محتملة")
-    if st.button("ابحث", key="h"):
+    if st.button("ابحث ديناميكياً", key="h"):
+        with st.spinner("جاري تحميل القائمة..."):
+            universe = get_dynamic_universe(limit=300)
+        
         pg = st.progress(0)
         res = []
-        for i, s in enumerate(LOCAL_UNIVERSE):
-            pg.progress((i + 1) / len(LOCAL_UNIVERSE))
+        for i, s in enumerate(universe):
+            pg.progress((i + 1) / len(universe))
             try:
                 h, sps = yahoo_candles(s, "3mo")
                 if h.empty or len(h) < 30:
                     continue
                 inf = finnhub_metrics(s)
                 r = score(s, h, inf, sps)
-                if r["rsi"] > 35 or r["total"] < 30:
+                if r["rsi"] > 35 or r["total"] < 40:
+                    continue
+                if r.get("failed_spike"):
                     continue
                 res.append(r)
             except Exception:
