@@ -549,7 +549,7 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365):
 
     return {
         "symbol": symbol, "price": price, "rsi": round(r, 2), "stoch": round(sk, 2),
-        "macd_pos": mp, "macd_imp": mi,has "macd_hist": round(macd_hist, 4),
+        "macd_pos": mp, "macd_imp": mi, "macd_hist": round(macd_hist, 4),
         "macd_txt": macd_txt, "macd_color": macd_color,
         "sma20": s20, "sma50": s50,
         "support": sup, "resistance": res, "dist_sup": ds, "float": fs, "marketCap": mc, "rvol": rv,
@@ -557,10 +557,10 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365):
         "breakdown": bd, "total": total, "verdict": v, "color": c,
         "rebound": rebound, "split_info": split_info, "stability": stability,
         "sweep": detect_liquidity_sweep(hist), "spring": detect_spring(hist),
-        "lps": detect_lps(_hist), "w_pattern": w_pat, "runneroff": is_runner,
-        "bull_trapering": detect_bull_trap(hist),"):
- "failed_spike": failed_spike,
-        "gap":        detect_gap_fill(hist), "candles": detect_candle_patterns(hist)
+        "lps": detect_lps(hist), "w_pattern": w_pat, "runner": is_runner,
+        "bull_trapering": detect_bull_trap(hist),
+        "failed_spike": failed_spike,
+        "gap": detect_gap_fill(hist), "candles": detect_candle_patterns(hist)
     }
 
 
@@ -575,7 +575,9 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         st.markdown('<div class="danger-box">🚨 <b>أخبار حرجة!</b> ' + str(news["critical_count"]) + ' خبر خطير - تجنب السهم!</div>', unsafe_allow_html=True)
     if news.get("offering_count", 0) > 0:
         st.markdown('<div class="danger-box">⚠️ <b>طرح جديد محتمل!</b> ' + str(news["offering_count"]) + ' خبر عن طرح/إضعاف - خطر!</div>', unsafe_allow_html=True)
-    if offering.get(" st.markdown('<div class="danger-box">📋 <b>طرح في SEC:</b> ' + offering.get("form", "") + ' قبل ' + str(offering.get("days", 0)) + ' يوم - تجنب!</div>', unsafe_allow_html=True)
+    
+    if offering.get("has_offering"):
+        st.markdown('<div class="danger-box">📋 <b>طرح في SEC:</b> ' + offering.get("form", "") + ' قبل ' + str(offering.get("days", 0)) + ' يوم - تجنب!</div>', unsafe_allow_html=True)
 
     if news.get("items"):
         st.markdown("#### 📰 آخر الأخبار السلبية")
@@ -593,7 +595,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     elif r["support"]:
         st.markdown('<div class="warn-box">⚠️ <b>نموذج الثبات:</b> أقل من جلستين فوق الدعم - انتظر</div>', unsafe_allow_html=True)
 
-    if r["bull_trap"]:
+    if r["bull_trapering"]:
         st.markdown('<div class="danger-box">Bull Trap: كسر مقاومة ثم فشل - خطر!</div>', unsafe_allow_html=True)
     if r["split_info"].get("has_split"):
         d = r["split_info"]["days_since"]
@@ -681,7 +683,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
 
     st.markdown("### تفصيل النقاط")
     st.dataframe(pd.DataFrame(list(r["breakdown"].items()), columns=["المعيار", "النقاط"]), use_container_width=True, hide_index=True)
-    else st.markdown('<a href str="https(i://fintel.io)/ss/us/' + sym.lower() + '" target="_blank">عرض تفاصيل Short Interest على Fintel</a>', unsafe_allow_html=True)
+    st.markdown('<a href="https://fintel.io/ss/us/' + sym.lower() + '" target="_blank">عرض تفاصيل Short Interest على Fintel</a>', unsafe_allow_html=True)
 
 
 st.markdown("# Stock Screener")
@@ -824,7 +826,7 @@ with tab3:
         if res:
             res.sort(key=lambda x: x["total"], reverse=True)
             for i, r in enumerate(res[:10], 1):
-                m = "1." if i == 1 else "2." if i == 2 else "3." if i == 3 + "."
+                m = str(i) + "."
                 with st.expander(m + " **" + r['symbol'] + "** - " + str(r['total']) + "/100 " + r['verdict']):
                     c1, c2, c3 = st.columns(3)
                     c1.metric("السعر", "$" + str(round(r['price'], 3)))
