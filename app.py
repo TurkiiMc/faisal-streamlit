@@ -4,28 +4,28 @@ import numpy as np
 import requests
 import time
 import threading
+import io
+import os
 from datetime import datetime, timedelta
 from collections import deque
 
 # ============================================================
-# ===== الإعدادات العامة =====
+# ===== الإعدادات (المفاتيح من محفظة Render، لا من الملف) =====
 # ============================================================
 st.set_page_config(page_title="Stock Screener Pro", page_icon="🎯", layout="wide")
 
-PROXY_URL = "https://faisal-proxy.onrender.com"
-FINNHUB_KEY = "demn1c9r01qnf8fq7jc0demn1c9r01qnf8fq7jcg"   # ⚠️ انقله إلى st.secrets
-
-# Alpaca (اختياري — للبيانات اللحظية الحقيقية)
-ALPACA_KEY = ""
-ALPACA_SECRET = ""
+PROXY_URL     = os.environ.get("PROXY_URL", "https://faisal-proxy.onrender.com").rstrip("/")
+FINNHUB_KEY   = os.environ.get("FINNHUB_KEY", "")
+ALPACA_KEY    = os.environ.get("ALPACA_KEY", "")
+ALPACA_SECRET = os.environ.get("ALPACA_SECRET", "")
 ALPACA_ENABLED = bool(ALPACA_KEY and ALPACA_SECRET)
-ALPACA_BASE = "https://data.alpaca.markets/v2"
+ALPACA_BASE   = "https://data.alpaca.markets/v2"
+ON_RENDER     = bool(os.environ.get("RENDER_SERVICE_NAME"))
 
-# فلاتر السوق
 MARKET_CAP_MAX = 20_000_000
-FLOAT_MAX = 5_000_000
-PRICE_MAX = 5.0
-VOLUME_MIN = 100_000
+FLOAT_MAX      = 5_000_000
+PRICE_MAX      = 5.0
+VOLUME_MIN     = 100_000
 SPLIT_MAX_DAYS = 50
 
 # ============================================================
@@ -37,7 +37,6 @@ class RateLimiter:
         self.period = period
         self.calls = deque()
         self.lock = threading.Lock()
-
     def wait(self):
         with self.lock:
             now = time.time()
@@ -50,7 +49,7 @@ class RateLimiter:
             self.calls.append(time.time())
 
 finnhub_limiter = RateLimiter(max_calls=55, period=60)
-alpaca_limiter = RateLimiter(max_calls=200, period=60)
+alpaca_limiter  = RateLimiter(max_calls=200, period=60)
 
 # ============================================================
 # ===== CSS =====
@@ -139,8 +138,26 @@ def alpaca_realtime_trade(symbol):
 
 
 @st.cache_data(ttl=300)
+def stooq_candles(symbol, period="1y"):
+    """طوارئ يعمل على Render (يومي فقط، بلا تقسيمات)"""
+    try:
+        url = f"https://stooq.com/q/d/l/?s={symbol.lower()}.us&i=d"
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or len(r.text) < 50 or "No data" in r.text:
+            return pd.DataFrame()
+        df = pd.read_csv(io.StringIO(r.text))
+        df.columns = [c.capitalize() for c in df.columns]
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").sort_index()
+        days = {"1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730}.get(period, 365)
+        return df[df.index >= (datetime.now() - timedelta(days=days))]
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
 def get_candles_unified(symbol, period="6mo"):
-    """Fallback موحد: Alpaca → Yahoo Proxy → yfinance"""
+    """Fallback: Alpaca → Yahoo Proxy → yfinance(محلي) → Stooq(طوارئ)"""
     # 1) Alpaca
     if ALPACA_ENABLED:
         try:
@@ -149,39 +166,48 @@ def get_candles_unified(symbol, period="6mo"):
                 return df, splits, "alpaca"
         except Exception:
             pass
-    # 2) Yahoo Proxy
+    # 2) Yahoo Proxy (مع إعادة محاولة تغطي Cold Start)
     if PROXY_URL:
+        for attempt in range(2):
+            try:
+                r = requests.get(PROXY_URL + "/yahoo/candles",
+                                 params={"symbol": symbol, "period": period},
+                                 timeout=60 if attempt == 0 else 30)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("success") and data.get("candles"):
+                        df = pd.DataFrame(data["candles"])
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.set_index("date").sort_index()
+                        df.columns = [c.capitalize() for c in df.columns]
+                        return df, data.get("splits", []), "yahoo_proxy"
+                if r.status_code in (429, 503):
+                    time.sleep(3)
+            except Exception:
+                time.sleep(2)
+    # 3) yfinance مباشر (محلياً فقط — ميت على Render)
+    if not ON_RENDER:
         try:
-            r = requests.get(PROXY_URL + "/yahoo/candles",
-                             params={"symbol": symbol, "period": period}, timeout=30)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("success") and data.get("candles"):
-                    df = pd.DataFrame(data["candles"])
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.set_index("date").sort_index()
-                    df.columns = [c.capitalize() for c in df.columns]
-                    return df, data.get("splits", []), "yahoo_proxy"
+            import yfinance as yf
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period=period)
+            if not df.empty:
+                df.columns = [c.capitalize() for c in df.columns]
+                splits_list = []
+                for date, ratio in ticker.splits.items():
+                    if ratio and ratio < 1:
+                        num, den = 1, int(round(1 / ratio))
+                    else:
+                        num, den = int(ratio), 1
+                    splits_list.append({"date": date.strftime("%Y-%m-%d"),
+                                        "numerator": num, "denominator": den})
+                return df, splits_list, "yfinance"
         except Exception:
             pass
-    # 3) yfinance مباشر
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period)
-        if not df.empty:
-            df.columns = [c.capitalize() for c in df.columns]
-            splits_list = []
-            for date, ratio in ticker.splits.items():
-                if ratio and ratio < 1:
-                    num, den = 1, int(round(1 / ratio))
-                else:
-                    num, den = int(ratio), 1
-                splits_list.append({"date": date.strftime("%Y-%m-%d"),
-                                    "numerator": num, "denominator": den})
-            return df, splits_list, "yfinance"
-    except Exception:
-        pass
+    # 4) Stooq طوارئ
+    df = stooq_candles(symbol, period)
+    if not df.empty:
+        return df, [], "stooq"
     return pd.DataFrame(), [], "none"
 
 
@@ -746,7 +772,6 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
         else: bd["Float"] = 0
     else: bd["Float"] = 0
 
-    # ✅ جديد: Short Interest في النقاط
     if spct > 0.40: bd["Short"] = 20
     elif spct > 0.30: bd["Short"] = 15
     elif spct > 0.20: bd["Short"] = 10
@@ -768,7 +793,6 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
     elif sk < 50: bd["Stoch"] = 4
     else: bd["Stoch"] = 0
 
-    # ✅ إصلاح: الدعم المكسور = عقوبة وليس مكافأة
     support_broken = bool(sup and price < sup)
     ds = None
     if sup:
@@ -808,7 +832,6 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
 
     failed_spike = detect_failed_spike(hist)
 
-    # ✅ إصلاح: الإقصاء الفوري (Hard Veto)
     hard_veto = support_broken or bool(failed_spike)
     if news and news.get("critical_count", 0) > 0: hard_veto = True
     if offering and offering.get("has_offering"): hard_veto = True
@@ -837,7 +860,7 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
 
 
 # ============================================================
-# ===== عرض التحليل الكامل + خطة الدخول الاحترافية =====
+# ===== عرض التحليل + خطة الدخول الديناميكية =====
 # ============================================================
 def render_full_analysis(sym, hist, splits, info, news, offering, r):
     st.markdown(f'<div class="score-card"><div class="score-big" style="color:{r["color"]}">{r["total"]}/100</div><div class="verdict">{r["verdict"]}</div></div>', unsafe_allow_html=True)
@@ -917,7 +940,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
             st.markdown(f'<div class="info-box">تقدم الارتداد: {r["rebound"]}% - مبكر</div>', unsafe_allow_html=True)
     st.info(f"Free Float: {round(r['float']/1000000, 2)}M سهم" if r["float"] else "Free Float: غير متوفر")
 
-    # ═══════════ خطة الدخول الاحترافية ═══════════
+    # ═══════════ خطة الدخول الديناميكية (تحل مشكلة ELAB) ═══════════
     if r["support"] and r["resistance"]:
         sup_val, res_val, current_price = r["support"], r["resistance"], r["price"]
         atr_val = atr(hist["High"], hist["Low"], hist["Close"], 14)
@@ -937,28 +960,62 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
             target2, target3 = round(res_val*1.2, 3), round(res_val*1.5, 3)
         target1 = round(res_val, 3)
 
-        avg_entry = round(entry1*0.4 + entry2*0.35 + entry3*0.25, 3)
-        risk_ps = round(avg_entry - stop, 3)
-        rr = [round((t - avg_entry) / risk_ps, 2) if risk_ps > 0 else 0 for t in (target1, target2, target3)]
-        risk_pct = round(risk_ps / avg_entry * 100, 2)
-        rew_pct = [round((t - avg_entry) / avg_entry * 100, 2) for t in (target1, target2, target3)]
-
         max_risk = portfolio_size * (risk_percent / 100)
+        mkt = round(current_price, 3)
+
+        # تقدير عدد الأسهم من أعمق مستوى دخول (الأكثر تحفظاً)
+        risk_ps_est = max(entry3 - stop, 0.001)
+        shares_total = int(max_risk / risk_ps_est)
+
+        # بناء السلّم حسب موقع السعر الحالي
+        if current_price < sup_val:
+            ladder = []
+            avg_entry = mkt
+            note = "🚫 الدعم مكسور — لا دخول"
+            note_color = "#d63031"
+        elif current_price > entry1:
+            ladder = [
+                {"t": "🥇 دخول أولي (40%)", "p": entry1, "ord": "Limit", "pct": 0.40},
+                {"t": "🥈 تعزيز (35%)",     "p": entry2, "ord": "Limit", "pct": 0.35},
+                {"t": "🥉 دخول أخير (25%)", "p": entry3, "ord": "Limit", "pct": 0.25},
+            ]
+            avg_entry = round(entry1*0.40 + entry2*0.35 + entry3*0.25, 3)
+            note = "⏳ السعر فوق السلّم — علّق أوامرك تحت السوق وانتظر"
+            note_color = "#0984e3"
+        elif current_price >= entry2:
+            ladder = [
+                {"t": "🥇 دخول فوري (40%)", "p": mkt,    "ord": "Market", "pct": 0.40},
+                {"t": "🥈 تعزيز (35%)",     "p": entry2, "ord": "Limit",  "pct": 0.35},
+                {"t": "🥉 دخول أخير (25%)", "p": entry3, "ord": "Limit",  "pct": 0.25},
+            ]
+            avg_entry = round(mkt*0.40 + entry2*0.35 + entry3*0.25, 3)
+            note = "⚡ السعر داخل السلّم — الشريحة الأولى سوقاً الآن والبقية معلقة تحت"
+            note_color = "#00b894"
+        elif current_price >= entry3:
+            ladder = [
+                {"t": "🥇 دخول فوري (40%)",  "p": mkt,    "ord": "Market", "pct": 0.40},
+                {"t": "🥈 تعزيز فوري (35%)", "p": mkt,    "ord": "Market", "pct": 0.35},
+                {"t": "🥉 دخول أخير (25%)",  "p": entry3, "ord": "Limit",  "pct": 0.25},
+            ]
+            avg_entry = round(mkt*0.75 + entry3*0.25, 3)
+            note = "⚡ السعر عميق داخل السلّم — شريحتان سوقاً الآن وواحدة معلقة"
+            note_color = "#00b894"
+        else:
+            ladder = [{"t": "🎯 دخول كامل (100%)", "p": mkt, "ord": "Market", "pct": 1.0}]
+            avg_entry = mkt
+            note = "🟢 السعر عند المنطقة العميقة (فوق الدعم مباشرة) — دخول كامل مع التحقق من الثبات"
+            note_color = "#00b894"
+
+        risk_ps = round(avg_entry - stop, 3)
         shares = int(max_risk / risk_ps) if risk_ps > 0 else 0
-        sh1, sh2 = int(shares*0.4), int(shares*0.35)
-        sh3 = shares - sh1 - sh2
+        for L in ladder:
+            L["sh"] = int(shares * L["pct"])
+
+        risk_pct = round(risk_ps / avg_entry * 100, 2) if avg_entry > 0 else 0
+        rr = [round((t - avg_entry) / risk_ps, 2) if risk_ps > 0 else 0 for t in (target1, target2, target3)]
+        rew_pct = [round((t - avg_entry) / avg_entry * 100, 2) if avg_entry > 0 else 0 for t in (target1, target2, target3)]
         pos_value = round(shares * avg_entry, 2)
         trail_dist = round(atr_val * 1.5, 3) if atr_val else round(avg_entry * 0.05, 3)
-
-        # ✅ إصلاح: تحت الدعم = كسر وليس فرصة
-        if current_price < sup_val:
-            entry_status, entry_color = "🚫 الدعم مكسور — لا دخول", "#d63031"
-        elif current_price > entry1 * 1.03:
-            entry_status, entry_color = "🔴 السعر مرتفع — انتظر التصحيح", "#d63031"
-        elif current_price < entry1 * 0.99:
-            entry_status, entry_color = "🟢 منطقة دخول جيدة", "#00b894"
-        else:
-            entry_status, entry_color = "🔵 عند نقطة الدخول الأولى", "#0984e3"
 
         trend_map = {
             "strong_uptrend": ("✅ اتجاه صاعد قوي", "#00b894"),
@@ -970,32 +1027,36 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         trend_txt, trend_color = trend_map[trend]
 
         st.markdown("### 📊 خطة التداول الاحترافية")
-        st.markdown(f'<div style="background:{entry_color}22;padding:15px;border-radius:10px;margin:10px 0;border:2px solid {entry_color};text-align:center;font-size:18px;font-weight:bold">{entry_status}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div style="background:{note_color}22;padding:15px;border-radius:10px;margin:10px 0;border:2px solid {note_color};text-align:center;font-size:18px;font-weight:bold">{note}</div>', unsafe_allow_html=True)
         st.markdown(f'<div style="background:{trend_color}15;padding:10px;border-radius:8px;margin:5px 0;border-right:4px solid {trend_color}"><b>📈 حالة الاتجاه:</b> {trend_txt}</div>', unsafe_allow_html=True)
 
-        st.markdown("#### 🎯 مستويات الدخول (Scale-in)")
+        st.markdown("#### 🎯 أوامر الدخول (حسب موقع السعر الآن)")
+        rows_html = ""
+        for L in ladder:
+            color = "#00b894" if L["ord"] == "Market" else "#0984e3"
+            rows_html += (f'<tr><td><b>{L["t"]}</b></td>'
+                          f'<td style="color:{color}"><b>${L["p"]}</b> — {L["ord"]}</td>'
+                          f'<td>{L["sh"]} سهم</td></tr>')
         st.markdown(f"""
         <div class="plan-box"><table class="plan-table">
-        <tr><td><b>🥇 دخول أولي (40% = {sh1} سهم)</b></td><td style="color:#0984e3"><b>${entry1}</b> — Limit</td></tr>
-        <tr><td><b>🥈 تعزيز (35% = {sh2} سهم)</b></td><td style="color:#0984e3"><b>${entry2}</b> — Stop Limit</td></tr>
-        <tr><td><b>🥉 دخول أخير (25% = {sh3} سهم)</b></td><td style="color:#0984e3"><b>${entry3}</b> — Limit</td></tr>
-        <tr><td><b>المتوسط المرجح</b></td><td><b>${avg_entry}</b> ({shares} سهم)</td></tr>
-        <tr><td><b>🛡️ الوقف</b></td><td style="color:#d63031"><b>${stop}</b> (-{risk_pct}%)</td></tr>
-        <tr><td><b>🎯 هدف 1 (بيع 33%)</b></td><td style="color:#00b894"><b>${target1}</b> (+{rew_pct[0]}%) R:R 1:{rr[0]}</td></tr>
-        <tr><td><b>🚀 هدف 2 (بيع 33% + Trailing)</b></td><td style="color:#0984e3"><b>${target2}</b> (+{rew_pct[1]}%) R:R 1:{rr[1]}</td></tr>
-        <tr><td><b>🌟 هدف 3 (بيع الباقي)</b></td><td style="color:#6c5ce7"><b>${target3}</b> (+{rew_pct[2]}%) R:R 1:{rr[2]}</td></tr>
-        <tr><td><b>📈 Trailing Stop</b></td><td>ينشط عند ${target1} بمسافة ${trail_dist}</td></tr>
-        <tr><td><b>💵 قيمة الصفقة</b></td><td>${pos_value:,} ({round(pos_value/portfolio_size*100, 1)}% من المحفظة)</td></tr>
-        <tr><td><b>⚖️ المخاطرة القصوى</b></td><td style="color:#d63031">${round(max_risk, 2)} ({risk_percent}%)</td></tr>
+        <tr><td colspan="3"><b>السعر الحالي:</b> ${mkt} | <b>المتوسط المتوقع:</b> ${avg_entry}</td></tr>
+        {rows_html}
+        <tr><td><b>🛡️ الوقف</b></td><td style="color:#d63031"><b>${stop}</b> (-{risk_pct}%)</td><td>—</td></tr>
+        <tr><td><b>🎯 هدف 1 (بيع 33%)</b></td><td style="color:#00b894"><b>${target1}</b> (+{rew_pct[0]}%)</td><td>R:R 1:{rr[0]}</td></tr>
+        <tr><td><b>🚀 هدف 2 (بيع 33% + Trailing)</b></td><td style="color:#0984e3"><b>${target2}</b> (+{rew_pct[1]}%)</td><td>R:R 1:{rr[1]}</td></tr>
+        <tr><td><b>🌟 هدف 3 (بيع الباقي)</b></td><td style="color:#6c5ce7"><b>${target3}</b> (+{rew_pct[2]}%)</td><td>R:R 1:{rr[2]}</td></tr>
+        <tr><td><b>📈 Trailing Stop</b></td><td>ينشط عند ${target1} بمسافة ${trail_dist}</td><td>—</td></tr>
+        <tr><td><b>💵 قيمة الصفقة</b></td><td>${pos_value:,}</td><td>{round(pos_value/portfolio_size*100, 1)}% من المحفظة</td></tr>
+        <tr><td><b>⚖️ المخاطرة القصوى</b></td><td style="color:#d63031">${round(max_risk, 2)}</td><td>{risk_percent}%</td></tr>
         </table></div>""", unsafe_allow_html=True)
 
         with st.expander("⚙️ قواعد التنفيذ"):
             st.markdown("""
+            - أوامر **Market** تٌنفذ الآن، وأوامر **Limit** تُعلّق تحت السعر الحالي فقط
             - لا تحرّك الوقف للخسارة أبداً
             - عند الهدف 1: بيع 33% + تفعيل Trailing Stop
             - عند الهدف 2: بيع 33% + نقل الوقف لنقطة الدخول
             - وقف زمني: 5-7 جلسات بلا حركة = إعادة تقييم
-            - خروج مبكر: شمعة انعكاسية سلبية / كسر الدعم بفجوة / أخبار سلبية
             """)
 
     st.markdown("### تفصيل النقاط")
@@ -1050,7 +1111,7 @@ def render_split_board(rows):
                 if key == "READY":
                     st.success("✅ داخل منطقة الدخول (≤15%) — افتح تبويب «تحليل سهم» للخطة الكاملة")
                 elif key == "WATCH":
-                    st.info("👁️ الدعم مؤكد لكن السعر خارج منطقة 15% — انتظر تراجعاً هادئاً بحجم منخفض")
+                    st.info("👁️ الدعم مؤكد لكن السعر خارج منطقة 15% — انتظر تراجعاً هادئاُ بحجم منخفض")
                 elif key == "RETEST":
                     st.info("🔄 السهم يختبر المنطقة — راقب ثبات جلستين بقيعان صاعدة")
                 else:
@@ -1086,6 +1147,7 @@ with st.sidebar:
     st.markdown(f"**Alpaca:** {'🟢' if ALPACA_ENABLED else '⚪ غير مفعل'}")
     st.markdown(f"**Finnhub:** {'🟢' if FINNHUB_KEY else '🔴'}")
     st.markdown(f"**Yahoo Proxy:** {'🟢' if PROXY_URL else '🔴'}")
+    st.markdown(f"**بيئة Render:** {'🟢 نعم' if ON_RENDER else '⚪ محلي'}")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 تحليل سهم", "🛰️ رادار التقسيم", "⭐ أفضل 10", "📡 رادار الاكتشاف", "⚡ سعر لحظي"])
 
@@ -1105,6 +1167,8 @@ with tab1:
                 st.error("❌ لا بيانات لـ " + sym)
             else:
                 st.success(f"✅ المصدر: **{source}** ({len(hist)} شمعة)")
+                if source == "stooq":
+                    st.warning("⚠️ مصدر طوارئ (Stooq): بيانات يومية بلا تقسيمات — رادار التقسيم غير متاح لهذا السهم")
                 info = finnhub_metrics(sym)
                 offering = check_offering(sym)
                 news = check_negative_news(sym)
@@ -1133,7 +1197,7 @@ with tab2:
             pg.progress((i + 1) / len(universe))
             try:
                 h, sps, src = get_candles_unified(s, "1y")
-                if h.empty or len(h) < 30:
+                if h.empty or len(h) < 30 or src == "stooq":
                     continue
                 pi = post_split_phase(s, h, sps)
                 if not pi:
