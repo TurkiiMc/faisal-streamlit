@@ -8,9 +8,10 @@ import io
 import os
 from datetime import datetime, timedelta
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
-# ===== الإعدادات (المفاتيح من محفظة Render، لا من الملف) =====
+# ===== الإعدادات (المفاتيح من محفظة Render) =====
 # ============================================================
 st.set_page_config(page_title="Stock Screener Pro", page_icon="🎯", layout="wide")
 
@@ -27,6 +28,13 @@ FLOAT_MAX      = 5_000_000
 PRICE_MAX      = 5.0
 VOLUME_MIN     = 100_000
 SPLIT_MAX_DAYS = 50
+
+# ثوابت التسريع وطريقة الارتكاز
+MAX_WORKERS = 6
+LADDER_MIN_CANDLES = 2
+LADDER_STEP_MIN, LADDER_STEP_MAX = 15.0, 35.0
+MA_TOUCH_PCT = 3.0
+PIVOT_UNIVERSE_LIMIT = 200
 
 # ============================================================
 # ===== Rate Limiter =====
@@ -95,6 +103,23 @@ FALLBACK_UNIVERSE = [
 ]
 
 # ============================================================
+# ===== كاش يدوي آمن للخيوط =====
+# ============================================================
+_c_store, _c_lock = {}, threading.Lock()
+_f_store, _f_lock = {}, threading.Lock()
+
+def _ttl(store, lock, key, ttl, producer):
+    now = time.time()
+    with lock:
+        hit = store.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    val = producer()
+    with lock:
+        store[key] = (now, val)
+    return val
+
+# ============================================================
 # ===== طبقة البيانات =====
 # ============================================================
 def alpaca_candles(symbol, period="6mo"):
@@ -139,7 +164,6 @@ def alpaca_realtime_trade(symbol):
 
 @st.cache_data(ttl=300)
 def stooq_candles(symbol, period="1y"):
-    """طوارئ يعمل على Render (يومي فقط، بلا تقسيمات)"""
     try:
         url = f"https://stooq.com/q/d/l/?s={symbol.lower()}.us&i=d"
         r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
@@ -155,9 +179,7 @@ def stooq_candles(symbol, period="1y"):
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=300)
-def get_candles_unified(symbol, period="6mo"):
-    """Fallback: Alpaca → Yahoo Proxy → yfinance(محلي) → Stooq(طوارئ)"""
+def _candles_uncached(symbol, period="6mo"):
     # 1) Alpaca
     if ALPACA_ENABLED:
         try:
@@ -185,7 +207,7 @@ def get_candles_unified(symbol, period="6mo"):
                     time.sleep(3)
             except Exception:
                 time.sleep(2)
-    # 3) yfinance مباشر (محلياً فقط — ميت على Render)
+    # 3) yfinance (محلياً فقط)
     if not ON_RENDER:
         try:
             import yfinance as yf
@@ -209,6 +231,30 @@ def get_candles_unified(symbol, period="6mo"):
     if not df.empty:
         return df, [], "stooq"
     return pd.DataFrame(), [], "none"
+
+
+def get_candles_unified(symbol, period="6mo"):
+    return _ttl(_c_store, _c_lock, (symbol, period), 300,
+                lambda: _candles_uncached(symbol, period))
+
+
+def scan_parallel(symbols, period, progress_cb=None):
+    """جلب متوازٍ — أسرع ~6 أضعاف من الحلقة التسلسلية"""
+    out, total, done = [], len(symbols), 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = {ex.submit(get_candles_unified, s, period): s for s in symbols}
+        for f in as_completed(futs):
+            s = futs[f]; done += 1
+            if progress_cb:
+                try: progress_cb(done, total)
+                except Exception: pass
+            try:
+                hist, splits, src = f.result()
+                if not hist.empty and len(hist) >= 30:
+                    out.append((s, hist, splits, src))
+            except Exception:
+                pass
+    return out
 
 
 @st.cache_data(ttl=60)
@@ -265,8 +311,7 @@ def get_dynamic_universe(limit=500):
     return FALLBACK_UNIVERSE
 
 
-@st.cache_data(ttl=300)
-def finnhub_metrics(symbol):
+def _metrics_uncached(symbol):
     info = {"floatShares": 0, "shortPercentOfFloat": 0, "sharesShort": 0, "marketCap": 0}
     if not FINNHUB_KEY:
         return info
@@ -286,6 +331,10 @@ def finnhub_metrics(symbol):
     except Exception:
         pass
     return info
+
+
+def finnhub_metrics(symbol):
+    return _ttl(_f_store, _f_lock, symbol, 300, lambda: _metrics_uncached(symbol))
 
 
 def check_offering(symbol):
@@ -732,6 +781,101 @@ def advanced_veto(symbol):
 
 
 # ============================================================
+# ===== طريقة الارتكاز: شموع 4H =====
+# ============================================================
+@st.cache_data(ttl=300)
+def get_4h(symbol):
+    """شموع 4 ساعات: جلب 1h من البروكسي ثم تجميع كل 4 شموع داخل الجلسة"""
+    if not PROXY_URL:
+        return None
+    try:
+        r = requests.get(PROXY_URL + "/yahoo/candles",
+                         params={"symbol": symbol, "period": "3mo", "interval": "1h"},
+                         timeout=60)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not data.get("success") or not data.get("candles"):
+            return None
+        df = pd.DataFrame(data["candles"])
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        df.columns = [c.capitalize() for c in df.columns]
+        df["_d"] = df.index.normalize()
+        df["_c"] = df.groupby("_d").cumcount() // 4
+        g = df.groupby(["_d", "_c"])
+        h4 = g.agg(t=("Open", lambda s: s.index[0]),
+                   Open=("Open", "first"), High=("High", "max"),
+                   Low=("Low", "min"), Close=("Close", "last"),
+                   Volume=("Volume", "sum")).reset_index(drop=True)
+        return h4.set_index("t").sort_index()
+    except Exception:
+        return None
+
+
+def build_red_ladder(h4):
+    """سلّم الشموع الساقطة على 4H: الذيل(Low) مقاومة→دعم، الرأس(High) هدف"""
+    if h4 is None or len(h4) < 10:
+        return None
+    reds = h4[h4["Close"] < h4["Open"]].tail(40)
+    price = float(h4["Close"].iloc[-1])
+    above = reds[reds["Low"] > price].sort_values("Low")
+    if len(above) < LADDER_MIN_CANDLES:
+        return None
+    ladder = []
+    for _, c in above.iterrows():
+        tail, head = float(c["Low"]), float(c["High"])
+        ladder.append({"date": str(c.name)[:16], "tail": round(tail, 4),
+                       "head": round(head, 4),
+                       "step_pct": round((head - tail) / tail * 100, 1)})
+    broken = reds[reds["Low"] <= price].sort_values("Low").tail(3)
+    supports = [round(float(c["Low"]), 4) for _, c in broken.iterrows()]
+    return {"ladder": ladder, "supports": supports,
+            "resistance": ladder[0]["tail"], "target": ladder[0]["head"],
+            "steps": len(ladder)}
+
+
+def ma_band_touch(hist, level, tol=MA_TOUCH_PCT):
+    m1, m2 = sma(hist["Close"], 20), sma(hist["Close"], 30)
+    if not m1 or not m2:
+        return False
+    lo, hi = min(m1, m2) * (1 - tol / 100), max(m1, m2) * (1 + tol / 100)
+    return lo <= level <= hi
+
+
+def filter_pivot_stock(symbol, hd, h4, splits):
+    """فلتر طريقة الارتكاز — بدون شورت إطلاقاً"""
+    lad = build_red_ladder(h4)
+    if not lad:
+        return None
+    pts, reasons = 30, [f"سلّم 4H: {lad['steps']} شمعة حمراء فوق السعر"]
+
+    res = lad["resistance"]
+    if ma_band_touch(hd, res) or ma_band_touch(h4, res):
+        pts += 25
+        reasons.append("✅ المقاومة الحالية على نطاق متوسط 20–30")
+
+    steps25 = sum(1 for L in lad["ladder"] if LADDER_STEP_MIN <= L["step_pct"] <= LADDER_STEP_MAX)
+    if steps25 >= 1:
+        pts += 15
+        reasons.append(f"{steps25} شمعة بهدف ~25%")
+
+    if lad["supports"]:
+        pts += 10
+        reasons.append(f"ذيول محروقة تحولت لدعم: {lad['supports']}")
+
+    n_splits = count_reverse_splits(splits, months=60)
+    cap = None
+    if n_splits > 3:
+        cap = sma(hd["Close"], 20)
+        reasons.append(f"مقسم {n_splits} مرات → سقف الهدف تحت MA20 (${round(cap,3) if cap else '-'})")
+
+    target = lad["target"] if (cap is None or lad["target"] <= cap) else round(cap, 3)
+    return {"symbol": symbol, "points": pts, "ladder": lad,
+            "target": target, "cap_ma20": cap, "reasons": reasons}
+
+
+# ============================================================
 # ===== نظام النقاط (مع الإصلاحات) =====
 # ============================================================
 def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offering=None):
@@ -940,7 +1084,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
             st.markdown(f'<div class="info-box">تقدم الارتداد: {r["rebound"]}% - مبكر</div>', unsafe_allow_html=True)
     st.info(f"Free Float: {round(r['float']/1000000, 2)}M سهم" if r["float"] else "Free Float: غير متوفر")
 
-    # ═══════════ خطة الدخول الديناميكية (تحل مشكلة ELAB) ═══════════
+    # ═══════════ خطة الدخول الديناميكية + إصلاح الأهداف ═══════════
     if r["support"] and r["resistance"]:
         sup_val, res_val, current_price = r["support"], r["resistance"], r["price"]
         atr_val = atr(hist["High"], hist["Low"], hist["Close"], 14)
@@ -951,28 +1095,28 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
             entry1 = round(sup_val + atr_val * 0.5, 3)
             entry2 = round(sup_val + atr_val * 0.25, 3)
             entry3 = round(sup_val + atr_val * 0.1, 3)
-            stop = round(sup_val - atr_val * 2.0, 3)
-            target2 = round(current_price + (current_price - sup_val) * 1.618, 3)
-            target3 = fib.get("1.618", round(res_val * 1.3, 3))
+            stop_hard = round(sup_val - atr_val * 2.0, 3)
+            t2_raw = round(current_price + (current_price - sup_val) * 1.618, 3)
         else:
             entry1, entry2, entry3 = round(sup_val*1.02, 3), round(sup_val*1.01, 3), round(sup_val*1.005, 3)
-            stop = round(sup_val * 0.94, 3)
-            target2, target3 = round(res_val*1.2, 3), round(res_val*1.5, 3)
+            stop_hard = round(sup_val * 0.94, 3)
+            t2_raw = round(res_val * 1.2, 3)
+        stop_struct = round(sup_val * 0.97, 3)
+        stop = stop_hard
+        # أهداف مرتبة تصاعدياً دائماً (إصلاح خلل KITT)
         target1 = round(res_val, 3)
+        target2 = round(max(t2_raw, target1 * 1.15), 3)
+        target3 = round(max(fib.get("1.618", res_val * 1.3), target2 * 1.5), 3)
 
-        max_risk = portfolio_size * (risk_percent / 100)
+        atr_pct = round(atr_val / current_price * 100, 1) if atr_val else 0
+        vol_flag = atr_pct > 8
+        eff_risk = risk_percent / 2 if vol_flag else risk_percent
+        max_risk = portfolio_size * (eff_risk / 100)
         mkt = round(current_price, 3)
 
-        # تقدير عدد الأسهم من أعمق مستوى دخول (الأكثر تحفظاً)
-        risk_ps_est = max(entry3 - stop, 0.001)
-        shares_total = int(max_risk / risk_ps_est)
-
-        # بناء السلّم حسب موقع السعر الحالي
         if current_price < sup_val:
-            ladder = []
-            avg_entry = mkt
-            note = "🚫 الدعم مكسور — لا دخول"
-            note_color = "#d63031"
+            ladder = []; avg_entry = mkt
+            note = "🚫 الدعم مكسور — لا دخول"; note_color = "#d63031"
         elif current_price > entry1:
             ladder = [
                 {"t": "🥇 دخول أولي (40%)", "p": entry1, "ord": "Limit", "pct": 0.40},
@@ -980,8 +1124,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
                 {"t": "🥉 دخول أخير (25%)", "p": entry3, "ord": "Limit", "pct": 0.25},
             ]
             avg_entry = round(entry1*0.40 + entry2*0.35 + entry3*0.25, 3)
-            note = "⏳ السعر فوق السلّم — علّق أوامرك تحت السوق وانتظر"
-            note_color = "#0984e3"
+            note = "⏳ السعر فوق السلّم — علّق أوامرك تحت السوق وانتظر"; note_color = "#0984e3"
         elif current_price >= entry2:
             ladder = [
                 {"t": "🥇 دخول فوري (40%)", "p": mkt,    "ord": "Market", "pct": 0.40},
@@ -989,28 +1132,24 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
                 {"t": "🥉 دخول أخير (25%)", "p": entry3, "ord": "Limit",  "pct": 0.25},
             ]
             avg_entry = round(mkt*0.40 + entry2*0.35 + entry3*0.25, 3)
-            note = "⚡ السعر داخل السلّم — الشريحة الأولى سوقاً الآن والبقية معلقة تحت"
-            note_color = "#00b894"
+            note = "⚡ السعر داخل السلّم — الشريحة الأولى سوقاً الآن والبقية معلقة تحت"; note_color = "#00b894"
         elif current_price >= entry3:
             ladder = [
-                {"t": "🥇 دخول فوري (40%)",  "p": mkt,    "ord": "Market", "pct": 0.40},
-                {"t": "🥈 تعزيز فوري (35%)", "p": mkt,    "ord": "Market", "pct": 0.35},
-                {"t": "🥉 دخول أخير (25%)",  "p": entry3, "ord": "Limit",  "pct": 0.25},
+                {"t": "🥇 دخول فوري (40%)",  "p": mkt, "ord": "Market", "pct": 0.40},
+                {"t": "🥈 تعزيز فوري (35%)", "p": mkt, "ord": "Market", "pct": 0.35},
+                {"t": "🥉 دخول أخير (25%)",  "p": entry3, "ord": "Limit", "pct": 0.25},
             ]
             avg_entry = round(mkt*0.75 + entry3*0.25, 3)
-            note = "⚡ السعر عميق داخل السلّم — شريحتان سوقاً الآن وواحدة معلقة"
-            note_color = "#00b894"
+            note = "⚡ السعر عميق داخل السلّم — شريحتان سوقاً الآن وواحدة معلقة"; note_color = "#00b894"
         else:
             ladder = [{"t": "🎯 دخول كامل (100%)", "p": mkt, "ord": "Market", "pct": 1.0}]
             avg_entry = mkt
-            note = "🟢 السعر عند المنطقة العميقة (فوق الدعم مباشرة) — دخول كامل مع التحقق من الثبات"
-            note_color = "#00b894"
+            note = "🟢 السعر عند المنطقة العميقة (فوق الدعم مباشرة) — دخول كامل مع التحقق من الثبات"; note_color = "#00b894"
 
         risk_ps = round(avg_entry - stop, 3)
         shares = int(max_risk / risk_ps) if risk_ps > 0 else 0
         for L in ladder:
             L["sh"] = int(shares * L["pct"])
-
         risk_pct = round(risk_ps / avg_entry * 100, 2) if avg_entry > 0 else 0
         rr = [round((t - avg_entry) / risk_ps, 2) if risk_ps > 0 else 0 for t in (target1, target2, target3)]
         rew_pct = [round((t - avg_entry) / avg_entry * 100, 2) if avg_entry > 0 else 0 for t in (target1, target2, target3)]
@@ -1030,6 +1169,9 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         st.markdown(f'<div style="background:{note_color}22;padding:15px;border-radius:10px;margin:10px 0;border:2px solid {note_color};text-align:center;font-size:18px;font-weight:bold">{note}</div>', unsafe_allow_html=True)
         st.markdown(f'<div style="background:{trend_color}15;padding:10px;border-radius:8px;margin:5px 0;border-right:4px solid {trend_color}"><b>📈 حالة الاتجاه:</b> {trend_txt}</div>', unsafe_allow_html=True)
 
+        if vol_flag:
+            st.markdown(f'<div class="warn-box">⚠️ <b>تقلب يومي {atr_pct}%</b> — الوقف الصلب بعيد ({risk_pct}%) بتصميم مضاد للضجيج، ولذا خُفّضت المخاطرة تلقائياً إلى {eff_risk}%.<br>📌 <b>وقف القرار:</b> أي <b>إغلاق يومي</b> تحت ${stop_struct} يُنهي الصفقة فوراً حتى لو لم يلمس الوقف الصلب.</div>', unsafe_allow_html=True)
+
         st.markdown("#### 🎯 أوامر الدخول (حسب موقع السعر الآن)")
         rows_html = ""
         for L in ladder:
@@ -1041,19 +1183,21 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         <div class="plan-box"><table class="plan-table">
         <tr><td colspan="3"><b>السعر الحالي:</b> ${mkt} | <b>المتوسط المتوقع:</b> ${avg_entry}</td></tr>
         {rows_html}
-        <tr><td><b>🛡️ الوقف</b></td><td style="color:#d63031"><b>${stop}</b> (-{risk_pct}%)</td><td>—</td></tr>
+        <tr><td><b>🛡️ الوقف الصلب (فجوات)</b></td><td style="color:#d63031"><b>${stop}</b> (-{risk_pct}%)</td><td>—</td></tr>
+        <tr><td><b>📌 وقف القرار (إغلاق يومي)</b></td><td style="color:#e17055"><b>${stop_struct}</b></td><td>تحت الدعم</td></tr>
         <tr><td><b>🎯 هدف 1 (بيع 33%)</b></td><td style="color:#00b894"><b>${target1}</b> (+{rew_pct[0]}%)</td><td>R:R 1:{rr[0]}</td></tr>
         <tr><td><b>🚀 هدف 2 (بيع 33% + Trailing)</b></td><td style="color:#0984e3"><b>${target2}</b> (+{rew_pct[1]}%)</td><td>R:R 1:{rr[1]}</td></tr>
         <tr><td><b>🌟 هدف 3 (بيع الباقي)</b></td><td style="color:#6c5ce7"><b>${target3}</b> (+{rew_pct[2]}%)</td><td>R:R 1:{rr[2]}</td></tr>
         <tr><td><b>📈 Trailing Stop</b></td><td>ينشط عند ${target1} بمسافة ${trail_dist}</td><td>—</td></tr>
         <tr><td><b>💵 قيمة الصفقة</b></td><td>${pos_value:,}</td><td>{round(pos_value/portfolio_size*100, 1)}% من المحفظة</td></tr>
-        <tr><td><b>⚖️ المخاطرة القصوى</b></td><td style="color:#d63031">${round(max_risk, 2)}</td><td>{risk_percent}%</td></tr>
+        <tr><td><b>⚖️ المخاطرة القصوى</b></td><td style="color:#d63031">${round(max_risk, 2)}</td><td>{eff_risk}%</td></tr>
         </table></div>""", unsafe_allow_html=True)
 
         with st.expander("⚙️ قواعد التنفيذ"):
             st.markdown("""
-            - أوامر **Market** تٌنفذ الآن، وأوامر **Limit** تُعلّق تحت السعر الحالي فقط
+            - أوامر **Market** تُنفذ الآن، وأوامر **Limit** تُعلّق تحت السعر الحالي فقط
             - لا تحرّك الوقف للخسارة أبداً
+            - إغلاق يومي تحت وقف القرار = خروج فوري مهما كان السعر
             - عند الهدف 1: بيع 33% + تفعيل Trailing Stop
             - عند الهدف 2: بيع 33% + نقل الوقف لنقطة الدخول
             - وقف زمني: 5-7 جلسات بلا حركة = إعادة تقييم
@@ -1111,7 +1255,7 @@ def render_split_board(rows):
                 if key == "READY":
                     st.success("✅ داخل منطقة الدخول (≤15%) — افتح تبويب «تحليل سهم» للخطة الكاملة")
                 elif key == "WATCH":
-                    st.info("👁️ الدعم مؤكد لكن السعر خارج منطقة 15% — انتظر تراجعاً هادئاُ بحجم منخفض")
+                    st.info("👁️ الدعم مؤكد لكن السعر خارج منطقة 15% — انتظر تراجعاً هادئاً بحجم منخفض")
                 elif key == "RETEST":
                     st.info("🔄 السهم يختبر المنطقة — راقب ثبات جلستين بقيعان صاعدة")
                 else:
@@ -1149,7 +1293,7 @@ with st.sidebar:
     st.markdown(f"**Yahoo Proxy:** {'🟢' if PROXY_URL else '🔴'}")
     st.markdown(f"**بيئة Render:** {'🟢 نعم' if ON_RENDER else '⚪ محلي'}")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 تحليل سهم", "🛰️ رادار التقسيم", "⭐ أفضل 10", "📡 رادار الاكتشاف", "⚡ سعر لحظي"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📈 تحليل سهم", "🛰️ رادار التقسيم", "⭐ أفضل 10", "📡 رادار الاكتشاف", "⚡ سعر لحظي", "🕯️ فلتر الارتكاز"])
 
 # ===== TAB 1 =====
 with tab1:
@@ -1190,15 +1334,15 @@ with tab2:
     if st.button("🛰️ امسح دورة التقسيم", key="sp"):
         with st.spinner("تحميل قائمة الأسهم..."):
             universe = get_dynamic_universe(limit=500)
-        st.info(f"📡 {len(universe)} سهم — الفحص الرخيص أولاً (شموع فقط)")
+        st.info(f"📡 {len(universe)} سهم — جلب متوازٍ")
         pg = st.progress(0)
+        raw = scan_parallel(universe, "1y", progress_cb=lambda i, n: pg.progress(i / n))
+        pg.empty()
         rows = []
-        for i, s in enumerate(universe):
-            pg.progress((i + 1) / len(universe))
+        for s, h, sps, src in raw:
+            if src == "stooq":
+                continue
             try:
-                h, sps, src = get_candles_unified(s, "1y")
-                if h.empty or len(h) < 30 or src == "stooq":
-                    continue
                 pi = post_split_phase(s, h, sps)
                 if not pi:
                     continue
@@ -1217,7 +1361,6 @@ with tab2:
                 rows.append(pi)
             except Exception:
                 continue
-        pg.empty()
         st.session_state["split_board"] = rows
         st.success(f"✅ اكتمل المسح: {len(rows)} سهم بتقسيم عكسي")
 
@@ -1232,22 +1375,30 @@ with tab3:
     if st.button("🔍 ابدأ الفحص الديناميكي", key="t"):
         with st.spinner("جاري تحميل القائمة..."):
             universe = get_dynamic_universe(limit=300)
-        st.info(f"📡 {len(universe)} سهم")
+        st.info(f"📡 {len(universe)} سهم — جلب متوازٍ")
         pg = st.progress(0)
-        res = []
-        for i, s in enumerate(universe):
-            pg.progress((i + 1) / len(universe))
+        raw = scan_parallel(universe, "3mo", progress_cb=lambda i, n: pg.progress(i / n))
+        pg.empty()
+        cands = []
+        for s, h, sps, src in raw:
             try:
-                h, sps, src = get_candles_unified(s, "3mo")
-                if h.empty or len(h) < 30:
-                    continue
-                inf = finnhub_metrics(s)
-                r = score(s, h, inf, sps)
+                cheap = score(s, h, {}, sps)
+                if cheap["total"] >= 20 and not cheap["hard_veto"]:
+                    cands.append((s, h, sps))
+            except Exception:
+                continue
+        st.info(f"🔎 {len(cands)} نجحت بالفلتر الرخيص — Finnhub للناجين فقط")
+        pg2 = st.progress(0)
+        res = []
+        for i, (s, h, sps) in enumerate(cands):
+            pg2.progress((i + 1) / max(len(cands), 1))
+            try:
+                r = score(s, h, finnhub_metrics(s), sps)
                 if r["total"] >= 40:
                     res.append(r)
             except Exception:
                 continue
-        pg.empty()
+        pg2.empty()
         if res:
             res.sort(key=lambda x: x["total"], reverse=True)
             for i, r in enumerate(res[:10], 1):
@@ -1272,22 +1423,30 @@ with tab4:
     if st.button("🔍 ابحث ديناميكياً", key="h"):
         with st.spinner("جاري تحميل القائمة..."):
             universe = get_dynamic_universe(limit=300)
+        st.info(f"📡 {len(universe)} سهم — جلب متوازٍ")
         pg = st.progress(0)
-        res = []
-        for i, s in enumerate(universe):
-            pg.progress((i + 1) / len(universe))
+        raw = scan_parallel(universe, "3mo", progress_cb=lambda i, n: pg.progress(i / n))
+        pg.empty()
+        cands = []
+        for s, h, sps, src in raw:
             try:
-                h, sps, src = get_candles_unified(s, "3mo")
-                if h.empty or len(h) < 30:
-                    continue
-                inf = finnhub_metrics(s)
-                r = score(s, h, inf, sps)
-                if r["rsi"] > 35 or r["total"] < 40 or r.get("hard_veto"):
+                if score(s, h, {}, sps)["rsi"] <= 35:
+                    cands.append((s, h, sps))
+            except Exception:
+                continue
+        st.info(f"🔎 {len(cands)} سهم بنقاط RSI مؤهلة — Finnhub لها فقط")
+        pg2 = st.progress(0)
+        res = []
+        for i, (s, h, sps) in enumerate(cands):
+            pg2.progress((i + 1) / max(len(cands), 1))
+            try:
+                r = score(s, h, finnhub_metrics(s), sps)
+                if r["total"] < 40 or r.get("hard_veto"):
                     continue
                 res.append(r)
             except Exception:
                 continue
-        pg.empty()
+        pg2.empty()
         if res:
             res.sort(key=lambda x: x["total"], reverse=True)
             for r in res[:10]:
@@ -1334,6 +1493,73 @@ with tab5:
             if auto_refresh:
                 time.sleep(refresh_interval)
                 st.rerun()
+
+# ===== TAB 6 =====
+with tab6:
+    st.markdown("### 🕯️ فلتر سهم الارتكاز — الشموع الساقطة (4H)")
+    st.markdown(
+        '<div class="filter-box"><b>قواعد الطريقة (بدون شورت):</b><br>'
+        '• سلّم شموع حمراء على 4H: الذيل مقاومة، الرأس هدف<br>'
+        '• أي ذيل يحترق يتحول لدعم تلقائياً<br>'
+        '• لكل شمعة هدف ~25% | المقاومة على نطاق متوسط 20–30 = تعزيز<br>'
+        '• المقسم >3 مرات: سقف الهدف تحت MA20 | أخبار حرجة/طرح = إقصاء</div>',
+        unsafe_allow_html=True)
+
+    if st.button("🕯️ امسح بطريقة الارتكاز", key="pv"):
+        with st.spinner("تحميل القائمة..."):
+            universe = get_dynamic_universe(limit=PIVOT_UNIVERSE_LIMIT)
+
+        def fetch_both(s):
+            hd, sps, src = get_candles_unified(s, "6mo")
+            if hd.empty:
+                return None
+            h4 = get_4h(s)
+            if h4 is None or h4.empty:
+                return None
+            return s, hd, h4, sps
+
+        pg = st.progress(0)
+        rows = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futs = [ex.submit(fetch_both, s) for s in universe]
+            for i, f in enumerate(as_completed(futs)):
+                pg.progress((i + 1) / len(universe))
+                try:
+                    rr_ = f.result()
+                    if rr_:
+                        rows.append(rr_)
+                except Exception:
+                    pass
+        pg.empty()
+
+        hits = []
+        for s, hd, h4, sps in rows:
+            res = filter_pivot_stock(s, hd, h4, sps)
+            if res:
+                hits.append(res)
+
+        for h in hits:
+            veto, why = advanced_veto(h["symbol"])
+            if veto:
+                h["veto"] = True
+                h["reasons"].append(f"🚫 إقصاء: {why}")
+        st.session_state["pivot_hits"] = hits
+        st.success(f"✅ {len(hits)} سهم مطابق لطريقة الارتكاز")
+
+    if "pivot_hits" in st.session_state:
+        hits = st.session_state["pivot_hits"]
+        if not hits:
+            st.warning("لا سهام مطابقة للطريقة حالياً")
+        for h in sorted(hits, key=lambda x: x["points"], reverse=True):
+            veto = "🚫 " if h.get("veto") else ""
+            with st.expander(f"{veto}**{h['symbol']}** — {h['points']} نقطة | الهدف الحالي ${h['target']}"):
+                for reason in h["reasons"]:
+                    st.markdown(f'<div class="info-box">{reason}</div>', unsafe_allow_html=True)
+                st.markdown("#### السلّم (من الأقرب للأبعد)")
+                st.dataframe(pd.DataFrame(h["ladder"]["ladder"]),
+                             use_container_width=True, hide_index=True)
+                if h["ladder"]["supports"]:
+                    st.markdown(f'<div class="success-box">🛡️ ذيول تحولت لدعم: {h["ladder"]["supports"]}</div>', unsafe_allow_html=True)
 
 st.markdown("---")
 st.caption("⚠️ تعليمي فقط - ليس توصية استثمارية")
