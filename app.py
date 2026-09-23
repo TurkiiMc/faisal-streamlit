@@ -308,7 +308,6 @@ def check_offering(symbol):
         return {"has_offering": False}
 
 
-# كلمات المحفز الإيجابي (الدليل ص 65)
 POS_WORDS = ["approval", "approved", "contract", "award", "awarded", "partnership",
              "patent", "license", "agreement", "acquisition", "positive results",
              "phase 2", "phase 3", "regain compliance", "nasdaq compliance",
@@ -316,7 +315,6 @@ POS_WORDS = ["approval", "approved", "contract", "award", "awarded", "partnershi
 
 @st.cache_data(ttl=600)
 def check_news(symbol):
-    """أخبار سلبية + إيجابية في نداء واحد"""
     base = {"has_negative": False, "items": [], "status": "no_key",
             "critical_count": 0, "offering_count": 0, "high_count": 0,
             "positive_count": 0, "positive_items": []}
@@ -446,7 +444,6 @@ def detect_trend_strength(hist):
 # ===== سلوك المضارب (الدليل ص 12 و18) =====
 # ============================================================
 def detect_distribution(hist):
-    """تصريف: فوليوم مرتفع والسعر لا يتقدم (ص 18)"""
     if len(hist) < 15:
         return False
     last = hist.tail(10)
@@ -463,7 +460,6 @@ def detect_distribution(hist):
 
 
 def selling_volume_drying(hist):
-    """تجميع هادئ: فوليوم جلسات الهبوط يتناقص (ص 12)"""
     down = hist[hist["Close"] < hist["Open"]]
     if len(down) < 6:
         return False
@@ -473,7 +469,6 @@ def selling_volume_drying(hist):
 
 
 def geometric_wash_target(hist):
-    """قاعدة MWC (ص 68): كسر القاع الأول لطرح جديد → هدف الغسل نصفه"""
     if not (30 <= len(hist) <= 260):
         return None
     first_low = float(hist["Low"].head(20).min())
@@ -834,7 +829,7 @@ def filter_pivot_stock(symbol, hd, h4, splits):
 
 
 # ============================================================
-# ===== نظام النقاط (مطابق لمعادلة الدليل ص 65) =====
+# ===== نظام النقاط (معادلة الدليل ص 65) =====
 # ============================================================
 def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offering=None):
     close, high, low, vol = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
@@ -852,7 +847,6 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
     rv = round(cv / avg_vol, 2) if avg_vol > 0 else 0
 
     bd = {}
-    # ضغط RSI 23-27 (ص 64)
     if 23 <= r <= 27: bd["RSI"] = 25
     elif 20 <= r < 23: bd["RSI"] = 12
     elif 27 < r <= 30: bd["RSI"] = 15
@@ -908,11 +902,9 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
     stability = detect_stability(hist, sup, min_sessions=2)
     bd["Stability"] = stability["points"] if stability else 0
 
-    # تجميع هادئ: فوليوم البيع يتناقص (ص 12)
     accum = selling_volume_drying(hist)
     bd["AccumVol"] = 5 if accum else 0
 
-    # محفز إيجابي (ص 65)
     bd["Catalyst"] = 10 if (news and news.get("positive_count", 0) > 0) else 0
 
     rebound = rebound_progress(hist, sup, res)
@@ -984,7 +976,6 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     if live:
         st.info(f"🟢 السعر اللحظي: ${live['price']:.3f} ({live.get('percent_change', 0):+.2f}%)")
 
-    # شارة الشورت المتاح (ص 7) — عرض فقط
     if 0 < r.get("shares_short", 0) < 10000:
         st.markdown(f'<div class="info-box">🔥 <b>الشورت المتاح:</b> {int(r["shares_short"]):,} سهم — أقل من 10 آلاف = وقود مساعد (عامل مساعد لا إشارة شراء)</div>', unsafe_allow_html=True)
     if r.get("accum"):
@@ -1176,7 +1167,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
 
 
 # ============================================================
-# ===== لوحة رادار التقسيم =====
+# ===== لوحة رادار التقسيم (دورة + معادلة الدليل) =====
 # ============================================================
 def render_split_board(rows):
     if not rows:
@@ -1185,6 +1176,14 @@ def render_split_board(rows):
     counts = {}
     for r in rows:
         counts[r["phase_key"]] = counts.get(r["phase_key"], 0) + 1
+
+    # ═══ عدّاد الجاهزية الكاملة ═══
+    full_ready = [r for r in rows if r.get("guide_ready")]
+    if full_ready:
+        names = ", ".join(r["symbol"] for r in full_ready[:6])
+        st.markdown(f'<div style="background:#00b89422;border:2px solid #00b894;border-radius:12px;padding:12px;text-align:center;margin:8px 0;font-size:20px;font-weight:bold;color:#00b894">🟢 جاهز دخول كامل (دورة + معادلة الدليل): {len(full_ready)} سهم — {names}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="warn-box">⏳ لا سهم مكتمل المعادلة حالياً — الرادار يجهّز ولا يطارد</div>', unsafe_allow_html=True)
 
     st.markdown("#### 📊 توزيع المراحل")
     cols = st.columns(6)
@@ -1205,7 +1204,10 @@ def render_split_board(rows):
         st.markdown(f"#### {PHASE_META[key]['label']} — ({len(group)})")
         for r in group:
             zone_txt = f"${r['zone']['low']}–{r['zone']['high']}" if r["zone"] else "—"
-            with st.expander(f"**{r['symbol']}** | تقسيم {r['ratio']} قبل {r['days']} يوم | المنطقة {zone_txt} | ارتداد {r['rebound']}%"):
+            g_badge = ""
+            if r.get("missing") is not None:
+                g_badge = " | دليل: " + ("✅" if not r["missing"] else "⏳")
+            with st.expander(f"**{r['symbol']}** | تقسيم {r['ratio']} قبل {r['days']} يوم | المنطقة {zone_txt} | ارتداد {r['rebound']}%{g_badge}"):
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("عمر التقسيم", f"{r['days']} يوم")
                 c2.metric("النسبة", r["ratio"])
@@ -1218,6 +1220,12 @@ def render_split_board(rows):
                 c4.metric("ثبات جلستين", "✅" if r["stability"] else "❌")
                 if r["zone"]:
                     st.markdown(f'<div class="info-box">📐 <b>المنطقة المعتمدة:</b> ${r["zone"]["low"]} — ${r["zone"]["high"]} ({r["zone"]["touches"]} لمسات)</div>', unsafe_allow_html=True)
+                if r.get("score") is not None:
+                    st.write(f"🧮 نقاط الطريقة: **{r['score']}/100**")
+                    if r.get("guide_ready"):
+                        st.markdown('<div class="success-box">✅ <b>معادلة الدليل مكتملة (ص 65):</b> ضغط RSI + MACD متحسن + ثبات + بلا تصريف — هذا هو الدخول الصحيح</div>', unsafe_allow_html=True)
+                    elif r.get("missing") is not None:
+                        st.markdown(f'<div class="warn-box">⏳ <b>الدورة مكتملة لكن المعادلة لا:</b> {" | ".join(r["missing"])} — راقب ولا تدخل بعد</div>', unsafe_allow_html=True)
                 if key == "READY":
                     st.success("✅ داخل منطقة الدخول (≤15%) — افتح تبويب «تحليل سهم» للخطة الكاملة")
                 elif key == "WATCH":
@@ -1260,7 +1268,7 @@ with st.sidebar:
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 تحليل سهم", "⭐ الفرص الحالية", "🛰️ رادار التقسيم", "🕯️ فلتر الارتكاز", "📓 دفتر المتابعة"])
 
-# ===== TAB 1: تحليل سهم =====
+# ===== TAB 1 =====
 with tab1:
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -1284,7 +1292,7 @@ with tab1:
                 r = score(sym, hist, info, splits, news, offering=offering)
                 render_full_analysis(sym, hist, splits, info, news, offering, r)
 
-# ===== TAB 2: الفرص الحالية (دمج أفضل10 + الاكتشاف) =====
+# ===== TAB 2 =====
 with tab2:
     st.markdown("### ⭐ الفرص الحالية — معادلة الارتكاز (ص 65)")
     st.markdown(
@@ -1344,15 +1352,16 @@ with tab2:
                 if r["stability"]:
                     st.write(f"الثبات: {r['stability']['strength']} - {r['stability']['sessions_held']} جلسات")
 
-# ===== TAB 3: رادار التقسيم =====
+# ===== TAB 3 =====
 with tab3:
-    st.markdown("### 🛰️ رادار التقسيم العكسي — لوحة دورة الحياة")
+    st.markdown("### 🛰️ رادار التقسيم العكسي — دورة الحياة + معادلة الدليل")
     st.markdown(
         '<div class="filter-box"><b>منطق الرادار:</b><br>'
         '• <b>الحدث:</b> تقسيم عكسي خلال آخر 90 يوم<br>'
         '• <b>الغسيل:</b> جفاف حجم <50% من حجم أول 10 جلسات بعد التقسيم<br>'
         '• <b>المنطقة:</b> ≥3 قيعان داخل ±4% بلا إغلاق تحتها<br>'
         '• <b>إثبات الحياة:</b> ارتداد ≥10% | <b>الدخول:</b> داخل 15% من القاع<br>'
+        '• <b>معادلة الدليل (ص 65):</b> RSI 23-27 + MACD متحسن + ثبات + بلا تصريف<br>'
         '• <b>استبعاد فوري:</b> طرح SEC / خبر حرج / سعر <$1.30 / مقسّم تسلسلي</div>',
         unsafe_allow_html=True)
 
@@ -1383,6 +1392,23 @@ with tab3:
                     if veto:
                         pi["phase_key"] = "REJECTED"
                         pi["rejections"] = [why]
+                    else:
+                        # معادلة الدليل ص 65 تُفحص لكل سهم متقدم
+                        inf = finnhub_metrics(s)
+                        news = check_news(s)
+                        r = score(s, h, inf, sps, news)
+                        pi["score"] = r["total"]
+                        missing = []
+                        if not (20 <= r["rsi"] <= 30):
+                            missing.append(f"RSI {r['rsi']} خارج ضغط 23-27")
+                        if not r["macd_imp"]:
+                            missing.append("MACD لا يتحسن")
+                        if r["distribution"]:
+                            missing.append("تصريف: فوليوم عالي والسعر واقف")
+                        if not r["stability"]:
+                            missing.append("لا ثبات فوق الدعم")
+                        pi["missing"] = missing
+                        pi["guide_ready"] = (pi["phase_key"] == "READY" and not missing)
                 rows.append(pi)
             except Exception:
                 continue
@@ -1394,7 +1420,7 @@ with tab3:
     else:
         st.info("اضغط «امسح دورة التقسيم» لبدء أول مسح")
 
-# ===== TAB 4: فلتر الارتكاز 4H =====
+# ===== TAB 4 =====
 with tab4:
     st.markdown("### 🕯️ فلتر سهم الارتكاز — الشموع الساقطة (4H)")
     st.markdown(
@@ -1461,7 +1487,7 @@ with tab4:
                 if h["ladder"]["supports"]:
                     st.markdown(f'<div class="success-box">🛡️ ذيول تحولت لدعم: {h["ladder"]["supports"]}</div>', unsafe_allow_html=True)
 
-# ===== TAB 5: دفتر المتابعة اليومي (ص 38) =====
+# ===== TAB 5 =====
 with tab5:
     st.markdown("### 📓 دفتر المتابعة اليومي")
     st.caption("الاحتراف في تكرار نفس عملية الفحص يومياً — لا في معرفة سهم واحد")
