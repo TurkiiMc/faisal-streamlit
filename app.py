@@ -11,17 +11,13 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
-# ===== الإعدادات (المفاتيح من محفظة Render) =====
+# ===== الإعدادات =====
 # ============================================================
 st.set_page_config(page_title="Stock Screener Pro", page_icon="🎯", layout="wide")
 
-PROXY_URL     = os.environ.get("PROXY_URL", "https://faisal-proxy.onrender.com").rstrip("/")
-FINNHUB_KEY   = os.environ.get("FINNHUB_KEY", "")
-ALPACA_KEY    = os.environ.get("ALPACA_KEY", "")
-ALPACA_SECRET = os.environ.get("ALPACA_SECRET", "")
-ALPACA_ENABLED = bool(ALPACA_KEY and ALPACA_SECRET)
-ALPACA_BASE   = "https://data.alpaca.markets/v2"
-ON_RENDER     = bool(os.environ.get("RENDER_SERVICE_NAME"))
+PROXY_URL   = os.environ.get("PROXY_URL", "https://faisal-proxy.onrender.com").rstrip("/")
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")
+ON_RENDER   = bool(os.environ.get("RENDER_SERVICE_NAME"))
 
 MARKET_CAP_MAX = 20_000_000
 FLOAT_MAX      = 5_000_000
@@ -29,7 +25,6 @@ PRICE_MAX      = 5.0
 VOLUME_MIN     = 100_000
 SPLIT_MAX_DAYS = 50
 
-# ثوابت التسريع وطريقة الارتكاز
 MAX_WORKERS = 6
 LADDER_MIN_CANDLES = 2
 LADDER_STEP_MIN, LADDER_STEP_MAX = 15.0, 35.0
@@ -57,7 +52,6 @@ class RateLimiter:
             self.calls.append(time.time())
 
 finnhub_limiter = RateLimiter(max_calls=55, period=60)
-alpaca_limiter  = RateLimiter(max_calls=200, period=60)
 
 # ============================================================
 # ===== CSS =====
@@ -79,8 +73,6 @@ h1,h2,h3{direction:rtl;text-align:right}
 .filter-box{background:#fff8e1;padding:15px;border-radius:10px;margin:10px 0;border:2px solid #fdcb6e}
 .plan-table{width:100%;border-collapse:collapse;margin-top:10px}
 .plan-table td{padding:8px;border-bottom:1px solid #d0e4f5;font-size:16px}
-.live-price{font-size:32px;font-weight:bold;padding:15px;text-align:center;border-radius:10px;margin:5px;background:linear-gradient(135deg,#f8f9fa,#e9ecef)}
-.live-up{color:#00b894}.live-down{color:#d63031}.live-neutral{color:#636e72}
 </style>""", unsafe_allow_html=True)
 
 # ============================================================
@@ -122,46 +114,6 @@ def _ttl(store, lock, key, ttl, producer):
 # ============================================================
 # ===== طبقة البيانات =====
 # ============================================================
-def alpaca_candles(symbol, period="6mo"):
-    if not ALPACA_ENABLED:
-        return pd.DataFrame(), []
-    alpaca_limiter.wait()
-    period_map = {"1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730}
-    days = period_map.get(period, 180)
-    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    try:
-        headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
-        r = requests.get(f"{ALPACA_BASE}/stocks/{symbol}/bars", headers=headers,
-                         params={"timeframe": "1Day", "start": start, "limit": 1000, "adjustment": "all"},
-                         timeout=15)
-        if r.status_code == 200:
-            bars = r.json().get("bars", [])
-            if bars:
-                df = pd.DataFrame(bars)
-                df["date"] = pd.to_datetime(df["t"])
-                df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
-                return df.set_index("date").sort_index(), []
-    except Exception:
-        pass
-    return pd.DataFrame(), []
-
-
-def alpaca_realtime_trade(symbol):
-    if not ALPACA_ENABLED:
-        return None
-    alpaca_limiter.wait()
-    try:
-        headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
-        r = requests.get(f"{ALPACA_BASE}/stocks/{symbol}/trades/latest", headers=headers, timeout=10)
-        if r.status_code == 200:
-            t = r.json().get("trade", {})
-            if t:
-                return {"price": float(t.get("p", 0)), "size": int(t.get("s", 0)), "timestamp": t.get("t", "")}
-    except Exception:
-        pass
-    return None
-
-
 @st.cache_data(ttl=300)
 def stooq_candles(symbol, period="1y"):
     try:
@@ -180,15 +132,6 @@ def stooq_candles(symbol, period="1y"):
 
 
 def _candles_uncached(symbol, period="6mo"):
-    # 1) Alpaca
-    if ALPACA_ENABLED:
-        try:
-            df, splits = alpaca_candles(symbol, period)
-            if not df.empty and len(df) >= 20:
-                return df, splits, "alpaca"
-        except Exception:
-            pass
-    # 2) Yahoo Proxy (مع إعادة محاولة تغطي Cold Start)
     if PROXY_URL:
         for attempt in range(2):
             try:
@@ -207,7 +150,6 @@ def _candles_uncached(symbol, period="6mo"):
                     time.sleep(3)
             except Exception:
                 time.sleep(2)
-    # 3) yfinance (محلياً فقط)
     if not ON_RENDER:
         try:
             import yfinance as yf
@@ -226,7 +168,6 @@ def _candles_uncached(symbol, period="6mo"):
                 return df, splits_list, "yfinance"
         except Exception:
             pass
-    # 4) Stooq طوارئ
     df = stooq_candles(symbol, period)
     if not df.empty:
         return df, [], "stooq"
@@ -239,7 +180,6 @@ def get_candles_unified(symbol, period="6mo"):
 
 
 def scan_parallel(symbols, period, progress_cb=None):
-    """جلب متوازٍ — أسرع ~6 أضعاف من الحلقة التسلسلية"""
     out, total, done = [], len(symbols), 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futs = {ex.submit(get_candles_unified, s, period): s for s in symbols}
@@ -259,10 +199,6 @@ def scan_parallel(symbols, period, progress_cb=None):
 
 @st.cache_data(ttl=60)
 def get_realtime_price(symbol):
-    if ALPACA_ENABLED:
-        t = alpaca_realtime_trade(symbol)
-        if t and t["price"] > 0:
-            return {"price": t["price"], "source": "alpaca", "live": True}
     if FINNHUB_KEY:
         finnhub_limiter.wait()
         try:
@@ -272,7 +208,7 @@ def get_realtime_price(symbol):
                 q = r.json()
                 if q.get("c", 0) > 0:
                     return {"price": float(q["c"]), "percent_change": float(q.get("dp", 0)),
-                            "source": "finnhub", "live": True}
+                            "source": "finnhub"}
         except Exception:
             pass
     return None
@@ -372,10 +308,20 @@ def check_offering(symbol):
         return {"has_offering": False}
 
 
+# كلمات المحفز الإيجابي (الدليل ص 65)
+POS_WORDS = ["approval", "approved", "contract", "award", "awarded", "partnership",
+             "patent", "license", "agreement", "acquisition", "positive results",
+             "phase 2", "phase 3", "regain compliance", "nasdaq compliance",
+             "buyback", "insider buying", "exceeds expectations"]
+
 @st.cache_data(ttl=600)
-def check_negative_news(symbol):
+def check_news(symbol):
+    """أخبار سلبية + إيجابية في نداء واحد"""
+    base = {"has_negative": False, "items": [], "status": "no_key",
+            "critical_count": 0, "offering_count": 0, "high_count": 0,
+            "positive_count": 0, "positive_items": []}
     if not FINNHUB_KEY:
-        return {"has_negative": False, "items": [], "status": "no_key"}
+        return base
     finnhub_limiter.wait()
     try:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -384,10 +330,10 @@ def check_negative_news(symbol):
                          params={"symbol": symbol, "from": week_ago, "to": today, "token": FINNHUB_KEY},
                          timeout=15)
         if r.status_code != 200:
-            return {"has_negative": False, "items": [], "status": "error"}
+            base["status"] = "error"; return base
         news = r.json()
         if not news:
-            return {"has_negative": False, "items": [], "status": "no_news"}
+            base["status"] = "no_news"; return base
         neg_critical = ["bankruptcy", "chapter 11", "chapter 7", "delisting", "delisted", "fraud",
                         "sec investigation", "sec probe", "halted", "trading halt", "going concern"]
         neg_high = ["lawsuit", "class action", "sued", "net loss", "layoffs", "layoff", "restructuring",
@@ -396,9 +342,13 @@ def check_negative_news(symbol):
         neg_offering = ["public offering", "private placement", "registered direct", "dilution",
                         "shelf offering", "atm offering", "stock offering"]
         neg_medium = ["investigation", "probe", "subpoena", "recall", "delay", "rejected", "cancellation"]
-        matches = []
+        matches, pos_matches = [], []
         for item in news[:30]:
-            text = ((item.get("headline") or "") + " " + (item.get("summary") or "")).lower()
+            head = item.get("headline") or ""
+            text = (head + " " + (item.get("summary") or "")).lower()
+            low_head = head.lower()
+            if any(p in low_head for p in POS_WORDS):
+                pos_matches.append(head[:120])
             level = keyword = None
             for kw in neg_critical:
                 if kw in text: level, keyword = "CRITICAL", kw; break
@@ -416,15 +366,16 @@ def check_negative_news(symbol):
                     date_str = datetime.fromtimestamp(item.get("datetime", 0)).strftime("%Y-%m-%d")
                 except Exception:
                     date_str = "?"
-                matches.append({"headline": (item.get("headline") or "")[:120],
-                                "source": item.get("source", "?"), "date": date_str,
-                                "level": level, "keyword": keyword, "url": item.get("url", "")})
+                matches.append({"headline": head[:120], "source": item.get("source", "?"),
+                                "date": date_str, "level": level, "keyword": keyword,
+                                "url": item.get("url", "")})
         return {"has_negative": len(matches) > 0, "items": matches[:5], "status": "done",
                 "critical_count": sum(1 for m in matches if m["level"] == "CRITICAL"),
                 "offering_count": sum(1 for m in matches if m["level"] == "OFFERING"),
-                "high_count": sum(1 for m in matches if m["level"] == "HIGH")}
+                "high_count": sum(1 for m in matches if m["level"] == "HIGH"),
+                "positive_count": len(pos_matches), "positive_items": pos_matches[:3]}
     except Exception:
-        return {"has_negative": False, "items": [], "status": "error"}
+        return base
 
 
 # ============================================================
@@ -472,16 +423,6 @@ def sma(close, p):
     return float(close.rolling(p).mean().iloc[-1]) if len(close) >= p else None
 
 
-def stoch(high, low, close, kp=14, dp=3):
-    if len(close) < kp: return 50.0
-    ll = low.rolling(kp).min()
-    hh = high.rolling(kp).max()
-    d = (hh - ll).replace(0, np.nan)
-    k = 100 * ((close - ll) / d)
-    v = k.rolling(dp).mean().iloc[-1]
-    return float(v) if pd.notna(v) else 50.0
-
-
 def sr(hist, w=20):
     if hist.empty or len(hist) < w: return None, None
     return float(hist["Low"].rolling(w).min().iloc[-1]), float(hist["High"].rolling(w).max().iloc[-1])
@@ -501,9 +442,45 @@ def detect_trend_strength(hist):
     return "neutral"
 
 
-def fibonacci_levels(low, high):
-    diff = high - low
-    return {"1.272": round(high + diff * 0.272, 3), "1.618": round(high + diff * 0.618, 3)}
+# ============================================================
+# ===== سلوك المضارب (الدليل ص 12 و18) =====
+# ============================================================
+def detect_distribution(hist):
+    """تصريف: فوليوم مرتفع والسعر لا يتقدم (ص 18)"""
+    if len(hist) < 15:
+        return False
+    last = hist.tail(10)
+    prev = hist.iloc[-30:-10] if len(hist) >= 30 else hist.iloc[:-10]
+    if prev.empty:
+        return False
+    vol_prev = float(prev["Volume"].mean())
+    vol_now = float(last["Volume"].mean())
+    base = float(last["Close"].iloc[0])
+    if base <= 0:
+        return False
+    move = abs(float(last["Close"].iloc[-1]) - base) / base * 100
+    return vol_now > vol_prev * 1.5 and move < 2.0
+
+
+def selling_volume_drying(hist):
+    """تجميع هادئ: فوليوم جلسات الهبوط يتناقص (ص 12)"""
+    down = hist[hist["Close"] < hist["Open"]]
+    if len(down) < 6:
+        return False
+    recent = float(down["Volume"].tail(3).mean())
+    prior = float(down["Volume"].iloc[-6:-3].mean())
+    return prior > 0 and recent < prior * 0.7
+
+
+def geometric_wash_target(hist):
+    """قاعدة MWC (ص 68): كسر القاع الأول لطرح جديد → هدف الغسل نصفه"""
+    if not (30 <= len(hist) <= 260):
+        return None
+    first_low = float(hist["Low"].head(20).min())
+    current = float(hist["Close"].iloc[-1])
+    if first_low > 0 and current < first_low * 0.999:
+        return round(first_low * 0.5, 3)
+    return None
 
 
 # ============================================================
@@ -645,22 +622,6 @@ def detect_liquidity_sweep(hist):
     return False
 
 
-def detect_spring(hist):
-    if len(hist) < 40: return None
-    support = hist["Low"].tail(40).min()
-    last10 = hist.tail(10)
-    return {"detected": True} if (last10["Low"].min() < support * 0.97 and last10["Close"].iloc[-1] > support) else None
-
-
-def detect_lps(hist):
-    if len(hist) < 40: return None
-    resistance = hist["High"].tail(30).max()
-    recent = hist.tail(15)
-    if not (recent["High"].max() > resistance * 0.98): return None
-    pullback = recent["Low"].min()
-    return {"detected": True} if (pullback > resistance * 0.95 and hist["Close"].iloc[-1] > pullback) else None
-
-
 # ============================================================
 # ===== آلة حالات التقسيم العكسي =====
 # ============================================================
@@ -774,7 +735,7 @@ def advanced_veto(symbol):
     offering = check_offering(symbol)
     if offering.get("has_offering"):
         return True, f"طرح SEC نشط ({offering.get('form','?')} قبل {offering.get('days','?')} يوم)"
-    news = check_negative_news(symbol)
+    news = check_news(symbol)
     if news.get("critical_count", 0) > 0:
         return True, f"أخبار حرجة ({news.get('critical_count')} خبر)"
     return False, ""
@@ -785,7 +746,6 @@ def advanced_veto(symbol):
 # ============================================================
 @st.cache_data(ttl=300)
 def get_4h(symbol):
-    """شموع 4 ساعات: جلب 1h من البروكسي ثم تجميع كل 4 شموع داخل الجلسة"""
     if not PROXY_URL:
         return None
     try:
@@ -814,7 +774,6 @@ def get_4h(symbol):
 
 
 def build_red_ladder(h4):
-    """سلّم الشموع الساقطة على 4H: الذيل(Low) مقاومة→دعم، الرأس(High) هدف"""
     if h4 is None or len(h4) < 10:
         return None
     reds = h4[h4["Close"] < h4["Open"]].tail(40)
@@ -844,7 +803,6 @@ def ma_band_touch(hist, level, tol=MA_TOUCH_PCT):
 
 
 def filter_pivot_stock(symbol, hd, h4, splits):
-    """فلتر طريقة الارتكاز — بدون شورت إطلاقاً"""
     lad = build_red_ladder(h4)
     if not lad:
         return None
@@ -876,7 +834,7 @@ def filter_pivot_stock(symbol, hd, h4, splits):
 
 
 # ============================================================
-# ===== نظام النقاط (مع الإصلاحات) =====
+# ===== نظام النقاط (مطابق لمعادلة الدليل ص 65) =====
 # ============================================================
 def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offering=None):
     close, high, low, vol = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
@@ -884,7 +842,6 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
     r = rsi(close)
     mp, mi, macd_hist = macd(close)
     macd_txt, macd_color = macd_status(mp, mi, macd_hist)
-    sk = stoch(high, low, close)
     s20, s30, s50 = sma(close, 20), sma(close, 30), sma(close, 50)
     sup, res = sr(hist, 20)
     fs = info.get("floatShares", 0) or 0
@@ -895,6 +852,7 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
     rv = round(cv / avg_vol, 2) if avg_vol > 0 else 0
 
     bd = {}
+    # ضغط RSI 23-27 (ص 64)
     if 23 <= r <= 27: bd["RSI"] = 25
     elif 20 <= r < 23: bd["RSI"] = 12
     elif 27 < r <= 30: bd["RSI"] = 15
@@ -931,12 +889,6 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
         bd["MA"] = {3: 15, 2: 8, 1: 5}.get(b, 0)
     else: bd["MA"] = 0
 
-    if sk < 20: bd["Stoch"] = 10
-    elif sk < 30: bd["Stoch"] = 8
-    elif sk < 40: bd["Stoch"] = 6
-    elif sk < 50: bd["Stoch"] = 4
-    else: bd["Stoch"] = 0
-
     support_broken = bool(sup and price < sup)
     ds = None
     if sup:
@@ -955,6 +907,13 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
 
     stability = detect_stability(hist, sup, min_sessions=2)
     bd["Stability"] = stability["points"] if stability else 0
+
+    # تجميع هادئ: فوليوم البيع يتناقص (ص 12)
+    accum = selling_volume_drying(hist)
+    bd["AccumVol"] = 5 if accum else 0
+
+    # محفز إيجابي (ص 65)
+    bd["Catalyst"] = 10 if (news and news.get("positive_count", 0) > 0) else 0
 
     rebound = rebound_progress(hist, sup, res)
     if rebound is not None:
@@ -975,8 +934,9 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
         if news.get("high_count", 0) >= 2: total = max(0, total - 10)
 
     failed_spike = detect_failed_spike(hist)
+    distribution = detect_distribution(hist)
 
-    hard_veto = support_broken or bool(failed_spike)
+    hard_veto = support_broken or bool(failed_spike) or distribution
     if news and news.get("critical_count", 0) > 0: hard_veto = True
     if offering and offering.get("has_offering"): hard_veto = True
 
@@ -989,14 +949,15 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
     else: v, c = "مرفوض", "#d63031"
 
     return {
-        "symbol": symbol, "price": price, "rsi": round(r, 2), "stoch": round(sk, 2),
+        "symbol": symbol, "price": price, "rsi": round(r, 2),
         "macd_pos": mp, "macd_imp": mi, "macd_hist": round(macd_hist, 4),
         "macd_txt": macd_txt, "macd_color": macd_color, "sma20": s20, "sma50": s50,
         "support": sup, "resistance": res, "dist_sup": ds, "float": fs, "marketCap": mc,
-        "rvol": rv, "short_pct": spct, "breakdown": bd, "total": total, "verdict": v,
-        "color": c, "rebound": rebound, "split_info": split_info, "stability": stability,
-        "sweep": detect_liquidity_sweep(hist), "spring": detect_spring(hist),
-        "lps": detect_lps(hist), "w_pattern": w_pat, "runner": is_runner,
+        "rvol": rv, "short_pct": spct, "shares_short": info.get("sharesShort", 0) or 0,
+        "breakdown": bd, "total": total, "verdict": v, "color": c,
+        "rebound": rebound, "split_info": split_info, "stability": stability,
+        "accum": accum, "distribution": distribution,
+        "sweep": detect_liquidity_sweep(hist), "w_pattern": w_pat, "runner": is_runner,
         "bull_trapering": detect_bull_trap(hist), "failed_spike": failed_spike,
         "gap": detect_gap_fill(hist), "candles": detect_candle_patterns(hist),
         "support_broken": support_broken, "hard_veto": hard_veto,
@@ -1004,7 +965,7 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
 
 
 # ============================================================
-# ===== عرض التحليل + خطة الدخول الديناميكية =====
+# ===== عرض التحليل + خطة الدخول =====
 # ============================================================
 def render_full_analysis(sym, hist, splits, info, news, offering, r):
     st.markdown(f'<div class="score-card"><div class="score-big" style="color:{r["color"]}">{r["total"]}/100</div><div class="verdict">{r["verdict"]}</div></div>', unsafe_allow_html=True)
@@ -1012,7 +973,8 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     if r.get("hard_veto"):
         reasons = []
         if r.get("support_broken"): reasons.append("الدعم مكسور")
-        if r.get("failed_spike"): reasons.append("Failed Spike")
+        if r.get("failed_spike"): reasons.append("Failed Spike / ضخ ثم تصريف")
+        if r.get("distribution"): reasons.append("تصريف: فوليوم عالي والسعر واقف")
         if news and news.get("critical_count", 0) > 0: reasons.append("أخبار حرجة")
         if offering and offering.get("has_offering"): reasons.append("طرح SEC نشط")
         st.markdown(f'<div class="danger-box">🚫 <b>إقصاء فوري:</b> {" | ".join(reasons)} — لا تُتداول هذه الحالة</div>', unsafe_allow_html=True)
@@ -1020,7 +982,18 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
 
     live = get_realtime_price(sym)
     if live:
-        st.info(f"🟢 السعر اللحظي: ${live['price']:.3f} (المصدر: {live.get('source')})")
+        st.info(f"🟢 السعر اللحظي: ${live['price']:.3f} ({live.get('percent_change', 0):+.2f}%)")
+
+    # شارة الشورت المتاح (ص 7) — عرض فقط
+    if 0 < r.get("shares_short", 0) < 10000:
+        st.markdown(f'<div class="info-box">🔥 <b>الشورت المتاح:</b> {int(r["shares_short"]):,} سهم — أقل من 10 آلاف = وقود مساعد (عامل مساعد لا إشارة شراء)</div>', unsafe_allow_html=True)
+    if r.get("accum"):
+        st.markdown('<div class="success-box">🤫 <b>تجميع هادئ:</b> فوليوم جلسات الهبوط يتناقص بينما السعر متماسك</div>', unsafe_allow_html=True)
+    if news and news.get("positive_count", 0) > 0:
+        st.markdown(f'<div class="success-box">📰 <b>محفز إيجابي:</b> {news["positive_count"]} خبر — المحفز لا يكفي إن لم يكن الشارت جاهزاً</div>', unsafe_allow_html=True)
+    gwt = geometric_wash_target(hist)
+    if gwt:
+        st.markdown(f'<div class="warn-box">📐 <b>قاعدة MWC (ص 68):</b> القاع الأول مكسور → هدف الغسل الهندسي ${gwt} (نصف القاع الأول)</div>', unsafe_allow_html=True)
 
     if news.get("critical_count", 0) > 0:
         st.markdown(f'<div class="danger-box">🚨 <b>أخبار حرجة!</b> {news["critical_count"]} خبر خطير</div>', unsafe_allow_html=True)
@@ -1044,12 +1017,12 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         st.markdown('<div class="warn-box">⚠️ <b>نموذج الثبات:</b> أقل من جلستين فوق الدعم - انتظر</div>', unsafe_allow_html=True)
 
     if r["bull_trapering"]:
-        st.markdown('<div class="danger-box">Bull Trap: كسر مقاومة ثم فشل - خطر!</div>', unsafe_allow_html=True)
+        st.markdown('<div class="danger-box">Bull Trap: كسر مقاومة ثم فشل - لا تشترِ الاختراق، اشترِ الثبات</div>', unsafe_allow_html=True)
     if r["split_info"].get("has_split"):
         d = r["split_info"]["days_since"]
         st.markdown(f'<div class="split-box">Reverse Split: {r["split_info"]["ratio"]} - قبل {d} يوم{" - حديث!" if d <= 180 else ""}</div>', unsafe_allow_html=True)
     if r["short_pct"] > 0:
-        warn = " - مرتفع! Squeeze محتمل" if r["short_pct"] > 0.20 else ""
+        warn = " - مرتفع! وقود ارتداد" if r["short_pct"] > 0.20 else ""
         st.markdown(f'<div class="info-box">Short Float: {round(r["short_pct"]*100, 2)}%{warn}</div>', unsafe_allow_html=True)
     if r["marketCap"]:
         st.markdown(f'<div class="info-box">Market Cap: ${round(r["marketCap"]/1000000, 2)}M</div>', unsafe_allow_html=True)
@@ -1058,38 +1031,35 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("السعر", f"${round(r['price'], 3)}")
     c2.metric("RSI", r['rsi'])
-    c3.metric("Stoch", r['stoch'])
-    c4.metric("RVOL", r['rvol'])
+    c3.metric("RVOL", r['rvol'])
+    c4.metric("Float", f"{round(r['float']/1000000, 2)}M" if r['float'] else "-")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("MA20", f"${round(r['sma20'], 2)}" if r['sma20'] else "-")
     c2.metric("MA50", f"${round(r['sma50'], 2)}" if r['sma50'] else "-")
     c3.metric("الدعم", f"${round(r['support'], 3)}" if r['support'] else "-")
     c4.metric("المقاومة", f"${round(r['resistance'], 3)}" if r['resistance'] else "-")
 
-    if r["runner"]: st.markdown('<div class="success-box">Former Runner: سبق أن انفجر +50% في يوم!</div>', unsafe_allow_html=True)
+    if r["runner"]: st.markdown('<div class="success-box">Former Runner: سبق أن انفجر +50% في يوم — يستحق الرادار</div>', unsafe_allow_html=True)
     if r["w_pattern"]:
         wp = r["w_pattern"]
-        st.markdown(f'<div class="success-box">W Pattern: قاعان ${wp["bottom1"]} / ${wp["bottom2"]} - خط العنق: ${wp["neckline"]}</div>', unsafe_allow_html=True)
-    if r["sweep"]: st.markdown('<div class="success-box">سحب سيولة: تم كشفه!</div>', unsafe_allow_html=True)
-    if r["spring"]: st.markdown('<div class="success-box">Spring (وايكوف): كسر ثم استرداد!</div>', unsafe_allow_html=True)
-    if r["lps"]: st.markdown('<div class="success-box">LPS (وايكوف): اختراق ثم اختبار ناجح!</div>', unsafe_allow_html=True)
-    if r["candles"]: st.markdown(f'<div class="success-box">شموع انعكاسية: {", ".join(r["candles"])}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="success-box">W Pattern: قاعان ${wp["bottom1"]} / ${wp["bottom2"]} - خط العنق: ${wp["neckline"]} — ادخل بعد كسر العنق والثبات فوقه</div>', unsafe_allow_html=True)
+    if r["sweep"]: st.markdown('<div class="success-box">سحب سيولة: كسر ثم استرداد — الكسر المسترد = فرصة، الكسر الباقي = فشل</div>', unsafe_allow_html=True)
+    if r["candles"]: st.markdown(f'<div class="success-box">شمعة إيجابية: {", ".join(r["candles"])}</div>', unsafe_allow_html=True)
     if r["gap"]:
         g = r["gap"]
-        st.markdown(f'<div class="info-box">فجوة {"هبوط" if g["direction"]=="down" else "صعود"}: {g["gap_pct"]}% عند ${g["gap_price"]}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="info-box">فجوة {"هبوط" if g["direction"]=="down" else "صعود"}: {g["gap_pct"]}% عند ${g["gap_price"]} — الفجوة هدف محتمل لا وعد</div>', unsafe_allow_html=True)
     if r["rebound"] is not None:
         if r["rebound"] > 60:
-            st.markdown(f'<div class="warn-box">الارتداد: {r["rebound"]}% - متأخر</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="warn-box">الارتداد: {r["rebound"]}% - متأخر، لا تطارد</div>', unsafe_allow_html=True)
         else:
             st.markdown(f'<div class="info-box">تقدم الارتداد: {r["rebound"]}% - مبكر</div>', unsafe_allow_html=True)
-    st.info(f"Free Float: {round(r['float']/1000000, 2)}M سهم" if r["float"] else "Free Float: غير متوفر")
 
-    # ═══════════ خطة الدخول الديناميكية + إصلاح الأهداف ═══════════
+    # ═══════════ خطة الدخول ═══════════
     if r["support"] and r["resistance"]:
         sup_val, res_val, current_price = r["support"], r["resistance"], r["price"]
         atr_val = atr(hist["High"], hist["Low"], hist["Close"], 14)
         trend = detect_trend_strength(hist)
-        fib = fibonacci_levels(hist["Low"].tail(60).min(), hist["High"].tail(60).max())
+        fib1618 = round(res_val + (res_val - sup_val) * 0.618, 3)
 
         if atr_val:
             entry1 = round(sup_val + atr_val * 0.5, 3)
@@ -1103,10 +1073,9 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
             t2_raw = round(res_val * 1.2, 3)
         stop_struct = round(sup_val * 0.97, 3)
         stop = stop_hard
-        # أهداف مرتبة تصاعدياً دائماً (إصلاح خلل KITT)
         target1 = round(res_val, 3)
         target2 = round(max(t2_raw, target1 * 1.15), 3)
-        target3 = round(max(fib.get("1.618", res_val * 1.3), target2 * 1.5), 3)
+        target3 = round(max(fib1618, target2 * 1.5), 3)
 
         atr_pct = round(atr_val / current_price * 100, 1) if atr_val else 0
         vol_flag = atr_pct > 8
@@ -1124,7 +1093,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
                 {"t": "🥉 دخول أخير (25%)", "p": entry3, "ord": "Limit", "pct": 0.25},
             ]
             avg_entry = round(entry1*0.40 + entry2*0.35 + entry3*0.25, 3)
-            note = "⏳ السعر فوق السلّم — علّق أوامرك تحت السوق وانتظر"; note_color = "#0984e3"
+            note = "⏳ السعر فوق السلّم — ضع طلباتك في منطقة الطلب ولا تشترِ من العرض"; note_color = "#0984e3"
         elif current_price >= entry2:
             ladder = [
                 {"t": "🥇 دخول فوري (40%)", "p": mkt,    "ord": "Market", "pct": 0.40},
@@ -1132,7 +1101,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
                 {"t": "🥉 دخول أخير (25%)", "p": entry3, "ord": "Limit",  "pct": 0.25},
             ]
             avg_entry = round(mkt*0.40 + entry2*0.35 + entry3*0.25, 3)
-            note = "⚡ السعر داخل السلّم — الشريحة الأولى سوقاً الآن والبقية معلقة تحت"; note_color = "#00b894"
+            note = "⚡ السعر داخل السلّم — الشريحة الأولى سوقاً والبقية معلقة تحت"; note_color = "#00b894"
         elif current_price >= entry3:
             ladder = [
                 {"t": "🥇 دخول فوري (40%)",  "p": mkt, "ord": "Market", "pct": 0.40},
@@ -1140,11 +1109,11 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
                 {"t": "🥉 دخول أخير (25%)",  "p": entry3, "ord": "Limit", "pct": 0.25},
             ]
             avg_entry = round(mkt*0.75 + entry3*0.25, 3)
-            note = "⚡ السعر عميق داخل السلّم — شريحتان سوقاً الآن وواحدة معلقة"; note_color = "#00b894"
+            note = "⚡ السعر عميق داخل السلّم — شريحتان سوقاً وواحدة معلقة"; note_color = "#00b894"
         else:
             ladder = [{"t": "🎯 دخول كامل (100%)", "p": mkt, "ord": "Market", "pct": 1.0}]
             avg_entry = mkt
-            note = "🟢 السعر عند المنطقة العميقة (فوق الدعم مباشرة) — دخول كامل مع التحقق من الثبات"; note_color = "#00b894"
+            note = "🟢 السعر عند منطقة الطلب — دخول كامل مع التحقق من الثبات"; note_color = "#00b894"
 
         risk_ps = round(avg_entry - stop, 3)
         shares = int(max_risk / risk_ps) if risk_ps > 0 else 0
@@ -1165,14 +1134,13 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         }
         trend_txt, trend_color = trend_map[trend]
 
-        st.markdown("### 📊 خطة التداول الاحترافية")
+        st.markdown("### 📊 خطة التداول")
         st.markdown(f'<div style="background:{note_color}22;padding:15px;border-radius:10px;margin:10px 0;border:2px solid {note_color};text-align:center;font-size:18px;font-weight:bold">{note}</div>', unsafe_allow_html=True)
         st.markdown(f'<div style="background:{trend_color}15;padding:10px;border-radius:8px;margin:5px 0;border-right:4px solid {trend_color}"><b>📈 حالة الاتجاه:</b> {trend_txt}</div>', unsafe_allow_html=True)
 
         if vol_flag:
-            st.markdown(f'<div class="warn-box">⚠️ <b>تقلب يومي {atr_pct}%</b> — الوقف الصلب بعيد ({risk_pct}%) بتصميم مضاد للضجيج، ولذا خُفّضت المخاطرة تلقائياً إلى {eff_risk}%.<br>📌 <b>وقف القرار:</b> أي <b>إغلاق يومي</b> تحت ${stop_struct} يُنهي الصفقة فوراً حتى لو لم يلمس الوقف الصلب.</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="warn-box">⚠️ <b>تقلب يومي {atr_pct}%</b> — الوقف الصلب بعيد ({risk_pct}%) بتصميم مضاد للضجيج، وخُفّضت المخاطرة إلى {eff_risk}%.<br>📌 <b>وقف القرار:</b> إغلاق يومي تحت ${stop_struct} = خروج فوري.</div>', unsafe_allow_html=True)
 
-        st.markdown("#### 🎯 أوامر الدخول (حسب موقع السعر الآن)")
         rows_html = ""
         for L in ladder:
             color = "#00b894" if L["ord"] == "Market" else "#0984e3"
@@ -1193,20 +1161,18 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         <tr><td><b>⚖️ المخاطرة القصوى</b></td><td style="color:#d63031">${round(max_risk, 2)}</td><td>{eff_risk}%</td></tr>
         </table></div>""", unsafe_allow_html=True)
 
-        with st.expander("⚙️ قواعد التنفيذ"):
+        with st.expander("⚙️ قواعد التنفيذ (الدليل ص 36)"):
             st.markdown("""
-            - أوامر **Market** تُنفذ الآن، وأوامر **Limit** تُعلّق تحت السعر الحالي فقط
-            - لا تحرّك الوقف للخسارة أبداً
-            - إغلاق يومي تحت وقف القرار = خروج فوري مهما كان السعر
-            - عند الهدف 1: بيع 33% + تفعيل Trailing Stop
-            - عند الهدف 2: بيع 33% + نقل الوقف لنقطة الدخول
-            - وقف زمني: 5-7 جلسات بلا حركة = إعادة تقييم
+            - أوامر **Limit** داخل منطقة الطلب فقط — لا شراء من العرض
+            - إغلاق يومي تحت وقف القرار = خروج فوري بدون عاطفة
+            - عند الهدف 1: بيع 33% + تفعيل Trailing | عند الهدف 2: بيع 33% + نقل الوقف للدخول
+            - كسر الدعم الحرج أو اختراق وهمي أو خبر سلبي = بطل السبب فاخرج
+            - إذا فاتتك الحركة، اترك السهم — لا تطارد
             """)
 
     st.markdown("### تفصيل النقاط")
     st.dataframe(pd.DataFrame(list(r["breakdown"].items()), columns=["المعيار", "النقاط"]),
                  use_container_width=True, hide_index=True)
-    st.markdown(f'<a href="https://fintel.io/ss/us/{sym.lower()}" target="_blank">عرض تفاصيل Short Interest على Fintel</a>', unsafe_allow_html=True)
 
 
 # ============================================================
@@ -1255,7 +1221,7 @@ def render_split_board(rows):
                 if key == "READY":
                     st.success("✅ داخل منطقة الدخول (≤15%) — افتح تبويب «تحليل سهم» للخطة الكاملة")
                 elif key == "WATCH":
-                    st.info("👁️ الدعم مؤكد لكن السعر خارج منطقة 15% — انتظر تراجعاً هادئاً بحجم منخفض")
+                    st.info("👁️ الدعم مؤكد لكن السعر خارج منطقة 15% — انتظر تراجعاً هادئاً")
                 elif key == "RETEST":
                     st.info("🔄 السهم يختبر المنطقة — راقب ثبات جلستين بقيعان صاعدة")
                 else:
@@ -1281,21 +1247,20 @@ def render_split_board(rows):
 # ============================================================
 # ===== الواجهة =====
 # ============================================================
-st.markdown("# 🎯 Stock Screener Pro")
+st.markdown("# 🎯 Stock Screener Pro — طريقة فيصل")
 
 with st.sidebar:
     st.markdown("### ⚙️ إعدادات الخطة")
     portfolio_size = st.number_input("حجم المحفظة ($)", min_value=1000, value=10000, step=1000)
     risk_percent = st.slider("نسبة المخاطرة (%)", 0.5, 5.0, 2.0, 0.5)
     st.markdown("### 🔌 حالة المصادر")
-    st.markdown(f"**Alpaca:** {'🟢' if ALPACA_ENABLED else '⚪ غير مفعل'}")
     st.markdown(f"**Finnhub:** {'🟢' if FINNHUB_KEY else '🔴'}")
     st.markdown(f"**Yahoo Proxy:** {'🟢' if PROXY_URL else '🔴'}")
-    st.markdown(f"**بيئة Render:** {'🟢 نعم' if ON_RENDER else '⚪ محلي'}")
+    st.markdown(f"**بيئة Render:** {'🟢' if ON_RENDER else '⚪ محلي'}")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📈 تحليل سهم", "🛰️ رادار التقسيم", "⭐ أفضل 10", "📡 رادار الاكتشاف", "⚡ سعر لحظي", "🕯️ فلتر الارتكاز"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 تحليل سهم", "⭐ الفرص الحالية", "🛰️ رادار التقسيم", "🕯️ فلتر الارتكاز", "📓 دفتر المتابعة"])
 
-# ===== TAB 1 =====
+# ===== TAB 1: تحليل سهم =====
 with tab1:
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -1312,15 +1277,75 @@ with tab1:
             else:
                 st.success(f"✅ المصدر: **{source}** ({len(hist)} شمعة)")
                 if source == "stooq":
-                    st.warning("⚠️ مصدر طوارئ (Stooq): بيانات يومية بلا تقسيمات — رادار التقسيم غير متاح لهذا السهم")
+                    st.warning("⚠️ مصدر طوارئ (Stooq): بيانات يومية بلا تقسيمات")
                 info = finnhub_metrics(sym)
                 offering = check_offering(sym)
-                news = check_negative_news(sym)
+                news = check_news(sym)
                 r = score(sym, hist, info, splits, news, offering=offering)
                 render_full_analysis(sym, hist, splits, info, news, offering, r)
 
-# ===== TAB 2 =====
+# ===== TAB 2: الفرص الحالية (دمج أفضل10 + الاكتشاف) =====
 with tab2:
+    st.markdown("### ⭐ الفرص الحالية — معادلة الارتكاز (ص 65)")
+    st.markdown(
+        '<div class="filter-box"><b>الشروط:</b> ضغط RSI ≤35 + نقاط ≥40 + بلا إقصاء '
+        '(دعم مكسور / تصريف / Failed Spike / خبر حرج / طرح SEC)</div>',
+        unsafe_allow_html=True)
+    if st.button("🔍 امسح الفرص", key="t"):
+        with st.spinner("تحميل القائمة..."):
+            universe = get_dynamic_universe(limit=300)
+        st.info(f"📡 {len(universe)} سهم — جلب متوازٍ")
+        pg = st.progress(0)
+        raw = scan_parallel(universe, "3mo", progress_cb=lambda i, n: pg.progress(i / n))
+        pg.empty()
+        cands = []
+        for s, h, sps, src in raw:
+            try:
+                cheap = score(s, h, {}, sps)
+                if cheap["rsi"] <= 35 and cheap["total"] >= 20 and not cheap["hard_veto"]:
+                    cands.append((s, h, sps))
+            except Exception:
+                continue
+        st.info(f"🔎 {len(cands)} سهم مضغوط — فحص Finnhub والأخبار للناجين فقط")
+        pg2 = st.progress(0)
+        res = []
+        for i, (s, h, sps) in enumerate(cands):
+            pg2.progress((i + 1) / max(len(cands), 1))
+            try:
+                inf = finnhub_metrics(s)
+                news = check_news(s)
+                off = check_offering(s)
+                r = score(s, h, inf, sps, news, offering=off)
+                if r["total"] >= 40 and not r["hard_veto"]:
+                    res.append(r)
+            except Exception:
+                continue
+        pg2.empty()
+        st.session_state["opp_hits"] = res
+    if "opp_hits" in st.session_state:
+        res = st.session_state["opp_hits"]
+        if not res:
+            st.warning("لا فرص مطابقة حالياً")
+        res.sort(key=lambda x: x["total"], reverse=True)
+        for i, r in enumerate(res[:10], 1):
+            with st.expander(f"{i}. **{r['symbol']}** - {r['total']}/100 {r['verdict']} | RSI {r['rsi']} | RVOL {r['rvol']}"):
+                c1, c2, c3 = st.columns(3)
+                c1.metric("السعر", f"${round(r['price'], 3)}")
+                c2.metric("الدعم", f"${round(r['support'], 3)}" if r['support'] else "-")
+                c3.metric("البعد عن الدعم", f"{r['dist_sup']}%" if r['dist_sup'] is not None else "-")
+                tags = []
+                if r["runner"]: tags.append("Former Runner")
+                if r["w_pattern"]: tags.append("W")
+                if r["sweep"]: tags.append("سحب سيولة")
+                if r["accum"]: tags.append("تجميع هادئ")
+                if r["split_info"].get("has_split"): tags.append(f"Split {r['split_info']['ratio']}")
+                if tags:
+                    st.markdown(f'<div class="success-box">🏷️ السلوك: {" | ".join(tags)}</div>', unsafe_allow_html=True)
+                if r["stability"]:
+                    st.write(f"الثبات: {r['stability']['strength']} - {r['stability']['sessions_held']} جلسات")
+
+# ===== TAB 3: رادار التقسيم =====
+with tab3:
     st.markdown("### 🛰️ رادار التقسيم العكسي — لوحة دورة الحياة")
     st.markdown(
         '<div class="filter-box"><b>منطق الرادار:</b><br>'
@@ -1369,133 +1394,8 @@ with tab2:
     else:
         st.info("اضغط «امسح دورة التقسيم» لبدء أول مسح")
 
-# ===== TAB 3 =====
-with tab3:
-    st.markdown("### ⭐ أفضل 10 أسهم — TradingView Screener")
-    if st.button("🔍 ابدأ الفحص الديناميكي", key="t"):
-        with st.spinner("جاري تحميل القائمة..."):
-            universe = get_dynamic_universe(limit=300)
-        st.info(f"📡 {len(universe)} سهم — جلب متوازٍ")
-        pg = st.progress(0)
-        raw = scan_parallel(universe, "3mo", progress_cb=lambda i, n: pg.progress(i / n))
-        pg.empty()
-        cands = []
-        for s, h, sps, src in raw:
-            try:
-                cheap = score(s, h, {}, sps)
-                if cheap["total"] >= 20 and not cheap["hard_veto"]:
-                    cands.append((s, h, sps))
-            except Exception:
-                continue
-        st.info(f"🔎 {len(cands)} نجحت بالفلتر الرخيص — Finnhub للناجين فقط")
-        pg2 = st.progress(0)
-        res = []
-        for i, (s, h, sps) in enumerate(cands):
-            pg2.progress((i + 1) / max(len(cands), 1))
-            try:
-                r = score(s, h, finnhub_metrics(s), sps)
-                if r["total"] >= 40:
-                    res.append(r)
-            except Exception:
-                continue
-        pg2.empty()
-        if res:
-            res.sort(key=lambda x: x["total"], reverse=True)
-            for i, r in enumerate(res[:10], 1):
-                with st.expander(f"{i}. **{r['symbol']}** - {r['total']}/100 {r['verdict']}"):
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("السعر", f"${round(r['price'], 3)}")
-                    c2.metric("RSI", r['rsi'])
-                    c3.metric("Stoch", r['stoch'])
-                    if r["support"]:
-                        st.write(f"الدعم: ${round(r['support'], 3)} (على بعد {r['dist_sup']}%)")
-                    if r["split_info"].get("has_split"):
-                        st.write(f"Reverse Split: {r['split_info']['ratio']} قبل {r['split_info']['days_since']} يوم")
-                    if r["stability"]:
-                        st.write(f"الثبات: {r['stability']['strength']} - {r['stability']['sessions_held']} جلسات")
-        else:
-            st.warning("لا نتائج.")
-
-# ===== TAB 4 =====
+# ===== TAB 4: فلتر الارتكاز 4H =====
 with tab4:
-    st.markdown("### 📡 رادار الاكتشاف المبكر")
-    st.caption("أسهم Squeeze محتملة")
-    if st.button("🔍 ابحث ديناميكياً", key="h"):
-        with st.spinner("جاري تحميل القائمة..."):
-            universe = get_dynamic_universe(limit=300)
-        st.info(f"📡 {len(universe)} سهم — جلب متوازٍ")
-        pg = st.progress(0)
-        raw = scan_parallel(universe, "3mo", progress_cb=lambda i, n: pg.progress(i / n))
-        pg.empty()
-        cands = []
-        for s, h, sps, src in raw:
-            try:
-                if score(s, h, {}, sps)["rsi"] <= 35:
-                    cands.append((s, h, sps))
-            except Exception:
-                continue
-        st.info(f"🔎 {len(cands)} سهم بنقاط RSI مؤهلة — Finnhub لها فقط")
-        pg2 = st.progress(0)
-        res = []
-        for i, (s, h, sps) in enumerate(cands):
-            pg2.progress((i + 1) / max(len(cands), 1))
-            try:
-                r = score(s, h, finnhub_metrics(s), sps)
-                if r["total"] < 40 or r.get("hard_veto"):
-                    continue
-                res.append(r)
-            except Exception:
-                continue
-        pg2.empty()
-        if res:
-            res.sort(key=lambda x: x["total"], reverse=True)
-            for r in res[:10]:
-                with st.expander(f"**{r['symbol']}** - {r['total']}/100"):
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("السعر", f"${round(r['price'], 3)}")
-                    c2.metric("RSI", r['rsi'])
-                    c3.metric("Stoch", r['stoch'])
-                    if r["short_pct"] > 0:
-                        st.write(f"Short Float: {round(r['short_pct']*100, 2)}%")
-        else:
-            st.info("لا فرص حالياً.")
-
-# ===== TAB 5 =====
-with tab5:
-    st.markdown("### ⚡ مراقبة الأسعار اللحظية")
-    watchlist = [s.strip().upper() for s in st.text_input(
-        "رموز الأسهم (مفصولة بفواصل)", value="AAPL,TSLA,NVDA,AMZN,META").split(",") if s.strip()]
-    c1, c2 = st.columns(2)
-    with c1:
-        auto_refresh = st.checkbox("🔄 تحديث تلقائي", value=False)
-    with c2:
-        refresh_interval = st.selectbox("⏱️ الفاصل (ثوانٍ)", [5, 10, 15, 30], index=1)
-
-    if st.button("🔄 تحديث الآن", key="live") or auto_refresh:
-        if not watchlist:
-            st.warning("⚠️ أدخل رمزاً واحداً على الأقل")
-        else:
-            cols = st.columns(min(len(watchlist), 5))
-            for idx, s in enumerate(watchlist[:20]):
-                p = get_realtime_price(s)
-                with cols[idx % len(cols)]:
-                    if p:
-                        chg = p.get("percent_change", 0)
-                        cls = "live-up" if chg > 0 else "live-down" if chg < 0 else "live-neutral"
-                        st.markdown(
-                            f'<div class="live-price"><div style="font-size:14px;color:#636e72">🟢 {s}</div>'
-                            f'<div style="font-size:28px">${p["price"]:.2f}</div>'
-                            f'<div class="{cls}" style="font-size:16px">{chg:+.2f}%</div>'
-                            f'<div style="font-size:11px;color:#b2bec3">{p.get("source")}</div></div>',
-                            unsafe_allow_html=True)
-                    else:
-                        st.markdown(f'<div class="live-price"><div style="font-size:14px">{s}</div><div style="color:#d63031;font-size:18px">❌ غير متاح</div></div>', unsafe_allow_html=True)
-            if auto_refresh:
-                time.sleep(refresh_interval)
-                st.rerun()
-
-# ===== TAB 6 =====
-with tab6:
     st.markdown("### 🕯️ فلتر سهم الارتكاز — الشموع الساقطة (4H)")
     st.markdown(
         '<div class="filter-box"><b>قواعد الطريقة (بدون شورت):</b><br>'
@@ -1561,5 +1461,37 @@ with tab6:
                 if h["ladder"]["supports"]:
                     st.markdown(f'<div class="success-box">🛡️ ذيول تحولت لدعم: {h["ladder"]["supports"]}</div>', unsafe_allow_html=True)
 
+# ===== TAB 5: دفتر المتابعة اليومي (ص 38) =====
+with tab5:
+    st.markdown("### 📓 دفتر المتابعة اليومي")
+    st.caption("الاحتراف في تكرار نفس عملية الفحص يومياً — لا في معرفة سهم واحد")
+    with st.form("journal_form"):
+        j_sym = st.text_input("السهم").upper()
+        j_type = st.selectbox("النوع", ["ارتكاز", "زخم", "Former Runner", "Gap Fill", "W", "سحب سيولة", "طرح جديد"])
+        j_data = st.text_input("البيانات (Float / RVOL / Short / آخر Split)")
+        j_catalyst = st.text_input("المحفز (خبر / قطاع / بري ماركت)")
+        j_levels = st.text_input("المستويات (دعم / طلب / مقاومة1 / مقاومة2 / هدف)")
+        j_plan = st.text_input("الخطة (دخول / وقف / أهداف / إذا فشل)")
+        j_outcome = st.text_input("النتيجة والدرس")
+        submitted = st.form_submit_button("💾 حفظ في الدفتر")
+        if submitted and j_sym:
+            st.session_state.setdefault("journal", []).append({
+                "التاريخ": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "السهم": j_sym, "النوع": j_type, "البيانات": j_data,
+                "المحفز": j_catalyst, "المستويات": j_levels,
+                "الخطة": j_plan, "النتيجة": j_outcome,
+            })
+            st.success(f"✅ حُفظ {j_sym} في الدفتر")
+    if st.session_state.get("journal"):
+        jdf = pd.DataFrame(st.session_state["journal"])
+        st.dataframe(jdf, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ تصدير CSV", jdf.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="faisal_journal.csv")
+        if st.button("🗑️ تفريغ الدفتر"):
+            st.session_state["journal"] = []
+            st.rerun()
+    else:
+        st.info("لا إدخالات بعد — ابدأ بتوثيق أول سهم تراقبه")
+
 st.markdown("---")
-st.caption("⚠️ تعليمي فقط - ليس توصية استثمارية")
+st.caption("⚠️ تعليمي فقط - ليس توصية استثمارية | دليل طريقة فيصل")
