@@ -26,7 +26,6 @@ VOLUME_MIN     = 100_000
 
 MAX_WORKERS = 6
 LADDER_MIN_CANDLES = 2
-LADDER_STEP_MIN, LADDER_STEP_MAX = 15.0, 35.0
 MA_TOUCH_PCT = 3.0
 
 # ============================================================
@@ -881,6 +880,42 @@ def veto_reasons(r, news, offering):
 
 
 # ============================================================
+# ===== فصائل ما قبل الانفجار (الدليل ص 9-68) =====
+# ============================================================
+def detect_families(hist, r):
+    """أي فصيلة واحدة تكفي للعبور إلى الفحص العميق"""
+    fam = []
+    vol = hist["Volume"]
+    price = r["price"]
+    near_sup = r["dist_sup"] is not None and r["dist_sup"] <= 15
+    n = len(hist)
+    if 20 <= r["rsi"] <= 30:
+        fam.append("ضغط RSI")
+    vol_dry = n >= 30 and float(vol.tail(5).mean()) < float(vol.tail(30).mean()) * 0.5
+    range_narrow = n >= 10 and (float(hist["High"].tail(10).max()) - float(hist["Low"].tail(10).min())) / price < 0.15
+    if vol_dry and near_sup and (r["stability"] or range_narrow):
+        fam.append("تجميع/قاعدة")
+    if r["runner"] and near_sup:
+        fam.append("عدّاء سابق")
+    if r["sweep"]:
+        fam.append("سحب سيولة")
+    if r["w_pattern"]:
+        fam.append("W")
+    if r["gap"]:
+        fam.append("تغطية فجوات")
+    if r["split_info"].get("has_split"):
+        fam.append("تقسيم عكسي")
+    if n >= 30:
+        avg_prev = float(vol.iloc[-30:-5].mean())
+        probe = bool((vol.tail(5) > avg_prev * 3).any()) if avg_prev > 0 else False
+        if probe and (range_narrow or r["stability"]):
+            fam.append("جس نبض")
+    if n < 70:
+        fam.append("طرح جديد")
+    return fam
+
+
+# ============================================================
 # ===== عرض التحليل + خطة الدخول =====
 # ============================================================
 def render_full_analysis(sym, hist, splits, info, news, offering, r):
@@ -894,6 +929,9 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     if live:
         st.info(f"🟢 السعر اللحظي: ${live['price']:.3f} ({live.get('percent_change', 0):+.2f}%)")
 
+    fam = detect_families(hist, r)
+    if fam:
+        st.markdown(f'<div class="info-box">🧬 <b>فصيلة ما قبل الانفجار:</b> {" | ".join(fam)}</div>', unsafe_allow_html=True)
     if 0 < r.get("shares_short", 0) < 10000:
         st.markdown(f'<div class="info-box">🔥 <b>الشورت المتاح:</b> {int(r["shares_short"]):,} سهم — وقود مساعد (لا إشارة شراء)</div>', unsafe_allow_html=True)
     if r.get("accum"):
@@ -1121,12 +1159,12 @@ with tab1:
             st.download_button("⬇️ تصدير CSV", jdf.to_csv(index=False).encode("utf-8-sig"),
                                file_name="faisal_journal.csv")
 
-# ===== TAB 2: الرادار الموحد =====
+# ===== TAB 2: الرادار الموحد بكل الفصائل =====
 with tab2:
-    st.markdown("### 🛰️ الرادار الموحد — مسح واحد، كل القواعد")
+    st.markdown("### 🛰️ الرادار الموحد — مسح واحد، كل الفصائل")
     st.markdown(
-        '<div class="filter-box"><b>القمع:</b> 300 سهم → فرز رخيص (بلا إقصاء + RSI≤35 أو دورة تقسيم) '
-        '→ فحص عميق (Finnhub + أخبار + SEC + سلّم 4H) → معادلة الدليل ص 65<br>'
+        '<div class="filter-box"><b>فصائل ما قبل الانفجار:</b> ضغط RSI | تجميع/قاعدة | عدّاء سابق | سحب سيولة | W | تغطية فجوات | تقسيم عكسي | جس نبض | طرح جديد<br>'
+        '<b>القمع:</b> 300 سهم → فرز بالفصائل → فحص عميق (Finnhub + أخبار + SEC + 4H) → معادلة الدليل ص 65<br>'
         '<b>جاهز دخول كامل =</b> معادلة مكتملة + نقاط ≥50 + داخل 15% من الدعم</div>',
         unsafe_allow_html=True)
 
@@ -1147,15 +1185,17 @@ with tab2:
                     excluded.append({"symbol": s, "reason": " | ".join(veto_reasons(cheap, None, None)) or "إقصاء"})
                     continue
                 phase = post_split_phase(s, h, sps)
-                if cheap["rsi"] <= 35 or (phase and phase["phase_key"] in ("READY", "WATCH", "RETEST", "PROOF")):
-                    stage1.append((s, h, sps, phase))
+                fam = detect_families(h, cheap)
+                phase_ok = phase and phase["phase_key"] in ("READY", "WATCH", "RETEST", "PROOF")
+                if fam or phase_ok or cheap["rsi"] <= 35:
+                    stage1.append((s, h, sps, phase, fam))
             except Exception:
                 continue
-        st.info(f"🔎 {len(stage1)} سهم اجتاز الفرز — فحص عميق للناجين فقط")
+        st.info(f"🔎 {len(stage1)} سهم يحمل بصمة فصيلة — فحص عميق للناجين فقط")
 
         results = []
         pg2 = st.progress(0)
-        for i, (s, h, sps, phase) in enumerate(stage1):
+        for i, (s, h, sps, phase, fam) in enumerate(stage1):
             pg2.progress((i + 1) / max(len(stage1), 1))
             try:
                 inf = finnhub_metrics(s)
@@ -1177,14 +1217,12 @@ with tab2:
                 if phase and phase["phase_key"] in ("READY", "WATCH", "RETEST"):
                     tags.append(f"تقسيم: {PHASE_META[phase['phase_key']]} {phase['ratio']}")
                 if lad: tags.append(f"سلّم 4H: {len(lad['ladder'])} شموع")
-                if r["runner"]: tags.append("Former Runner")
-                if r["sweep"]: tags.append("سحب سيولة")
-                if r["w_pattern"]: tags.append("W")
                 if r["accum"]: tags.append("تجميع هادئ")
                 results.append({"symbol": s, "total": r["total"], "rsi": r["rsi"],
                                 "guide_ready": guide_ready, "missing": missing,
                                 "support": r["support"], "dist_sup": r["dist_sup"],
-                                "rvol": r["rvol"], "tags": tags, "phase": phase, "ladder": lad})
+                                "rvol": r["rvol"], "tags": tags, "fam": fam,
+                                "phase": phase, "ladder": lad})
             except Exception:
                 continue
         pg2.empty()
@@ -1205,7 +1243,10 @@ with tab2:
 
         for x in results[:15]:
             badge = "✅" if x["guide_ready"] else "⏳"
-            with st.expander(f"{badge} **{x['symbol']}** — {x['total']}/100 | RSI {x['rsi']} | RVOL {x['rvol']} | بعد عن الدعم {x['dist_sup']}%"):
+            fam_txt = " | ".join(x["fam"][:2]) if x["fam"] else "—"
+            with st.expander(f"{badge} **{x['symbol']}** — {x['total']}/100 | 🧬 {fam_txt} | RSI {x['rsi']}"):
+                if x["fam"]:
+                    st.markdown(f'<div class="info-box">🧬 <b>فصيلة ما قبل الانفجار:</b> {" | ".join(x["fam"])}</div>', unsafe_allow_html=True)
                 if x["tags"]:
                     st.markdown(f'<div class="success-box">🏷️ السلوك: {" | ".join(x["tags"])}</div>', unsafe_allow_html=True)
                 if x["guide_ready"]:
