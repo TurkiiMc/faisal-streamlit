@@ -23,13 +23,11 @@ MARKET_CAP_MAX = 20_000_000
 FLOAT_MAX      = 5_000_000
 PRICE_MAX      = 5.0
 VOLUME_MIN     = 100_000
-SPLIT_MAX_DAYS = 50
 
 MAX_WORKERS = 6
 LADDER_MIN_CANDLES = 2
 LADDER_STEP_MIN, LADDER_STEP_MAX = 15.0, 35.0
 MA_TOUCH_PCT = 3.0
-PIVOT_UNIVERSE_LIMIT = 200
 
 # ============================================================
 # ===== Rate Limiter =====
@@ -311,7 +309,9 @@ def check_offering(symbol):
 POS_WORDS = ["approval", "approved", "contract", "award", "awarded", "partnership",
              "patent", "license", "agreement", "acquisition", "positive results",
              "phase 2", "phase 3", "regain compliance", "nasdaq compliance",
-             "buyback", "insider buying", "exceeds expectations"]
+             "buyback", "insider buying", "exceeds expectations",
+             "merger", "merger closed", "protocol", "strategic update",
+             "regulation fd", "study initiation"]
 
 @st.cache_data(ttl=600)
 def check_news(symbol):
@@ -441,7 +441,7 @@ def detect_trend_strength(hist):
 
 
 # ============================================================
-# ===== سلوك المضارب (الدليل ص 12 و18) =====
+# ===== سلوك المضارب =====
 # ============================================================
 def detect_distribution(hist):
     if len(hist) < 15:
@@ -618,16 +618,11 @@ def detect_liquidity_sweep(hist):
 
 
 # ============================================================
-# ===== آلة حالات التقسيم العكسي =====
+# ===== دورة التقسيم + سلّم 4H =====
 # ============================================================
 PHASE_META = {
-    "READY":    {"label": "🟢 جاهز للدخول",             "color": "#00b894"},
-    "WATCH":    {"label": "👁️ مراقبة — خارج المنطقة",   "color": "#0984e3"},
-    "RETEST":   {"label": "🔄 اختبار المنطقة جارٍ",      "color": "#6c5ce7"},
-    "PROOF":    {"label": "⏳ منطقة بانتظار إثبات حياة",  "color": "#fdcb6e"},
-    "ZONE":     {"label": "🔍 تكوين منطقة",              "color": "#e17055"},
-    "WASHOUT":  {"label": "🌪️ غسيل جارٍ",                "color": "#636e72"},
-    "REJECTED": {"label": "🚫 مستبعد",                   "color": "#d63031"},
+    "READY":   "🟢 جاهز (دورة)", "WATCH": "👁️ مراقبة", "RETEST": "🔄 اختبار",
+    "PROOF":   "⏳ إثبات حياة", "ZONE": "🔍 منطقة", "WASHOUT": "🌪️ غسيل",
 }
 
 
@@ -660,22 +655,13 @@ def post_split_phase(symbol, hist, splits, min_days=10, max_days=90):
 
     post = hist[hist.index >= pd.Timestamp(sp["date"])]
     if len(post) < 10:
-        return {"phase_key": "WASHOUT", "symbol": symbol, "days": D, "ratio": ratio,
-                "price": float(hist["Close"].iloc[-1]), "drawdown": 0, "vol_dryup": False,
-                "vol_contract": False, "zone": None, "rebound": 0, "dist": None,
-                "stability": False, "rejections": []}
+        return {"phase_key": "WASHOUT", "days": D, "ratio": ratio, "zone": None,
+                "rebound": 0, "dist": None, "stability": False, "vol_dryup": False}
 
     price = float(hist["Close"].iloc[-1])
-    post_high = float(post["High"].max())
-    drawdown = round((post_high - price) / post_high * 100, 1) if post_high else 0
-
     early_vol = float(post["Volume"].head(10).mean())
     recent_vol = float(post["Volume"].tail(5).mean())
     vol_dryup = (recent_vol < early_vol * 0.50) if early_vol > 0 else False
-
-    atr_now = atr(hist["High"], hist["Low"], hist["Close"], 14)
-    atr_early = atr(post["High"].head(20), post["Low"].head(20), post["Close"].head(20), 10)
-    vol_contract = bool(atr_now and atr_early and atr_now < atr_early * 0.5)
 
     zone = None
     window = post.tail(20)
@@ -692,53 +678,16 @@ def post_split_phase(symbol, hist, splits, min_days=10, max_days=90):
     dist = round((price - zone["low"]) / zone["low"] * 100, 1) if zone else None
     proof = rebound >= 10
 
-    if D < min_days or not vol_dryup:
-        key = "WASHOUT"
-    elif not zone:
-        key = "ZONE"
-    elif not proof:
-        key = "PROOF"
-    elif not stability:
-        key = "RETEST"
-    else:
-        key = "READY" if dist <= 15 else "WATCH"
+    if D < min_days or not vol_dryup: key = "WASHOUT"
+    elif not zone: key = "ZONE"
+    elif not proof: key = "PROOF"
+    elif not stability: key = "RETEST"
+    else: key = "READY" if dist <= 15 else "WATCH"
 
-    return {"phase_key": key, "symbol": symbol, "days": D, "ratio": ratio, "price": price,
-            "drawdown": drawdown, "vol_dryup": vol_dryup, "vol_contract": vol_contract,
-            "zone": zone, "rebound": rebound, "dist": dist, "stability": stability, "rejections": []}
+    return {"phase_key": key, "days": D, "ratio": ratio, "zone": zone,
+            "rebound": rebound, "dist": dist, "stability": stability, "vol_dryup": vol_dryup}
 
 
-def split_rejections(symbol, hist, phase_info):
-    reasons = []
-    price = float(hist["Close"].iloc[-1])
-    zone = phase_info.get("zone")
-    if price < 1.30:
-        reasons.append("السعر تحت $1.30 — خطر استيفاء/تقسيم آخر")
-    if zone and zone["low"] < 1.20:
-        reasons.append("قاع المنطقة قرب $1 — فخ الاستيفاء")
-    return reasons
-
-
-def split_rejections_serial(splits):
-    if count_reverse_splits(splits, months=36) >= 2:
-        return "مقسّم تسلسلي (≥2 تقسيم عكسي خلال 36 شهر)"
-    return None
-
-
-@st.cache_data(ttl=600)
-def advanced_veto(symbol):
-    offering = check_offering(symbol)
-    if offering.get("has_offering"):
-        return True, f"طرح SEC نشط ({offering.get('form','?')} قبل {offering.get('days','?')} يوم)"
-    news = check_news(symbol)
-    if news.get("critical_count", 0) > 0:
-        return True, f"أخبار حرجة ({news.get('critical_count')} خبر)"
-    return False, ""
-
-
-# ============================================================
-# ===== طريقة الارتكاز: شموع 4H =====
-# ============================================================
 @st.cache_data(ttl=300)
 def get_4h(symbol):
     if not PROXY_URL:
@@ -779,14 +728,12 @@ def build_red_ladder(h4):
     ladder = []
     for _, c in above.iterrows():
         tail, head = float(c["Low"]), float(c["High"])
-        ladder.append({"date": str(c.name)[:16], "tail": round(tail, 4),
-                       "head": round(head, 4),
+        ladder.append({"tail": round(tail, 4), "head": round(head, 4),
                        "step_pct": round((head - tail) / tail * 100, 1)})
     broken = reds[reds["Low"] <= price].sort_values("Low").tail(3)
     supports = [round(float(c["Low"]), 4) for _, c in broken.iterrows()]
     return {"ladder": ladder, "supports": supports,
-            "resistance": ladder[0]["tail"], "target": ladder[0]["head"],
-            "steps": len(ladder)}
+            "resistance": ladder[0]["tail"], "target": ladder[0]["head"]}
 
 
 def ma_band_touch(hist, level, tol=MA_TOUCH_PCT):
@@ -797,41 +744,10 @@ def ma_band_touch(hist, level, tol=MA_TOUCH_PCT):
     return lo <= level <= hi
 
 
-def filter_pivot_stock(symbol, hd, h4, splits):
-    lad = build_red_ladder(h4)
-    if not lad:
-        return None
-    pts, reasons = 30, [f"سلّم 4H: {lad['steps']} شمعة حمراء فوق السعر"]
-
-    res = lad["resistance"]
-    if ma_band_touch(hd, res) or ma_band_touch(h4, res):
-        pts += 25
-        reasons.append("✅ المقاومة الحالية على نطاق متوسط 20–30")
-
-    steps25 = sum(1 for L in lad["ladder"] if LADDER_STEP_MIN <= L["step_pct"] <= LADDER_STEP_MAX)
-    if steps25 >= 1:
-        pts += 15
-        reasons.append(f"{steps25} شمعة بهدف ~25%")
-
-    if lad["supports"]:
-        pts += 10
-        reasons.append(f"ذيول محروقة تحولت لدعم: {lad['supports']}")
-
-    n_splits = count_reverse_splits(splits, months=60)
-    cap = None
-    if n_splits > 3:
-        cap = sma(hd["Close"], 20)
-        reasons.append(f"مقسم {n_splits} مرات → سقف الهدف تحت MA20 (${round(cap,3) if cap else '-'})")
-
-    target = lad["target"] if (cap is None or lad["target"] <= cap) else round(cap, 3)
-    return {"symbol": symbol, "points": pts, "ladder": lad,
-            "target": target, "cap_ma20": cap, "reasons": reasons}
-
-
 # ============================================================
 # ===== نظام النقاط (معادلة الدليل ص 65) =====
 # ============================================================
-def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offering=None):
+def score(symbol, hist, info, splits=None, news=None, offering=None):
     close, high, low, vol = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
     price = float(close.iloc[-1])
     r = rsi(close)
@@ -853,7 +769,7 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
     elif 30 < r <= 35: bd["RSI"] = 6
     else: bd["RSI"] = 0
 
-    split_info = detect_reverse_split(splits, max_days=max_split_days)
+    split_info = detect_reverse_split(splits, max_days=90)
     if split_info["has_split"]:
         d = split_info["days_since"]
         bd["Split"] = 20 if d <= 180 else (10 if d <= 365 else 0)
@@ -904,7 +820,6 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
 
     accum = selling_volume_drying(hist)
     bd["AccumVol"] = 5 if accum else 0
-
     bd["Catalyst"] = 10 if (news and news.get("positive_count", 0) > 0) else 0
 
     rebound = rebound_progress(hist, sup, res)
@@ -915,7 +830,6 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
 
     is_runner = detect_former_runner(hist)
     bd["Runner"] = 5 if is_runner else 0
-
     w_pat = detect_w_pattern(hist)
     bd["W_Pattern"] = 10 if w_pat else 0
 
@@ -956,6 +870,16 @@ def score(symbol, hist, info, splits=None, news=None, max_split_days=365, offeri
     }
 
 
+def veto_reasons(r, news, offering):
+    reasons = []
+    if r.get("support_broken"): reasons.append("الدعم مكسور")
+    if r.get("failed_spike"): reasons.append("Failed Spike")
+    if r.get("distribution"): reasons.append("تصريف")
+    if news and news.get("critical_count", 0) > 0: reasons.append("أخبار حرجة")
+    if offering and offering.get("has_offering"): reasons.append("طرح SEC")
+    return reasons
+
+
 # ============================================================
 # ===== عرض التحليل + خطة الدخول =====
 # ============================================================
@@ -963,13 +887,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     st.markdown(f'<div class="score-card"><div class="score-big" style="color:{r["color"]}">{r["total"]}/100</div><div class="verdict">{r["verdict"]}</div></div>', unsafe_allow_html=True)
 
     if r.get("hard_veto"):
-        reasons = []
-        if r.get("support_broken"): reasons.append("الدعم مكسور")
-        if r.get("failed_spike"): reasons.append("Failed Spike / ضخ ثم تصريف")
-        if r.get("distribution"): reasons.append("تصريف: فوليوم عالي والسعر واقف")
-        if news and news.get("critical_count", 0) > 0: reasons.append("أخبار حرجة")
-        if offering and offering.get("has_offering"): reasons.append("طرح SEC نشط")
-        st.markdown(f'<div class="danger-box">🚫 <b>إقصاء فوري:</b> {" | ".join(reasons)} — لا تُتداول هذه الحالة</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="danger-box">🚫 <b>إقصاء فوري:</b> {" | ".join(veto_reasons(r, news, offering))} — لا تُتداول هذه الحالة</div>', unsafe_allow_html=True)
         return
 
     live = get_realtime_price(sym)
@@ -977,22 +895,14 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         st.info(f"🟢 السعر اللحظي: ${live['price']:.3f} ({live.get('percent_change', 0):+.2f}%)")
 
     if 0 < r.get("shares_short", 0) < 10000:
-        st.markdown(f'<div class="info-box">🔥 <b>الشورت المتاح:</b> {int(r["shares_short"]):,} سهم — أقل من 10 آلاف = وقود مساعد (عامل مساعد لا إشارة شراء)</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="info-box">🔥 <b>الشورت المتاح:</b> {int(r["shares_short"]):,} سهم — وقود مساعد (لا إشارة شراء)</div>', unsafe_allow_html=True)
     if r.get("accum"):
-        st.markdown('<div class="success-box">🤫 <b>تجميع هادئ:</b> فوليوم جلسات الهبوط يتناقص بينما السعر متماسك</div>', unsafe_allow_html=True)
+        st.markdown('<div class="success-box">🤫 <b>تجميع هادئ:</b> فوليوم الهبوط يتناقص والسعر متماسك</div>', unsafe_allow_html=True)
     if news and news.get("positive_count", 0) > 0:
         st.markdown(f'<div class="success-box">📰 <b>محفز إيجابي:</b> {news["positive_count"]} خبر — المحفز لا يكفي إن لم يكن الشارت جاهزاً</div>', unsafe_allow_html=True)
     gwt = geometric_wash_target(hist)
     if gwt:
-        st.markdown(f'<div class="warn-box">📐 <b>قاعدة MWC (ص 68):</b> القاع الأول مكسور → هدف الغسل الهندسي ${gwt} (نصف القاع الأول)</div>', unsafe_allow_html=True)
-
-    if news.get("critical_count", 0) > 0:
-        st.markdown(f'<div class="danger-box">🚨 <b>أخبار حرجة!</b> {news["critical_count"]} خبر خطير</div>', unsafe_allow_html=True)
-    if news.get("offering_count", 0) > 0:
-        st.markdown(f'<div class="danger-box">⚠️ <b>طرح جديد محتمل!</b> {news["offering_count"]} خبر طرح/تخفيف</div>', unsafe_allow_html=True)
-    if offering.get("has_offering"):
-        st.markdown(f'<div class="danger-box">📋 <b>طرح في SEC:</b> {offering.get("form","")} قبل {offering.get("days",0)} يوم</div>', unsafe_allow_html=True)
-
+        st.markdown(f'<div class="warn-box">📐 <b>قاعدة MWC:</b> القاع الأول مكسور → هدف الغسل ${gwt}</div>', unsafe_allow_html=True)
     if news.get("items"):
         st.markdown("#### 📰 آخر الأخبار السلبية")
         for item in news["items"]:
@@ -1003,20 +913,17 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     if r["stability"]:
         s = r["stability"]
         hl = " + قيعان أعلى ✅" if s["higher_lows"] else ""
-        st.markdown(f'<div class="success-box" style="border-right-color:{s["color"]}">📊 <b>نموذج الثبات:</b> {s["strength"]} - {s["sessions_held"]} جلسات فوق الدعم{hl}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="success-box" style="border-right-color:{s["color"]}">📊 <b>الثبات:</b> {s["strength"]} - {s["sessions_held"]} جلسات فوق الدعم{hl}</div>', unsafe_allow_html=True)
     elif r["support"]:
-        st.markdown('<div class="warn-box">⚠️ <b>نموذج الثبات:</b> أقل من جلستين فوق الدعم - انتظر</div>', unsafe_allow_html=True)
-
+        st.markdown('<div class="warn-box">⚠️ <b>الثبات:</b> أقل من جلستين فوق الدعم - انتظر</div>', unsafe_allow_html=True)
     if r["bull_trapering"]:
-        st.markdown('<div class="danger-box">Bull Trap: كسر مقاومة ثم فشل - لا تشترِ الاختراق، اشترِ الثبات</div>', unsafe_allow_html=True)
+        st.markdown('<div class="danger-box">Bull Trap: كسر مقاومة ثم فشل — اشترِ الثبات لا الاختراق</div>', unsafe_allow_html=True)
     if r["split_info"].get("has_split"):
         d = r["split_info"]["days_since"]
-        st.markdown(f'<div class="split-box">Reverse Split: {r["split_info"]["ratio"]} - قبل {d} يوم{" - حديث!" if d <= 180 else ""}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="split-box">Reverse Split: {r["split_info"]["ratio"]} - قبل {d} يوم</div>', unsafe_allow_html=True)
     if r["short_pct"] > 0:
         warn = " - مرتفع! وقود ارتداد" if r["short_pct"] > 0.20 else ""
         st.markdown(f'<div class="info-box">Short Float: {round(r["short_pct"]*100, 2)}%{warn}</div>', unsafe_allow_html=True)
-    if r["marketCap"]:
-        st.markdown(f'<div class="info-box">Market Cap: ${round(r["marketCap"]/1000000, 2)}M</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="info-box" style="border-right-color:{r["macd_color"]}"><b>MACD:</b> {r["macd_txt"]} (قيمة: {r["macd_hist"]})</div>', unsafe_allow_html=True)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -1030,20 +937,15 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     c3.metric("الدعم", f"${round(r['support'], 3)}" if r['support'] else "-")
     c4.metric("المقاومة", f"${round(r['resistance'], 3)}" if r['resistance'] else "-")
 
-    if r["runner"]: st.markdown('<div class="success-box">Former Runner: سبق أن انفجر +50% في يوم — يستحق الرادار</div>', unsafe_allow_html=True)
+    if r["runner"]: st.markdown('<div class="success-box">Former Runner: سبق أن انفجر +50%</div>', unsafe_allow_html=True)
     if r["w_pattern"]:
         wp = r["w_pattern"]
-        st.markdown(f'<div class="success-box">W Pattern: قاعان ${wp["bottom1"]} / ${wp["bottom2"]} - خط العنق: ${wp["neckline"]} — ادخل بعد كسر العنق والثبات فوقه</div>', unsafe_allow_html=True)
-    if r["sweep"]: st.markdown('<div class="success-box">سحب سيولة: كسر ثم استرداد — الكسر المسترد = فرصة، الكسر الباقي = فشل</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="success-box">W: قاعان ${wp["bottom1"]} / ${wp["bottom2"]} - العنق ${wp["neckline"]} — ادخل بعد الكسر والثبات</div>', unsafe_allow_html=True)
+    if r["sweep"]: st.markdown('<div class="success-box">سحب سيولة: كسر ثم استرداد</div>', unsafe_allow_html=True)
     if r["candles"]: st.markdown(f'<div class="success-box">شمعة إيجابية: {", ".join(r["candles"])}</div>', unsafe_allow_html=True)
     if r["gap"]:
         g = r["gap"]
-        st.markdown(f'<div class="info-box">فجوة {"هبوط" if g["direction"]=="down" else "صعود"}: {g["gap_pct"]}% عند ${g["gap_price"]} — الفجوة هدف محتمل لا وعد</div>', unsafe_allow_html=True)
-    if r["rebound"] is not None:
-        if r["rebound"] > 60:
-            st.markdown(f'<div class="warn-box">الارتداد: {r["rebound"]}% - متأخر، لا تطارد</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="info-box">تقدم الارتداد: {r["rebound"]}% - مبكر</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="info-box">فجوة: {g["gap_pct"]}% عند ${g["gap_price"]} — هدف محتمل لا وعد</div>', unsafe_allow_html=True)
 
     # ═══════════ خطة الدخول ═══════════
     if r["support"] and r["resistance"]:
@@ -1084,7 +986,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
                 {"t": "🥉 دخول أخير (25%)", "p": entry3, "ord": "Limit", "pct": 0.25},
             ]
             avg_entry = round(entry1*0.40 + entry2*0.35 + entry3*0.25, 3)
-            note = "⏳ السعر فوق السلّم — ضع طلباتك في منطقة الطلب ولا تشترِ من العرض"; note_color = "#0984e3"
+            note = "⏳ فوق السلّم — ضع طلباتك في منطقة الطلب ولا تشترِ من العرض"; note_color = "#0984e3"
         elif current_price >= entry2:
             ladder = [
                 {"t": "🥇 دخول فوري (40%)", "p": mkt,    "ord": "Market", "pct": 0.40},
@@ -1092,7 +994,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
                 {"t": "🥉 دخول أخير (25%)", "p": entry3, "ord": "Limit",  "pct": 0.25},
             ]
             avg_entry = round(mkt*0.40 + entry2*0.35 + entry3*0.25, 3)
-            note = "⚡ السعر داخل السلّم — الشريحة الأولى سوقاً والبقية معلقة تحت"; note_color = "#00b894"
+            note = "⚡ داخل السلّم — الأولى سوقاً والبقية معلقة تحت"; note_color = "#00b894"
         elif current_price >= entry3:
             ladder = [
                 {"t": "🥇 دخول فوري (40%)",  "p": mkt, "ord": "Market", "pct": 0.40},
@@ -1100,11 +1002,11 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
                 {"t": "🥉 دخول أخير (25%)",  "p": entry3, "ord": "Limit", "pct": 0.25},
             ]
             avg_entry = round(mkt*0.75 + entry3*0.25, 3)
-            note = "⚡ السعر عميق داخل السلّم — شريحتان سوقاً وواحدة معلقة"; note_color = "#00b894"
+            note = "⚡ عميق داخل السلّم — شريحتان سوقاً وواحدة معلقة"; note_color = "#00b894"
         else:
             ladder = [{"t": "🎯 دخول كامل (100%)", "p": mkt, "ord": "Market", "pct": 1.0}]
             avg_entry = mkt
-            note = "🟢 السعر عند منطقة الطلب — دخول كامل مع التحقق من الثبات"; note_color = "#00b894"
+            note = "🟢 عند منطقة الطلب — دخول كامل مع التحقق من الثبات"; note_color = "#00b894"
 
         risk_ps = round(avg_entry - stop, 3)
         shares = int(max_risk / risk_ps) if risk_ps > 0 else 0
@@ -1127,10 +1029,9 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
 
         st.markdown("### 📊 خطة التداول")
         st.markdown(f'<div style="background:{note_color}22;padding:15px;border-radius:10px;margin:10px 0;border:2px solid {note_color};text-align:center;font-size:18px;font-weight:bold">{note}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div style="background:{trend_color}15;padding:10px;border-radius:8px;margin:5px 0;border-right:4px solid {trend_color}"><b>📈 حالة الاتجاه:</b> {trend_txt}</div>', unsafe_allow_html=True)
-
+        st.markdown(f'<div style="background:{trend_color}15;padding:10px;border-radius:8px;margin:5px 0;border-right:4px solid {trend_color}"><b>📈 الاتجاه:</b> {trend_txt}</div>', unsafe_allow_html=True)
         if vol_flag:
-            st.markdown(f'<div class="warn-box">⚠️ <b>تقلب يومي {atr_pct}%</b> — الوقف الصلب بعيد ({risk_pct}%) بتصميم مضاد للضجيج، وخُفّضت المخاطرة إلى {eff_risk}%.<br>📌 <b>وقف القرار:</b> إغلاق يومي تحت ${stop_struct} = خروج فوري.</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="warn-box">⚠️ تقلب {atr_pct}% — المخاطرة خُفّضت إلى {eff_risk}%. 📌 وقف القرار: إغلاق يومي تحت ${stop_struct} = خروج.</div>', unsafe_allow_html=True)
 
         rows_html = ""
         for L in ladder:
@@ -1140,26 +1041,16 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
                           f'<td>{L["sh"]} سهم</td></tr>')
         st.markdown(f"""
         <div class="plan-box"><table class="plan-table">
-        <tr><td colspan="3"><b>السعر الحالي:</b> ${mkt} | <b>المتوسط المتوقع:</b> ${avg_entry}</td></tr>
+        <tr><td colspan="3"><b>السعر:</b> ${mkt} | <b>المتوسط:</b> ${avg_entry}</td></tr>
         {rows_html}
-        <tr><td><b>🛡️ الوقف الصلب (فجوات)</b></td><td style="color:#d63031"><b>${stop}</b> (-{risk_pct}%)</td><td>—</td></tr>
-        <tr><td><b>📌 وقف القرار (إغلاق يومي)</b></td><td style="color:#e17055"><b>${stop_struct}</b></td><td>تحت الدعم</td></tr>
-        <tr><td><b>🎯 هدف 1 (بيع 33%)</b></td><td style="color:#00b894"><b>${target1}</b> (+{rew_pct[0]}%)</td><td>R:R 1:{rr[0]}</td></tr>
-        <tr><td><b>🚀 هدف 2 (بيع 33% + Trailing)</b></td><td style="color:#0984e3"><b>${target2}</b> (+{rew_pct[1]}%)</td><td>R:R 1:{rr[1]}</td></tr>
-        <tr><td><b>🌟 هدف 3 (بيع الباقي)</b></td><td style="color:#6c5ce7"><b>${target3}</b> (+{rew_pct[2]}%)</td><td>R:R 1:{rr[2]}</td></tr>
-        <tr><td><b>📈 Trailing Stop</b></td><td>ينشط عند ${target1} بمسافة ${trail_dist}</td><td>—</td></tr>
-        <tr><td><b>💵 قيمة الصفقة</b></td><td>${pos_value:,}</td><td>{round(pos_value/portfolio_size*100, 1)}% من المحفظة</td></tr>
+        <tr><td><b>🛡️ الوقف الصلب</b></td><td style="color:#d63031"><b>${stop}</b> (-{risk_pct}%)</td><td>—</td></tr>
+        <tr><td><b>📌 وقف القرار</b></td><td style="color:#e17055"><b>${stop_struct}</b></td><td>تحت الدعم</td></tr>
+        <tr><td><b>🎯 هدف 1 (33%)</b></td><td style="color:#00b894"><b>${target1}</b> (+{rew_pct[0]}%)</td><td>R:R 1:{rr[0]}</td></tr>
+        <tr><td><b>🚀 هدف 2 (33%+Trailing)</b></td><td style="color:#0984e3"><b>${target2}</b> (+{rew_pct[1]}%)</td><td>R:R 1:{rr[1]}</td></tr>
+        <tr><td><b>🌟 هدف 3 (الباقي)</b></td><td style="color:#6c5ce7"><b>${target3}</b> (+{rew_pct[2]}%)</td><td>R:R 1:{rr[2]}</td></tr>
+        <tr><td><b>💵 قيمة الصفقة</b></td><td>${pos_value:,}</td><td>{round(pos_value/portfolio_size*100, 1)}%</td></tr>
         <tr><td><b>⚖️ المخاطرة القصوى</b></td><td style="color:#d63031">${round(max_risk, 2)}</td><td>{eff_risk}%</td></tr>
         </table></div>""", unsafe_allow_html=True)
-
-        with st.expander("⚙️ قواعد التنفيذ (الدليل ص 36)"):
-            st.markdown("""
-            - أوامر **Limit** داخل منطقة الطلب فقط — لا شراء من العرض
-            - إغلاق يومي تحت وقف القرار = خروج فوري بدون عاطفة
-            - عند الهدف 1: بيع 33% + تفعيل Trailing | عند الهدف 2: بيع 33% + نقل الوقف للدخول
-            - كسر الدعم الحرج أو اختراق وهمي أو خبر سلبي = بطل السبب فاخرج
-            - إذا فاتتك الحركة، اترك السهم — لا تطارد
-            """)
 
     st.markdown("### تفصيل النقاط")
     st.dataframe(pd.DataFrame(list(r["breakdown"].items()), columns=["المعيار", "النقاط"]),
@@ -1167,93 +1058,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
 
 
 # ============================================================
-# ===== لوحة رادار التقسيم (دورة + معادلة الدليل) =====
-# ============================================================
-def render_split_board(rows):
-    if not rows:
-        st.warning("لا توجد أسهم بتقسيم عكسي ضمن الفلاتر الحالية")
-        return
-    counts = {}
-    for r in rows:
-        counts[r["phase_key"]] = counts.get(r["phase_key"], 0) + 1
-
-    # ═══ عدّاد الجاهزية الكاملة ═══
-    full_ready = [r for r in rows if r.get("guide_ready")]
-    if full_ready:
-        names = ", ".join(r["symbol"] for r in full_ready[:6])
-        st.markdown(f'<div style="background:#00b89422;border:2px solid #00b894;border-radius:12px;padding:12px;text-align:center;margin:8px 0;font-size:20px;font-weight:bold;color:#00b894">🟢 جاهز دخول كامل (دورة + معادلة الدليل): {len(full_ready)} سهم — {names}</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="warn-box">⏳ لا سهم مكتمل المعادلة حالياً — الرادار يجهّز ولا يطارد</div>', unsafe_allow_html=True)
-
-    st.markdown("#### 📊 توزيع المراحل")
-    cols = st.columns(6)
-    for idx, key in enumerate(["READY", "WATCH", "RETEST", "PROOF", "ZONE", "WASHOUT"]):
-        meta = PHASE_META[key]
-        with cols[idx]:
-            st.markdown(
-                f'<div style="background:{meta["color"]}18;border:1.5px solid {meta["color"]};'
-                f'border-radius:12px;padding:10px;text-align:center;margin:3px">'
-                f'<div style="font-size:24px;font-weight:bold;color:{meta["color"]}">{counts.get(key, 0)}</div>'
-                f'<div style="font-size:11px">{meta["label"]}</div></div>',
-                unsafe_allow_html=True)
-
-    for key in ["READY", "WATCH", "RETEST", "PROOF"]:
-        group = sorted([r for r in rows if r["phase_key"] == key], key=lambda x: x["days"])
-        if not group:
-            continue
-        st.markdown(f"#### {PHASE_META[key]['label']} — ({len(group)})")
-        for r in group:
-            zone_txt = f"${r['zone']['low']}–{r['zone']['high']}" if r["zone"] else "—"
-            g_badge = ""
-            if r.get("missing") is not None:
-                g_badge = " | دليل: " + ("✅" if not r["missing"] else "⏳")
-            with st.expander(f"**{r['symbol']}** | تقسيم {r['ratio']} قبل {r['days']} يوم | المنطقة {zone_txt} | ارتداد {r['rebound']}%{g_badge}"):
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("عمر التقسيم", f"{r['days']} يوم")
-                c2.metric("النسبة", r["ratio"])
-                c3.metric("الغسيل من القمة", f"-{r['drawdown']}%")
-                c4.metric("البعد عن القاع", f"{r['dist']}%" if r['dist'] is not None else "-")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("جفاف الحجم", "✅" if r["vol_dryup"] else "❌")
-                c2.metric("تقلص التقلب", "✅" if r["vol_contract"] else "❌")
-                c3.metric("لمسات القاع", str(r["zone"]["touches"]) if r["zone"] else "0")
-                c4.metric("ثبات جلستين", "✅" if r["stability"] else "❌")
-                if r["zone"]:
-                    st.markdown(f'<div class="info-box">📐 <b>المنطقة المعتمدة:</b> ${r["zone"]["low"]} — ${r["zone"]["high"]} ({r["zone"]["touches"]} لمسات)</div>', unsafe_allow_html=True)
-                if r.get("score") is not None:
-                    st.write(f"🧮 نقاط الطريقة: **{r['score']}/100**")
-                    if r.get("guide_ready"):
-                        st.markdown('<div class="success-box">✅ <b>معادلة الدليل مكتملة (ص 65):</b> ضغط RSI + MACD متحسن + ثبات + بلا تصريف — هذا هو الدخول الصحيح</div>', unsafe_allow_html=True)
-                    elif r.get("missing") is not None:
-                        st.markdown(f'<div class="warn-box">⏳ <b>الدورة مكتملة لكن المعادلة لا:</b> {" | ".join(r["missing"])} — راقب ولا تدخل بعد</div>', unsafe_allow_html=True)
-                if key == "READY":
-                    st.success("✅ داخل منطقة الدخول (≤15%) — افتح تبويب «تحليل سهم» للخطة الكاملة")
-                elif key == "WATCH":
-                    st.info("👁️ الدعم مؤكد لكن السعر خارج منطقة 15% — انتظر تراجعاً هادئاً")
-                elif key == "RETEST":
-                    st.info("🔄 السهم يختبر المنطقة — راقب ثبات جلستين بقيعان صاعدة")
-                else:
-                    st.info("⏳ منطقة متكونة لكن بلا إثبات حياة (ارتداد ≥10%) بعد")
-
-    early = [r for r in rows if r["phase_key"] in ("ZONE", "WASHOUT")]
-    if early:
-        with st.expander(f"🌪️ مراحل مبكرة — قائمة انتظار ({len(early)})"):
-            st.dataframe(pd.DataFrame([{
-                "الرمز": r["symbol"], "اليوم": r["days"], "النسبة": r["ratio"],
-                "المرحلة": PHASE_META[r["phase_key"]]["label"], "الغسيل %": r["drawdown"],
-                "جفاف": "✅" if r["vol_dryup"] else "❌",
-                "قاع المنطقة": r["zone"]["low"] if r["zone"] else "-",
-            } for r in early]), use_container_width=True, hide_index=True)
-
-    rejected = [r for r in rows if r["phase_key"] == "REJECTED"]
-    if rejected:
-        with st.expander(f"🚫 مستبعدات بأسباب ({len(rejected)})"):
-            for r in rejected:
-                st.markdown(f"- **{r['symbol']}** ({r['ratio']}, يوم {r['days']}): " + " | ".join(r["rejections"]))
-
-
-# ============================================================
-# ===== الواجهة =====
+# ===== الواجهة: تبويبان فقط =====
 # ============================================================
 st.markdown("# 🎯 Stock Screener Pro — طريقة فيصل")
 
@@ -1261,14 +1066,13 @@ with st.sidebar:
     st.markdown("### ⚙️ إعدادات الخطة")
     portfolio_size = st.number_input("حجم المحفظة ($)", min_value=1000, value=10000, step=1000)
     risk_percent = st.slider("نسبة المخاطرة (%)", 0.5, 5.0, 2.0, 0.5)
-    st.markdown("### 🔌 حالة المصادر")
+    st.markdown("### 🔌 المصادر")
     st.markdown(f"**Finnhub:** {'🟢' if FINNHUB_KEY else '🔴'}")
-    st.markdown(f"**Yahoo Proxy:** {'🟢' if PROXY_URL else '🔴'}")
-    st.markdown(f"**بيئة Render:** {'🟢' if ON_RENDER else '⚪ محلي'}")
+    st.markdown(f"**Proxy:** {'🟢' if PROXY_URL else '🔴'}")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 تحليل سهم", "⭐ الفرص الحالية", "🛰️ رادار التقسيم", "🕯️ فلتر الارتكاز", "📓 دفتر المتابعة"])
+tab1, tab2 = st.tabs(["📈 تحليل سهم", "🛰️ الرادار الموحد"])
 
-# ===== TAB 1 =====
+# ===== TAB 1: تحليل سهم + الدفتر =====
 with tab1:
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -1284,240 +1088,137 @@ with tab1:
                 st.error("❌ لا بيانات لـ " + sym)
             else:
                 st.success(f"✅ المصدر: **{source}** ({len(hist)} شمعة)")
-                if source == "stooq":
-                    st.warning("⚠️ مصدر طوارئ (Stooq): بيانات يومية بلا تقسيمات")
                 info = finnhub_metrics(sym)
                 offering = check_offering(sym)
                 news = check_news(sym)
                 r = score(sym, hist, info, splits, news, offering=offering)
                 render_full_analysis(sym, hist, splits, info, news, offering, r)
+                h4 = get_4h(sym)
+                lad = build_red_ladder(h4)
+                if lad:
+                    st.markdown("#### 🕯️ سلّم الشموع الساقطة (4H)")
+                    st.dataframe(pd.DataFrame(lad["ladder"]), use_container_width=True, hide_index=True)
+                    if lad["supports"]:
+                        st.markdown(f'<div class="success-box">🛡️ ذيول تحولت لدعم: {lad["supports"]}</div>', unsafe_allow_html=True)
 
-# ===== TAB 2 =====
+    with st.expander("📓 دفتر المتابعة اليومي"):
+        with st.form("journal_form"):
+            j_sym = st.text_input("السهم").upper()
+            j_type = st.selectbox("النوع", ["ارتكاز", "زخم", "Former Runner", "Gap Fill", "W", "سحب سيولة", "طرح جديد"])
+            j_levels = st.text_input("المستويات (دعم / طلب / مقاومة / هدف)")
+            j_plan = st.text_input("الخطة (دخول / وقف / أهداف)")
+            j_outcome = st.text_input("النتيجة والدرس")
+            submitted = st.form_submit_button("💾 حفظ")
+            if submitted and j_sym:
+                st.session_state.setdefault("journal", []).append({
+                    "التاريخ": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "السهم": j_sym, "النوع": j_type, "المستويات": j_levels,
+                    "الخطة": j_plan, "النتيجة": j_outcome})
+                st.success(f"✅ حُفظ {j_sym}")
+        if st.session_state.get("journal"):
+            jdf = pd.DataFrame(st.session_state["journal"])
+            st.dataframe(jdf, use_container_width=True, hide_index=True)
+            st.download_button("⬇️ تصدير CSV", jdf.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="faisal_journal.csv")
+
+# ===== TAB 2: الرادار الموحد =====
 with tab2:
-    st.markdown("### ⭐ الفرص الحالية — معادلة الارتكاز (ص 65)")
+    st.markdown("### 🛰️ الرادار الموحد — مسح واحد، كل القواعد")
     st.markdown(
-        '<div class="filter-box"><b>الشروط:</b> ضغط RSI ≤35 + نقاط ≥40 + بلا إقصاء '
-        '(دعم مكسور / تصريف / Failed Spike / خبر حرج / طرح SEC)</div>',
+        '<div class="filter-box"><b>القمع:</b> 300 سهم → فرز رخيص (بلا إقصاء + RSI≤35 أو دورة تقسيم) '
+        '→ فحص عميق (Finnhub + أخبار + SEC + سلّم 4H) → معادلة الدليل ص 65<br>'
+        '<b>جاهز دخول كامل =</b> معادلة مكتملة + نقاط ≥50 + داخل 15% من الدعم</div>',
         unsafe_allow_html=True)
-    if st.button("🔍 امسح الفرص", key="t"):
+
+    if st.button("🛰️ امسح بالرادار الموحد", key="uni"):
         with st.spinner("تحميل القائمة..."):
             universe = get_dynamic_universe(limit=300)
-        st.info(f"📡 {len(universe)} سهم — جلب متوازٍ")
         pg = st.progress(0)
-        raw = scan_parallel(universe, "3mo", progress_cb=lambda i, n: pg.progress(i / n))
+        raw = scan_parallel(universe, "6mo", progress_cb=lambda i, n: pg.progress(i / n))
         pg.empty()
-        cands = []
+
+        stage1, excluded = [], []
         for s, h, sps, src in raw:
+            if src == "stooq":
+                continue
             try:
                 cheap = score(s, h, {}, sps)
-                if cheap["rsi"] <= 35 and cheap["total"] >= 20 and not cheap["hard_veto"]:
-                    cands.append((s, h, sps))
+                if cheap["hard_veto"]:
+                    excluded.append({"symbol": s, "reason": " | ".join(veto_reasons(cheap, None, None)) or "إقصاء"})
+                    continue
+                phase = post_split_phase(s, h, sps)
+                if cheap["rsi"] <= 35 or (phase and phase["phase_key"] in ("READY", "WATCH", "RETEST", "PROOF")):
+                    stage1.append((s, h, sps, phase))
             except Exception:
                 continue
-        st.info(f"🔎 {len(cands)} سهم مضغوط — فحص Finnhub والأخبار للناجين فقط")
+        st.info(f"🔎 {len(stage1)} سهم اجتاز الفرز — فحص عميق للناجين فقط")
+
+        results = []
         pg2 = st.progress(0)
-        res = []
-        for i, (s, h, sps) in enumerate(cands):
-            pg2.progress((i + 1) / max(len(cands), 1))
+        for i, (s, h, sps, phase) in enumerate(stage1):
+            pg2.progress((i + 1) / max(len(stage1), 1))
             try:
                 inf = finnhub_metrics(s)
                 news = check_news(s)
                 off = check_offering(s)
                 r = score(s, h, inf, sps, news, offering=off)
-                if r["total"] >= 40 and not r["hard_veto"]:
-                    res.append(r)
+                if r["hard_veto"]:
+                    excluded.append({"symbol": s, "reason": " | ".join(veto_reasons(r, news, off))})
+                    continue
+                h4 = get_4h(s)
+                lad = build_red_ladder(h4)
+                missing = []
+                if not (20 <= r["rsi"] <= 30): missing.append(f"RSI {r['rsi']} خارج 23-27")
+                if not r["macd_imp"]: missing.append("MACD لا يتحسن")
+                if not r["stability"]: missing.append("لا ثبات فوق الدعم")
+                near_support = r["dist_sup"] is not None and r["dist_sup"] <= 15
+                guide_ready = (not missing) and r["total"] >= 50 and near_support
+                tags = []
+                if phase and phase["phase_key"] in ("READY", "WATCH", "RETEST"):
+                    tags.append(f"تقسيم: {PHASE_META[phase['phase_key']]} {phase['ratio']}")
+                if lad: tags.append(f"سلّم 4H: {len(lad['ladder'])} شموع")
+                if r["runner"]: tags.append("Former Runner")
+                if r["sweep"]: tags.append("سحب سيولة")
+                if r["w_pattern"]: tags.append("W")
+                if r["accum"]: tags.append("تجميع هادئ")
+                results.append({"symbol": s, "total": r["total"], "rsi": r["rsi"],
+                                "guide_ready": guide_ready, "missing": missing,
+                                "support": r["support"], "dist_sup": r["dist_sup"],
+                                "rvol": r["rvol"], "tags": tags, "phase": phase, "ladder": lad})
             except Exception:
                 continue
         pg2.empty()
-        st.session_state["opp_hits"] = res
-    if "opp_hits" in st.session_state:
-        res = st.session_state["opp_hits"]
-        if not res:
-            st.warning("لا فرص مطابقة حالياً")
-        res.sort(key=lambda x: x["total"], reverse=True)
-        for i, r in enumerate(res[:10], 1):
-            with st.expander(f"{i}. **{r['symbol']}** - {r['total']}/100 {r['verdict']} | RSI {r['rsi']} | RVOL {r['rvol']}"):
-                c1, c2, c3 = st.columns(3)
-                c1.metric("السعر", f"${round(r['price'], 3)}")
-                c2.metric("الدعم", f"${round(r['support'], 3)}" if r['support'] else "-")
-                c3.metric("البعد عن الدعم", f"{r['dist_sup']}%" if r['dist_sup'] is not None else "-")
-                tags = []
-                if r["runner"]: tags.append("Former Runner")
-                if r["w_pattern"]: tags.append("W")
-                if r["sweep"]: tags.append("سحب سيولة")
-                if r["accum"]: tags.append("تجميع هادئ")
-                if r["split_info"].get("has_split"): tags.append(f"Split {r['split_info']['ratio']}")
-                if tags:
-                    st.markdown(f'<div class="success-box">🏷️ السلوك: {" | ".join(tags)}</div>', unsafe_allow_html=True)
-                if r["stability"]:
-                    st.write(f"الثبات: {r['stability']['strength']} - {r['stability']['sessions_held']} جلسات")
+        results.sort(key=lambda x: (x["guide_ready"], x["total"]), reverse=True)
+        st.session_state["uni_results"] = results
+        st.session_state["uni_excluded"] = excluded
+        st.success(f"✅ المسح اكتمل: {len(results)} مرشح | {len(excluded)} مقصيّ")
 
-# ===== TAB 3 =====
-with tab3:
-    st.markdown("### 🛰️ رادار التقسيم العكسي — دورة الحياة + معادلة الدليل")
-    st.markdown(
-        '<div class="filter-box"><b>منطق الرادار:</b><br>'
-        '• <b>الحدث:</b> تقسيم عكسي خلال آخر 90 يوم<br>'
-        '• <b>الغسيل:</b> جفاف حجم <50% من حجم أول 10 جلسات بعد التقسيم<br>'
-        '• <b>المنطقة:</b> ≥3 قيعان داخل ±4% بلا إغلاق تحتها<br>'
-        '• <b>إثبات الحياة:</b> ارتداد ≥10% | <b>الدخول:</b> داخل 15% من القاع<br>'
-        '• <b>معادلة الدليل (ص 65):</b> RSI 23-27 + MACD متحسن + ثبات + بلا تصريف<br>'
-        '• <b>استبعاد فوري:</b> طرح SEC / خبر حرج / سعر <$1.30 / مقسّم تسلسلي</div>',
-        unsafe_allow_html=True)
+    if "uni_results" in st.session_state:
+        results = st.session_state["uni_results"]
+        excluded = st.session_state.get("uni_excluded", [])
+        ready = [x for x in results if x["guide_ready"]]
+        if ready:
+            names = ", ".join(x["symbol"] for x in ready[:6])
+            st.markdown(f'<div style="background:#00b89422;border:2px solid #00b894;border-radius:12px;padding:12px;text-align:center;margin:8px 0;font-size:20px;font-weight:bold;color:#00b894">🟢 جاهز دخول كامل: {len(ready)} سهم — {names}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="warn-box">⏳ لا سهم مكتمل المعادلة حالياً — الرادار يجهّز ولا يطارد</div>', unsafe_allow_html=True)
 
-    if st.button("🛰️ امسح دورة التقسيم", key="sp"):
-        with st.spinner("تحميل قائمة الأسهم..."):
-            universe = get_dynamic_universe(limit=500)
-        st.info(f"📡 {len(universe)} سهم — جلب متوازٍ")
-        pg = st.progress(0)
-        raw = scan_parallel(universe, "1y", progress_cb=lambda i, n: pg.progress(i / n))
-        pg.empty()
-        rows = []
-        for s, h, sps, src in raw:
-            if src == "stooq":
-                continue
-            try:
-                pi = post_split_phase(s, h, sps)
-                if not pi:
-                    continue
-                rej = split_rejections(s, h, pi)
-                serial = split_rejections_serial(sps)
-                if serial:
-                    rej.append(serial)
-                if rej:
-                    pi["phase_key"] = "REJECTED"
-                    pi["rejections"] = rej
-                elif pi["phase_key"] in ("READY", "WATCH", "RETEST"):
-                    veto, why = advanced_veto(s)
-                    if veto:
-                        pi["phase_key"] = "REJECTED"
-                        pi["rejections"] = [why]
-                    else:
-                        # معادلة الدليل ص 65 تُفحص لكل سهم متقدم
-                        inf = finnhub_metrics(s)
-                        news = check_news(s)
-                        r = score(s, h, inf, sps, news)
-                        pi["score"] = r["total"]
-                        missing = []
-                        if not (20 <= r["rsi"] <= 30):
-                            missing.append(f"RSI {r['rsi']} خارج ضغط 23-27")
-                        if not r["macd_imp"]:
-                            missing.append("MACD لا يتحسن")
-                        if r["distribution"]:
-                            missing.append("تصريف: فوليوم عالي والسعر واقف")
-                        if not r["stability"]:
-                            missing.append("لا ثبات فوق الدعم")
-                        pi["missing"] = missing
-                        pi["guide_ready"] = (pi["phase_key"] == "READY" and not missing)
-                rows.append(pi)
-            except Exception:
-                continue
-        st.session_state["split_board"] = rows
-        st.success(f"✅ اكتمل المسح: {len(rows)} سهم بتقسيم عكسي")
+        for x in results[:15]:
+            badge = "✅" if x["guide_ready"] else "⏳"
+            with st.expander(f"{badge} **{x['symbol']}** — {x['total']}/100 | RSI {x['rsi']} | RVOL {x['rvol']} | بعد عن الدعم {x['dist_sup']}%"):
+                if x["tags"]:
+                    st.markdown(f'<div class="success-box">🏷️ السلوك: {" | ".join(x["tags"])}</div>', unsafe_allow_html=True)
+                if x["guide_ready"]:
+                    st.markdown('<div class="success-box">✅ معادلة الدليل مكتملة (ص 65) — افتح تبويب التحليل للخطة الكاملة</div>', unsafe_allow_html=True)
+                elif x["missing"]:
+                    st.markdown(f'<div class="warn-box">⏳ ينقص: {" | ".join(x["missing"])}</div>', unsafe_allow_html=True)
+                if x["ladder"]:
+                    st.dataframe(pd.DataFrame(x["ladder"]["ladder"]), use_container_width=True, hide_index=True)
 
-    if "split_board" in st.session_state:
-        render_split_board(st.session_state["split_board"])
-    else:
-        st.info("اضغط «امسح دورة التقسيم» لبدء أول مسح")
-
-# ===== TAB 4 =====
-with tab4:
-    st.markdown("### 🕯️ فلتر سهم الارتكاز — الشموع الساقطة (4H)")
-    st.markdown(
-        '<div class="filter-box"><b>قواعد الطريقة (بدون شورت):</b><br>'
-        '• سلّم شموع حمراء على 4H: الذيل مقاومة، الرأس هدف<br>'
-        '• أي ذيل يحترق يتحول لدعم تلقائياً<br>'
-        '• لكل شمعة هدف ~25% | المقاومة على نطاق متوسط 20–30 = تعزيز<br>'
-        '• المقسم >3 مرات: سقف الهدف تحت MA20 | أخبار حرجة/طرح = إقصاء</div>',
-        unsafe_allow_html=True)
-
-    if st.button("🕯️ امسح بطريقة الارتكاز", key="pv"):
-        with st.spinner("تحميل القائمة..."):
-            universe = get_dynamic_universe(limit=PIVOT_UNIVERSE_LIMIT)
-
-        def fetch_both(s):
-            hd, sps, src = get_candles_unified(s, "6mo")
-            if hd.empty:
-                return None
-            h4 = get_4h(s)
-            if h4 is None or h4.empty:
-                return None
-            return s, hd, h4, sps
-
-        pg = st.progress(0)
-        rows = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futs = [ex.submit(fetch_both, s) for s in universe]
-            for i, f in enumerate(as_completed(futs)):
-                pg.progress((i + 1) / len(universe))
-                try:
-                    rr_ = f.result()
-                    if rr_:
-                        rows.append(rr_)
-                except Exception:
-                    pass
-        pg.empty()
-
-        hits = []
-        for s, hd, h4, sps in rows:
-            res = filter_pivot_stock(s, hd, h4, sps)
-            if res:
-                hits.append(res)
-
-        for h in hits:
-            veto, why = advanced_veto(h["symbol"])
-            if veto:
-                h["veto"] = True
-                h["reasons"].append(f"🚫 إقصاء: {why}")
-        st.session_state["pivot_hits"] = hits
-        st.success(f"✅ {len(hits)} سهم مطابق لطريقة الارتكاز")
-
-    if "pivot_hits" in st.session_state:
-        hits = st.session_state["pivot_hits"]
-        if not hits:
-            st.warning("لا سهام مطابقة للطريقة حالياً")
-        for h in sorted(hits, key=lambda x: x["points"], reverse=True):
-            veto = "🚫 " if h.get("veto") else ""
-            with st.expander(f"{veto}**{h['symbol']}** — {h['points']} نقطة | الهدف الحالي ${h['target']}"):
-                for reason in h["reasons"]:
-                    st.markdown(f'<div class="info-box">{reason}</div>', unsafe_allow_html=True)
-                st.markdown("#### السلّم (من الأقرب للأبعد)")
-                st.dataframe(pd.DataFrame(h["ladder"]["ladder"]),
-                             use_container_width=True, hide_index=True)
-                if h["ladder"]["supports"]:
-                    st.markdown(f'<div class="success-box">🛡️ ذيول تحولت لدعم: {h["ladder"]["supports"]}</div>', unsafe_allow_html=True)
-
-# ===== TAB 5 =====
-with tab5:
-    st.markdown("### 📓 دفتر المتابعة اليومي")
-    st.caption("الاحتراف في تكرار نفس عملية الفحص يومياً — لا في معرفة سهم واحد")
-    with st.form("journal_form"):
-        j_sym = st.text_input("السهم").upper()
-        j_type = st.selectbox("النوع", ["ارتكاز", "زخم", "Former Runner", "Gap Fill", "W", "سحب سيولة", "طرح جديد"])
-        j_data = st.text_input("البيانات (Float / RVOL / Short / آخر Split)")
-        j_catalyst = st.text_input("المحفز (خبر / قطاع / بري ماركت)")
-        j_levels = st.text_input("المستويات (دعم / طلب / مقاومة1 / مقاومة2 / هدف)")
-        j_plan = st.text_input("الخطة (دخول / وقف / أهداف / إذا فشل)")
-        j_outcome = st.text_input("النتيجة والدرس")
-        submitted = st.form_submit_button("💾 حفظ في الدفتر")
-        if submitted and j_sym:
-            st.session_state.setdefault("journal", []).append({
-                "التاريخ": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "السهم": j_sym, "النوع": j_type, "البيانات": j_data,
-                "المحفز": j_catalyst, "المستويات": j_levels,
-                "الخطة": j_plan, "النتيجة": j_outcome,
-            })
-            st.success(f"✅ حُفظ {j_sym} في الدفتر")
-    if st.session_state.get("journal"):
-        jdf = pd.DataFrame(st.session_state["journal"])
-        st.dataframe(jdf, use_container_width=True, hide_index=True)
-        st.download_button("⬇️ تصدير CSV", jdf.to_csv(index=False).encode("utf-8-sig"),
-                           file_name="faisal_journal.csv")
-        if st.button("🗑️ تفريغ الدفتر"):
-            st.session_state["journal"] = []
-            st.rerun()
-    else:
-        st.info("لا إدخالات بعد — ابدأ بتوثيق أول سهم تراقبه")
+        if excluded:
+            with st.expander(f"🚫 المقصيون وأسبابهم ({len(excluded)})"):
+                for e in excluded:
+                    st.markdown(f"- **{e['symbol']}**: {e['reason']}")
 
 st.markdown("---")
 st.caption("⚠️ تعليمي فقط - ليس توصية استثمارية | دليل طريقة فيصل")
