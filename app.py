@@ -22,9 +22,9 @@ ON_RENDER   = bool(os.environ.get("RENDER_SERVICE_NAME"))
 MARKET_CAP_MAX = 20_000_000
 FLOAT_MAX      = 5_000_000
 PRICE_MAX      = 5.0
-VOLUME_MIN     = 50_000   # مخفّض لرؤية القواعد النائمة ذات النبضات
+VOLUME_MIN     = 50_000
 
-MAX_WORKERS = 12          # مضاعف للسرعة (لا تتجاوز 15 حمايةً للبروكسي)
+MAX_WORKERS = 12
 LADDER_MIN_CANDLES = 2
 MA_TOUCH_PCT = 3.0
 
@@ -274,7 +274,6 @@ def finnhub_metrics(symbol):
 
 @st.cache_data(ttl=86400)
 def _sec_tickers_map():
-    """فهرس SEC يُنزّل مرة واحدة يومياً لكل التطبيق"""
     try:
         r = requests.get("https://www.sec.gov/files/company_tickers.json",
                          headers={"User-Agent": "FaisalBot contact@example.com"}, timeout=15)
@@ -906,7 +905,7 @@ def tradeability_veto(hist, splits=None):
 
 
 # ============================================================
-# ===== سيناريو المضارب المرتّب (لكل الأسهم) =====
+# ===== سيناريو المضارب المرتّب =====
 # ============================================================
 def manipulator_script(hist):
     """قاعدة جافة → جس نبض → سحب/اختبار قاع القاعدة → استرداد فوقه"""
@@ -964,6 +963,11 @@ def detect_families(hist, r):
         fam.append("طرح جديد")
     if manipulator_script(hist):
         fam.append("سيناريو المضارب")
+    # 🪜 درج الثبات: جلستان بقيعان أعلى فوق الدعم
+    if r["stability"] and r["stability"].get("higher_lows") \
+       and r["stability"]["sessions_held"] >= 2 \
+       and near_sup:
+        fam.append("درج ثبات")
     return fam
 
 
@@ -981,11 +985,10 @@ def _us_market_open():
 
 
 def detect_sweep_reclaim(h4, support):
-    """زناد الدخول: مسح سيولة ثم استرداد على 4H — ذيل تحت الدعم وإغلاق فوقه"""
     if h4 is None or len(h4) < 3 or not support:
         return None
     if _us_market_open() and len(h4) > 3:
-        h4 = h4.iloc[:-1]   # الشمعة الجارية ليست حقيقة بعد
+        h4 = h4.iloc[:-1]
     last3 = h4.tail(3)
     for i in range(len(last3)):
         c = last3.iloc[i]
@@ -1033,6 +1036,8 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     script = manipulator_script(hist)
     if script:
         st.markdown(f'<div class="success-box">🎭 <b>سيناريو المضارب مكتمل الترتيب:</b> قاعدة جافة → جس نبض {script["probe_date"]} → سحب/اختبار {script["sweep_date"]} عند {script["base_low"]} → استرداد — سهم يُراقب بزناد لا يُشترى اندفاعاً</div>', unsafe_allow_html=True)
+    if "درج ثبات" in fam:
+        st.markdown(f'<div class="success-box">🪜 <b>درج ثبات:</b> جلستان متتاليتان بقيعان أعلى فوق الدعم — بصمة استقواء قبل الحدث</div>', unsafe_allow_html=True)
     if 0 < r.get("shares_short", 0) < 10000:
         st.markdown(f'<div class="info-box">🔥 <b>الشورت المتاح:</b> {int(r["shares_short"]):,} سهم — وقود مساعد (لا إشارة شراء)</div>', unsafe_allow_html=True)
     if r.get("accum"):
@@ -1086,7 +1091,6 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         g = r["gap"]
         st.markdown(f'<div class="info-box">فجوة: {g["gap_pct"]}% عند ${g["gap_price"]} — هدف محتمل لا وعد</div>', unsafe_allow_html=True)
 
-    # ═══════════ خطة الدخول: زناد السحب مقابل سلّم الطلبات ═══════════
     sweep = sweep_wait = None
     heads_x = []
     if r["support"]:
@@ -1133,7 +1137,6 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
                     f'📌 إن تحقق: دخول سوقاً عند الإغلاق المسترد، وقف تحت قاع السحب ×0.97، أهداف: {w1} → {w2} → {w3}.<br>'
                     f'🚫 إن أُغلق تحت {round(sup0*0.80,3)} بدون استرداد: السحب تحوّل انهياراً — لا شيء يُشترى.</div>', unsafe_allow_html=True)
 
-    # سلّم الطلبات يبقى لأنماط الثبات/التجميع فقط
     if r["support"] and r["resistance"] and not sweep and not sweep_wait:
         sup_val, res_val, current_price = r["support"], r["resistance"], r["price"]
         atr_val = atr(hist["High"], hist["Low"], hist["Close"], 14)
@@ -1258,7 +1261,6 @@ with st.sidebar:
 
 tab1, tab2 = st.tabs(["📈 تحليل سهم", "🛰️ الرادار الموحد"])
 
-# ===== TAB 1 =====
 with tab1:
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -1290,7 +1292,7 @@ with tab1:
     with st.expander("📓 دفتر المتابعة اليومي"):
         with st.form("journal_form"):
             j_sym = st.text_input("السهم").upper()
-            j_type = st.selectbox("النوع", ["ارتكاز", "زخم", "Former Runner", "Gap Fill", "W", "سحب سيولة", "سيناريو المضارب", "طرح جديد"])
+            j_type = st.selectbox("النوع", ["ارتكاز", "زخم", "Former Runner", "Gap Fill", "W", "سحب سيولة", "سيناريو المضارب", "درج ثبات", "طرح جديد"])
             j_levels = st.text_input("المستويات (دعم / طلب / مقاومة / هدف)")
             j_plan = st.text_input("الخطة (دخول / وقف / أهداف)")
             j_outcome = st.text_input("النتيجة والدرس")
@@ -1307,13 +1309,12 @@ with tab1:
             st.download_button("⬇️ تصدير CSV", jdf.to_csv(index=False).encode("utf-8-sig"),
                                file_name="faisal_journal.csv")
 
-# ===== TAB 2 =====
 with tab2:
     st.markdown("### 🛰️ الرادار الموحد — مسح واحد، كل الفصائل")
     st.markdown(
-        '<div class="filter-box"><b>فصائل ما قبل الانفجار:</b> ضغط RSI | تجميع/قاعدة | عدّاء سابق | سحب سيولة | W | تغطية فجوات | تقسيم عكسي | جس نبض | طرح جديد | 🎭 سيناريو المضارب<br>'
+        '<div class="filter-box"><b>فصائل ما قبل الانفجار:</b> ضغط RSI | تجميع/قاعدة | عدّاء سابق | سحب سيولة | W | تغطية فجوات | تقسيم عكسي | جس نبض | طرح جديد | 🎭 سيناريو المضارب | 🪜 درج ثبات<br>'
         '<b>بوابة السيولة:</b> سعر ≥ $0.50 + نبضة ≥ 200K/60يوم + متوسط ≥ 50K + قيمة ≥ 75K + (تحت $1 بلا تقسيم حديث)<br>'
-        '<b>جاهز دخول كامل =</b> معادلة مكتملة (ضغط RSI <i>أو</i> جفاف قاعدة <i>أو</i> سيناريو مضارب) + نقاط ≥50 + (قرب الدعم <b>أو</b> زناد سحب) + بلا فجوة ≥25%</div>',
+        '<b>جاهز دخول كامل =</b> معادلة مكتملة + نقاط ≥50 + (قرب الدعم <b>أو</b> زناد سحب) + بلا فجوة ≥25%</div>',
         unsafe_allow_html=True)
 
     if st.button("🛰️ امسح بالرادار الموحد", key="uni"):
@@ -1363,13 +1364,13 @@ with tab2:
                 sweep = detect_sweep_reclaim(h4, r["support"])
                 sweep_wait = sweep is None and sweep_mode_candidate(h4, h, r["support"], r["dist_sup"])
                 missing = []
-                base_fam = ("تجميع/قاعدة" in fam) or ("سيناريو المضارب" in fam)
+                base_fam = ("تجميع/قاعدة" in fam) or ("سيناريو المضارب" in fam) or ("درج ثبات" in fam)
                 macd_flat = abs(r["macd_hist"]) / max(r["price"], 0.01) < 0.005
                 if not (20 <= r["rsi"] <= 30) and not base_fam:
-                    missing.append(f"RSI {r['rsi']} خارج الضغط ولا قاعدة مسطحة")
+                    missing.append(f"RSI {r['rsi']} خارج الضغط ولا قاعدة/درج")
                 if not (r["macd_imp"] or (base_fam and macd_flat)):
                     missing.append("MACD لا يتحسن")
-                if not r["stability"] and not sweep and not ("سيناريو المضارب" in fam):
+                if not r["stability"] and not sweep and not ("سيناريو المضارب" in fam) and not ("درج ثبات" in fam):
                     missing.append("لا ثبات فوق الدعم")
                 near_support = r["dist_sup"] is not None and r["dist_sup"] <= 15
                 guide_ready = (not missing) and r["total"] >= 50 and (near_support or bool(sweep))
@@ -1379,6 +1380,7 @@ with tab2:
                 if lad: tags.append(f"سلّم 4H: {len(lad['ladder'])} شموع")
                 if r["accum"]: tags.append("تجميع هادئ")
                 if "سيناريو المضارب" in fam: tags.append("🎭 سيناريو المضارب")
+                if "درج ثبات" in fam: tags.append("🪜 درج ثبات")
                 if sweep: tags.append("🌀 زناد السحب تحقق")
                 elif sweep_wait: tags.append("🌀 نمط سحب — انتظر الزناد")
                 off = {"has_offering": False}
