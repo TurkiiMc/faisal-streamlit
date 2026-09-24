@@ -884,20 +884,48 @@ def veto_reasons(r, news, offering):
 
 
 # ============================================================
-# ===== بوابة السيولة: النائم ≠ الزومبي =====
+# ===== بوابة السيولة: النائم ≠ الزومبي ≠ فخ التقسيم =====
 # ============================================================
-def tradeability_veto(hist):
+def tradeability_veto(hist, splits=None):
     price = float(hist["Close"].iloc[-1])
     avg_vol = float(hist["Volume"].tail(20).mean())
     max_vol = float(hist["Volume"].tail(60).max()) if len(hist) >= 60 else float(hist["Volume"].max())
-    if price < 1.0:
-        return f"سعر تحت $1 ({price:.3f}) — خطر شطب وسبريد قاتل"
+    if price < 0.50:
+        return f"سعر تحت $0.50 ({price:.3f}) — خطر شطب وسبريد قاتل"
     if max_vol < 200_000:
         return "لا نشاط حيوي خلال 60 يوم — سهم زومبي"
     if avg_vol < 50_000:
-        return f"سيولة ميتة: متوسط {int(avg_vol):,} حتى مع وجود نبضات"
+        return f"سيولة ميتة: متوسط {int(avg_vol):,} حتى مع نبضات"
     if price * avg_vol < 75_000:
         return f"قيمة التداول ${int(price * avg_vol):,} ضعيفة التنفيذ"
+    if price < 1.0 and splits:
+        sp = detect_reverse_split(splits, max_days=365)
+        if sp.get("has_split"):
+            return f"تحت $1 مع تقسيم عكسي حديث ({sp['ratio']}) — فخ استيفاء/تقسيم تسلسلي"
+    return None
+
+
+# ============================================================
+# ===== سيناريو المضارب المرتّب (لكل الأسهم) =====
+# ============================================================
+def manipulator_script(hist):
+    """قاعدة جافة → جس نبض → سحب/اختبار قاع القاعدة → استرداد فوقه"""
+    if len(hist) < 40:
+        return None
+    base = hist.iloc[-20:-5]
+    prev_vol = float(hist["Volume"].iloc[-40:-20].mean()) or 1.0
+    base_dry = float(base["Volume"].mean()) < prev_vol * 1.2
+    last_close = float(hist["Close"].iloc[-1])
+    base_range = (float(base["High"].max()) - float(base["Low"].min())) / max(last_close, 0.01) < 0.25
+    avg_prev = float(hist["Volume"].iloc[-30:-5].mean()) or 1.0
+    probe_idx = [i for i in range(len(hist) - 5, len(hist)) if float(hist["Volume"].iloc[i]) > avg_prev * 3]
+    base_low = float(base["Low"].min())
+    sweep_idx = [i for i in range(len(hist) - 3, len(hist)) if float(hist["Low"].iloc[i]) <= base_low * 1.02]
+    reclaim = last_close > base_low
+    if base_dry and base_range and probe_idx and sweep_idx and reclaim:
+        return {"base_low": round(base_low, 3),
+                "probe_date": str(hist.index[probe_idx[0]])[:10],
+                "sweep_date": str(hist.index[sweep_idx[0]])[:10]}
     return None
 
 
@@ -934,6 +962,8 @@ def detect_families(hist, r):
             fam.append("جس نبض")
     if n < 70:
         fam.append("طرح جديد")
+    if manipulator_script(hist):
+        fam.append("سيناريو المضارب")
     return fam
 
 
@@ -985,7 +1015,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         st.markdown(f'<div class="danger-box">🚫 <b>إقصاء فوري:</b> {" | ".join(veto_reasons(r, news, offering))} — لا تُتداول هذه الحالة</div>', unsafe_allow_html=True)
         return
 
-    dead = tradeability_veto(hist)
+    dead = tradeability_veto(hist, splits)
     if dead:
         st.markdown(f'<div class="danger-box">🧟 <b>سهم غير قابل للتداول:</b> {dead}</div>', unsafe_allow_html=True)
         return
@@ -1000,6 +1030,9 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     fam = detect_families(hist, r)
     if fam:
         st.markdown(f'<div class="info-box">🧬 <b>فصيلة ما قبل الانفجار:</b> {" | ".join(fam)}</div>', unsafe_allow_html=True)
+    script = manipulator_script(hist)
+    if script:
+        st.markdown(f'<div class="success-box">🎭 <b>سيناريو المضارب مكتمل الترتيب:</b> قاعدة جافة → جس نبض {script["probe_date"]} → سحب/اختبار {script["sweep_date"]} عند {script["base_low"]} → استرداد — سهم يُراقب بزناد لا يُشترى اندفاعاً</div>', unsafe_allow_html=True)
     if 0 < r.get("shares_short", 0) < 10000:
         st.markdown(f'<div class="info-box">🔥 <b>الشورت المتاح:</b> {int(r["shares_short"]):,} سهم — وقود مساعد (لا إشارة شراء)</div>', unsafe_allow_html=True)
     if r.get("accum"):
@@ -1257,7 +1290,7 @@ with tab1:
     with st.expander("📓 دفتر المتابعة اليومي"):
         with st.form("journal_form"):
             j_sym = st.text_input("السهم").upper()
-            j_type = st.selectbox("النوع", ["ارتكاز", "زخم", "Former Runner", "Gap Fill", "W", "سحب سيولة", "طرح جديد"])
+            j_type = st.selectbox("النوع", ["ارتكاز", "زخم", "Former Runner", "Gap Fill", "W", "سحب سيولة", "سيناريو المضارب", "طرح جديد"])
             j_levels = st.text_input("المستويات (دعم / طلب / مقاومة / هدف)")
             j_plan = st.text_input("الخطة (دخول / وقف / أهداف)")
             j_outcome = st.text_input("النتيجة والدرس")
@@ -1278,9 +1311,9 @@ with tab1:
 with tab2:
     st.markdown("### 🛰️ الرادار الموحد — مسح واحد، كل الفصائل")
     st.markdown(
-        '<div class="filter-box"><b>فصائل ما قبل الانفجار:</b> ضغط RSI | تجميع/قاعدة | عدّاء سابق | سحب سيولة | W | تغطية فجوات | تقسيم عكسي | جس نبض | طرح جديد<br>'
-        '<b>بوابة السيولة:</b> سعر ≥ $1 + نبضة ≥ 200K/60يوم + متوسط ≥ 50K + قيمة ≥ 75K<br>'
-        '<b>جاهز دخول كامل =</b> معادلة مكتملة (ضغط RSI <i>أو</i> جفاف قاعدة) + نقاط ≥50 + (قرب الدعم <b>أو</b> زناد سحب) + بلا فجوة ≥25%</div>',
+        '<div class="filter-box"><b>فصائل ما قبل الانفجار:</b> ضغط RSI | تجميع/قاعدة | عدّاء سابق | سحب سيولة | W | تغطية فجوات | تقسيم عكسي | جس نبض | طرح جديد | 🎭 سيناريو المضارب<br>'
+        '<b>بوابة السيولة:</b> سعر ≥ $0.50 + نبضة ≥ 200K/60يوم + متوسط ≥ 50K + قيمة ≥ 75K + (تحت $1 بلا تقسيم حديث)<br>'
+        '<b>جاهز دخول كامل =</b> معادلة مكتملة (ضغط RSI <i>أو</i> جفاف قاعدة <i>أو</i> سيناريو مضارب) + نقاط ≥50 + (قرب الدعم <b>أو</b> زناد سحب) + بلا فجوة ≥25%</div>',
         unsafe_allow_html=True)
 
     if st.button("🛰️ امسح بالرادار الموحد", key="uni"):
@@ -1297,7 +1330,7 @@ with tab2:
             if src == "stooq":
                 continue
             try:
-                dead = tradeability_veto(h)
+                dead = tradeability_veto(h, sps)
                 if dead:
                     excluded.append({"symbol": s, "reason": dead})
                     continue
@@ -1330,13 +1363,13 @@ with tab2:
                 sweep = detect_sweep_reclaim(h4, r["support"])
                 sweep_wait = sweep is None and sweep_mode_candidate(h4, h, r["support"], r["dist_sup"])
                 missing = []
-                base_fam = "تجميع/قاعدة" in fam
+                base_fam = ("تجميع/قاعدة" in fam) or ("سيناريو المضارب" in fam)
                 macd_flat = abs(r["macd_hist"]) / max(r["price"], 0.01) < 0.005
                 if not (20 <= r["rsi"] <= 30) and not base_fam:
                     missing.append(f"RSI {r['rsi']} خارج الضغط ولا قاعدة مسطحة")
                 if not (r["macd_imp"] or (base_fam and macd_flat)):
                     missing.append("MACD لا يتحسن")
-                if not r["stability"] and not sweep:
+                if not r["stability"] and not sweep and not ("سيناريو المضارب" in fam):
                     missing.append("لا ثبات فوق الدعم")
                 near_support = r["dist_sup"] is not None and r["dist_sup"] <= 15
                 guide_ready = (not missing) and r["total"] >= 50 and (near_support or bool(sweep))
@@ -1345,6 +1378,7 @@ with tab2:
                     tags.append(f"تقسيم: {PHASE_META[phase['phase_key']]} {phase['ratio']}")
                 if lad: tags.append(f"سلّم 4H: {len(lad['ladder'])} شموع")
                 if r["accum"]: tags.append("تجميع هادئ")
+                if "سيناريو المضارب" in fam: tags.append("🎭 سيناريو المضارب")
                 if sweep: tags.append("🌀 زناد السحب تحقق")
                 elif sweep_wait: tags.append("🌀 نمط سحب — انتظر الزناد")
                 off = {"has_offering": False}
