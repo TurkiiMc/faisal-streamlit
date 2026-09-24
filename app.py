@@ -882,10 +882,9 @@ def veto_reasons(r, news, offering):
 
 
 # ============================================================
-# ===== بوابة السيولة: لا أسهم زومبي (الدليل ص 7/38) =====
+# ===== بوابة السيولة: لا أسهم زومبي =====
 # ============================================================
 def tradeability_veto(hist):
-    """السهم الميت لا يُتداول مهما كان شكله"""
     price = float(hist["Close"].iloc[-1])
     avg_vol = float(hist["Volume"].tail(20).mean())
     max_vol = float(hist["Volume"].tail(60).max()) if len(hist) >= 60 else float(hist["Volume"].max())
@@ -901,10 +900,9 @@ def tradeability_veto(hist):
 
 
 # ============================================================
-# ===== فصائل ما قبل الانفجار (الدليل ص 9-68) =====
+# ===== فصائل ما قبل الانفجار =====
 # ============================================================
 def detect_families(hist, r):
-    """أي فصيلة واحدة تكفي للعبور إلى الفحص العميق"""
     fam = []
     vol = hist["Volume"]
     price = r["price"]
@@ -912,7 +910,6 @@ def detect_families(hist, r):
     n = len(hist)
     if 20 <= r["rsi"] <= 30:
         fam.append("ضغط RSI")
-    # الجفاف يشترط أن يكون هناك حجمٌ حيوي يجفّ أصلاً (لا ينطبق على الميت)
     vol_dry = n >= 30 and float(vol.tail(30).mean()) >= 100_000 \
               and float(vol.tail(5).mean()) < float(vol.tail(30).mean()) * 0.5
     range_narrow = n >= 10 and (float(hist["High"].tail(10).max()) - float(hist["Low"].tail(10).min())) / price < 0.15
@@ -939,7 +936,34 @@ def detect_families(hist, r):
 
 
 # ============================================================
-# ===== عرض التحليل + خطة الدخول =====
+# ===== زناد السحب (4H) =====
+# ============================================================
+def detect_sweep_reclaim(h4, support):
+    """زناد الدخول: مسح سيولة ثم استرداد على 4H — ذيل تحت الدعم وإغلاق فوقه"""
+    if h4 is None or len(h4) < 3 or not support:
+        return None
+    last3 = h4.tail(3)
+    for i in range(len(last3)):
+        c = last3.iloc[i]
+        if float(c["Low"]) < support * 0.99 and float(c["Close"]) > support:
+            return {"sweep_low": round(float(c["Low"]), 3),
+                    "reclaim": round(float(c["Close"]), 3),
+                    "date": str(last3.index[i])[:16]}
+    return None
+
+
+def sweep_mode_candidate(h4, hist, support, dist_sup):
+    """هل السهم من فصيلة السحب؟ قرب الدعم + بصمة ذيل تحت الدعم سابقاً"""
+    if not support or dist_sup is None or dist_sup > 15:
+        return False
+    if h4 is not None and len(h4) >= 10:
+        if float(h4["Low"].tail(10).min()) < support * 0.99:
+            return True
+    return bool(detect_liquidity_sweep(hist))
+
+
+# ============================================================
+# ===== عرض التحليل + خطة الدخول (3 أنماط) =====
 # ============================================================
 def render_full_analysis(sym, hist, splits, info, news, offering, r):
     st.markdown(f'<div class="score-card"><div class="score-big" style="color:{r["color"]}">{r["total"]}/100</div><div class="verdict">{r["verdict"]}</div></div>', unsafe_allow_html=True)
@@ -1013,8 +1037,55 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         g = r["gap"]
         st.markdown(f'<div class="info-box">فجوة: {g["gap_pct"]}% عند ${g["gap_price"]} — هدف محتمل لا وعد</div>', unsafe_allow_html=True)
 
-    # ═══════════ خطة الدخول ═══════════
-    if r["support"] and r["resistance"]:
+    # ═══════════ خطة الدخول: زناد السحب مقابل سلّم الطلبات ═══════════
+    sweep = sweep_wait = None
+    heads_x = []
+    if r["support"]:
+        h4x = get_4h(sym)
+        sweep = detect_sweep_reclaim(h4x, r["support"])
+        sweep_wait = sweep is None and sweep_mode_candidate(h4x, hist, r["support"], r["dist_sup"])
+        lad_x = build_red_ladder(h4x)
+        heads_x = [L["head"] for L in lad_x["ladder"]] if lad_x else []
+
+    if sweep:
+        entry = sweep["reclaim"]
+        stop = round(sweep["sweep_low"] * 0.97, 3)
+        risk_ps = round(entry - stop, 3)
+        cur = r["price"]
+        atr_val0 = atr(hist["High"], hist["Low"], hist["Close"], 14)
+        atr_pct0 = round(atr_val0 / cur * 100, 1) if atr_val0 else 0
+        eff_risk0 = risk_percent / 2 if atr_pct0 > 8 else risk_percent
+        max_risk0 = portfolio_size * (eff_risk0 / 100)
+        shares0 = int(max_risk0 / risk_ps) if risk_ps > 0 else 0
+        st1 = heads_x[0] if heads_x and heads_x[0] > entry else r["resistance"]
+        st2 = heads_x[1] if len(heads_x) > 1 and heads_x[1] > st1 else round(st1 * 1.2, 3)
+        st3 = heads_x[2] if len(heads_x) > 2 and heads_x[2] > st2 else round(st1 * 1.5, 3)
+        rr0 = [round((t - entry) / risk_ps, 2) if risk_ps > 0 else 0 for t in (st1, st2, st3)]
+        rew0 = [round((t - entry) / entry * 100, 2) if entry > 0 else 0 for t in (st1, st2, st3)]
+        st.markdown("### 📊 خطة الدخول بعد السحب (الزناد تحقق)")
+        st.markdown(f'<div class="success-box">🌀 <b>مسح سيولة ثم استرداد:</b> ذيل تحت {r["support"]} وإغلاق فوقه عند {entry} (شمعة {sweep["date"]}) — الدخول بعد الاسترداد مباشرة، لا قبل</div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="plan-box"><table class="plan-table">
+        <tr><td><b>⚡ الدخول سوقاً عند الاسترداد</b></td><td style="color:#00b894"><b>${entry}</b></td><td>{shares0} سهم</td></tr>
+        <tr><td><b>🛡️ الوقف تحت قاع السحب</b></td><td style="color:#d63031"><b>${stop}</b></td><td>-{round(risk_ps/entry*100,1)}%</td></tr>
+        <tr><td><b>🎯 هدف 1 (33%)</b></td><td style="color:#00b894"><b>${st1}</b> (+{rew0[0]}%)</td><td>R:R 1:{rr0[0]}</td></tr>
+        <tr><td><b>🚀 هدف 2 (33%+Trailing)</b></td><td style="color:#0984e3"><b>${st2}</b> (+{rew0[1]}%)</td><td>R:R 1:{rr0[1]}</td></tr>
+        <tr><td><b>🌟 هدف 3 (الباقي)</b></td><td style="color:#6c5ce7"><b>${st3}</b> (+{rew0[2]}%)</td><td>R:R 1:{rr0[2]}</td></tr>
+        <tr><td><b>⚖️ المخاطرة القصوى</b></td><td style="color:#d63031">${round(max_risk0,2)}</td><td>{eff_risk0}%</td></tr>
+        </table></div>""", unsafe_allow_html=True)
+    elif sweep_wait:
+        sup0 = r["support"]
+        w1 = heads_x[0] if heads_x and heads_x[0] > r["price"] else r["resistance"]
+        w2 = heads_x[1] if len(heads_x) > 1 and heads_x[1] > w1 else round(w1 * 1.2, 3)
+        w3 = heads_x[2] if len(heads_x) > 2 and heads_x[2] > w2 else round(w1 * 1.5, 3)
+        st.markdown("### 📊 خطة الدخول: وضع انتظار الزناد")
+        st.markdown(f'<div class="warn-box">🌀 <b>نمط سحب السيولة:</b> المضارب لا يُصعد وفي حضنه ركّاب — <b>لا تضع طلبات قبل السحب</b>.<br>'
+                    f'⏳ <b>الزناد:</b> شمعة 4H ذيلها تحت <b>{sup0}</b> وإغلاقها فوقه.<br>'
+                    f'📌 إن تحقق: دخول سوقاً عند الإغلاق المسترد، وقف تحت قاع السحب ×0.97، أهداف: {w1} → {w2} → {w3}.<br>'
+                    f'🚫 إن أُغلق تحت {round(sup0*0.80,3)} بدون استرداد: السحب تحوّل انهياراً — لا شيء يُشترى.</div>', unsafe_allow_html=True)
+
+    # سلّم الطلبات يبقى لأنماط الثبات/التجميع فقط (يُخفى لأسهم السحب)
+    if r["support"] and r["resistance"] and not sweep and not sweep_wait:
         sup_val, res_val, current_price = r["support"], r["resistance"], r["price"]
         atr_val = atr(hist["High"], hist["Low"], hist["Close"], 14)
         trend = detect_trend_strength(hist)
@@ -1093,7 +1164,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         }
         trend_txt, trend_color = trend_map[trend]
 
-        st.markdown("### 📊 خطة التداول")
+        st.markdown("### 📊 خطة التداول (نمط الثبات)")
         st.markdown(f'<div style="background:{note_color}22;padding:15px;border-radius:10px;margin:10px 0;border:2px solid {note_color};text-align:center;font-size:18px;font-weight:bold">{note}</div>', unsafe_allow_html=True)
         st.markdown(f'<div style="background:{trend_color}15;padding:10px;border-radius:8px;margin:5px 0;border-right:4px solid {trend_color}"><b>📈 الاتجاه:</b> {trend_txt}</div>', unsafe_allow_html=True)
         if vol_flag:
@@ -1138,7 +1209,7 @@ with st.sidebar:
 
 tab1, tab2 = st.tabs(["📈 تحليل سهم", "🛰️ الرادار الموحد"])
 
-# ===== TAB 1: تحليل سهم + الدفتر =====
+# ===== TAB 1 =====
 with tab1:
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -1187,13 +1258,13 @@ with tab1:
             st.download_button("⬇️ تصدير CSV", jdf.to_csv(index=False).encode("utf-8-sig"),
                                file_name="faisal_journal.csv")
 
-# ===== TAB 2: الرادار الموحد بكل الفصائل + بوابة السيولة =====
+# ===== TAB 2 =====
 with tab2:
     st.markdown("### 🛰️ الرادار الموحد — مسح واحد، كل الفصائل")
     st.markdown(
         '<div class="filter-box"><b>فصائل ما قبل الانفجار:</b> ضغط RSI | تجميع/قاعدة | عدّاء سابق | سحب سيولة | W | تغطية فجوات | تقسيم عكسي | جس نبض | طرح جديد<br>'
-        '<b>بوابة السيولة:</b> سعر ≥ $1 + حجم ≥ 100K + قيمة تداول ≥ 150K + نبض حيوي خلال 60 يوم<br>'
-        '<b>جاهز دخول كامل =</b> معادلة مكتملة + نقاط ≥50 + داخل 15% من الدعم</div>',
+        '<b>بوابة السيولة:</b> سعر ≥ $1 + حجم ≥ 100K + قيمة تداول ≥ 150K + نبض حيوي<br>'
+        '<b>جاهز دخول كامل =</b> معادلة مكتملة + نقاط ≥50 + (داخل 15% من الدعم <b>أو</b> زناد سحب تحقق)</div>',
         unsafe_allow_html=True)
 
     if st.button("🛰️ امسح بالرادار الموحد", key="uni"):
@@ -1241,22 +1312,26 @@ with tab2:
                     continue
                 h4 = get_4h(s)
                 lad = build_red_ladder(h4)
+                sweep = detect_sweep_reclaim(h4, r["support"])
+                sweep_wait = sweep is None and sweep_mode_candidate(h4, h, r["support"], r["dist_sup"])
                 missing = []
                 if not (20 <= r["rsi"] <= 30): missing.append(f"RSI {r['rsi']} خارج 23-27")
                 if not r["macd_imp"]: missing.append("MACD لا يتحسن")
-                if not r["stability"]: missing.append("لا ثبات فوق الدعم")
+                if not r["stability"] and not sweep: missing.append("لا ثبات فوق الدعم")
                 near_support = r["dist_sup"] is not None and r["dist_sup"] <= 15
-                guide_ready = (not missing) and r["total"] >= 50 and near_support
+                guide_ready = (not missing) and r["total"] >= 50 and (near_support or bool(sweep))
                 tags = []
                 if phase and phase["phase_key"] in ("READY", "WATCH", "RETEST"):
                     tags.append(f"تقسيم: {PHASE_META[phase['phase_key']]} {phase['ratio']}")
                 if lad: tags.append(f"سلّم 4H: {len(lad['ladder'])} شموع")
                 if r["accum"]: tags.append("تجميع هادئ")
+                if sweep: tags.append("🌀 زناد السحب تحقق")
+                elif sweep_wait: tags.append("🌀 نمط سحب — انتظر الزناد")
                 results.append({"symbol": s, "total": r["total"], "rsi": r["rsi"],
                                 "guide_ready": guide_ready, "missing": missing,
                                 "support": r["support"], "dist_sup": r["dist_sup"],
                                 "rvol": r["rvol"], "tags": tags, "fam": fam,
-                                "phase": phase, "ladder": lad})
+                                "phase": phase, "ladder": lad, "sweep": sweep, "sweep_wait": sweep_wait})
             except Exception:
                 continue
         pg2.empty()
