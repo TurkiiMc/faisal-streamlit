@@ -237,10 +237,12 @@ def get_dynamic_universe(limit=500):
             tickers = [t.split(':')[-1] if ':' in t else t for t in tickers]
             tickers = list(dict.fromkeys(tickers))
             st.session_state[cache_key] = {"data": tickers, "ts": now}
+            st.session_state["universe_source"] = "TradingView"
             return tickers
     except Exception:
         pass
     st.session_state[cache_key] = {"data": FALLBACK_UNIVERSE, "ts": now}
+    st.session_state["universe_source"] = "قائمة احتياطية قديمة"
     return FALLBACK_UNIVERSE
 
 
@@ -880,6 +882,25 @@ def veto_reasons(r, news, offering):
 
 
 # ============================================================
+# ===== بوابة السيولة: لا أسهم زومبي (الدليل ص 7/38) =====
+# ============================================================
+def tradeability_veto(hist):
+    """السهم الميت لا يُتداول مهما كان شكله"""
+    price = float(hist["Close"].iloc[-1])
+    avg_vol = float(hist["Volume"].tail(20).mean())
+    max_vol = float(hist["Volume"].tail(60).max()) if len(hist) >= 60 else float(hist["Volume"].max())
+    if price < 1.0:
+        return f"سعر تحت $1 ({price:.3f}) — خطر شطب وسبريد قاتل"
+    if avg_vol < 100_000:
+        return f"متوسط حجم 20 يوم {int(avg_vol):,} أقل من 100K — سيولة ميتة"
+    if price * avg_vol < 150_000:
+        return f"قيمة التداول اليومي ${int(price * avg_vol):,} أقل من 150K — غير قابل للتنفيذ"
+    if max_vol < 200_000:
+        return "لا نشاط حيوي خلال 60 يوم — سهم زومبي"
+    return None
+
+
+# ============================================================
 # ===== فصائل ما قبل الانفجار (الدليل ص 9-68) =====
 # ============================================================
 def detect_families(hist, r):
@@ -891,7 +912,9 @@ def detect_families(hist, r):
     n = len(hist)
     if 20 <= r["rsi"] <= 30:
         fam.append("ضغط RSI")
-    vol_dry = n >= 30 and float(vol.tail(5).mean()) < float(vol.tail(30).mean()) * 0.5
+    # الجفاف يشترط أن يكون هناك حجمٌ حيوي يجفّ أصلاً (لا ينطبق على الميت)
+    vol_dry = n >= 30 and float(vol.tail(30).mean()) >= 100_000 \
+              and float(vol.tail(5).mean()) < float(vol.tail(30).mean()) * 0.5
     range_narrow = n >= 10 and (float(hist["High"].tail(10).max()) - float(hist["Low"].tail(10).min())) / price < 0.15
     if vol_dry and near_sup and (r["stability"] or range_narrow):
         fam.append("تجميع/قاعدة")
@@ -923,6 +946,11 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
 
     if r.get("hard_veto"):
         st.markdown(f'<div class="danger-box">🚫 <b>إقصاء فوري:</b> {" | ".join(veto_reasons(r, news, offering))} — لا تُتداول هذه الحالة</div>', unsafe_allow_html=True)
+        return
+
+    dead = tradeability_veto(hist)
+    if dead:
+        st.markdown(f'<div class="danger-box">🧟 <b>سهم غير قابل للتداول:</b> {dead}</div>', unsafe_allow_html=True)
         return
 
     live = get_realtime_price(sym)
@@ -1159,18 +1187,20 @@ with tab1:
             st.download_button("⬇️ تصدير CSV", jdf.to_csv(index=False).encode("utf-8-sig"),
                                file_name="faisal_journal.csv")
 
-# ===== TAB 2: الرادار الموحد بكل الفصائل =====
+# ===== TAB 2: الرادار الموحد بكل الفصائل + بوابة السيولة =====
 with tab2:
     st.markdown("### 🛰️ الرادار الموحد — مسح واحد، كل الفصائل")
     st.markdown(
         '<div class="filter-box"><b>فصائل ما قبل الانفجار:</b> ضغط RSI | تجميع/قاعدة | عدّاء سابق | سحب سيولة | W | تغطية فجوات | تقسيم عكسي | جس نبض | طرح جديد<br>'
-        '<b>القمع:</b> 300 سهم → فرز بالفصائل → فحص عميق (Finnhub + أخبار + SEC + 4H) → معادلة الدليل ص 65<br>'
+        '<b>بوابة السيولة:</b> سعر ≥ $1 + حجم ≥ 100K + قيمة تداول ≥ 150K + نبض حيوي خلال 60 يوم<br>'
         '<b>جاهز دخول كامل =</b> معادلة مكتملة + نقاط ≥50 + داخل 15% من الدعم</div>',
         unsafe_allow_html=True)
 
     if st.button("🛰️ امسح بالرادار الموحد", key="uni"):
         with st.spinner("تحميل القائمة..."):
             universe = get_dynamic_universe(limit=300)
+        if st.session_state.get("universe_source") != "TradingView":
+            st.warning("⚠️ المسح على القائمة الاحتياطية القديمة — بوابة السيولة ستفلتر الميت منها")
         pg = st.progress(0)
         raw = scan_parallel(universe, "6mo", progress_cb=lambda i, n: pg.progress(i / n))
         pg.empty()
@@ -1180,6 +1210,10 @@ with tab2:
             if src == "stooq":
                 continue
             try:
+                dead = tradeability_veto(h)
+                if dead:
+                    excluded.append({"symbol": s, "reason": dead})
+                    continue
                 cheap = score(s, h, {}, sps)
                 if cheap["hard_veto"]:
                     excluded.append({"symbol": s, "reason": " | ".join(veto_reasons(cheap, None, None)) or "إقصاء"})
@@ -1191,7 +1225,7 @@ with tab2:
                     stage1.append((s, h, sps, phase, fam))
             except Exception:
                 continue
-        st.info(f"🔎 {len(stage1)} سهم يحمل بصمة فصيلة — فحص عميق للناجين فقط")
+        st.info(f"🔎 {len(stage1)} سهم حي يحمل بصمة فصيلة — فحص عميق للناجين فقط")
 
         results = []
         pg2 = st.progress(0)
