@@ -22,7 +22,7 @@ ON_RENDER   = bool(os.environ.get("RENDER_SERVICE_NAME"))
 MARKET_CAP_MAX = 20_000_000
 FLOAT_MAX      = 5_000_000
 PRICE_MAX      = 5.0
-VOLUME_MIN     = 100_000
+VOLUME_MIN     = 50_000   # مخفّض لرؤية القواعد النائمة ذات النبضات
 
 MAX_WORKERS = 6
 LADDER_MIN_CANDLES = 2
@@ -882,7 +882,7 @@ def veto_reasons(r, news, offering):
 
 
 # ============================================================
-# ===== بوابة السيولة: لا أسهم زومبي =====
+# ===== بوابة السيولة: النائم ≠ الزومبي =====
 # ============================================================
 def tradeability_veto(hist):
     price = float(hist["Close"].iloc[-1])
@@ -890,12 +890,12 @@ def tradeability_veto(hist):
     max_vol = float(hist["Volume"].tail(60).max()) if len(hist) >= 60 else float(hist["Volume"].max())
     if price < 1.0:
         return f"سعر تحت $1 ({price:.3f}) — خطر شطب وسبريد قاتل"
-    if avg_vol < 100_000:
-        return f"متوسط حجم 20 يوم {int(avg_vol):,} أقل من 100K — سيولة ميتة"
-    if price * avg_vol < 150_000:
-        return f"قيمة التداول اليومي ${int(price * avg_vol):,} أقل من 150K — غير قابل للتنفيذ"
     if max_vol < 200_000:
         return "لا نشاط حيوي خلال 60 يوم — سهم زومبي"
+    if avg_vol < 50_000:
+        return f"سيولة ميتة: متوسط {int(avg_vol):,} حتى مع وجود نبضات"
+    if price * avg_vol < 75_000:
+        return f"قيمة التداول ${int(price * avg_vol):,} ضعيفة التنفيذ"
     return None
 
 
@@ -910,7 +910,7 @@ def detect_families(hist, r):
     n = len(hist)
     if 20 <= r["rsi"] <= 30:
         fam.append("ضغط RSI")
-    vol_dry = n >= 30 and float(vol.tail(30).mean()) >= 100_000 \
+    vol_dry = n >= 30 and float(vol.tail(30).mean()) >= 50_000 \
               and float(vol.tail(5).mean()) < float(vol.tail(30).mean()) * 0.5
     range_narrow = n >= 10 and (float(hist["High"].tail(10).max()) - float(hist["Low"].tail(10).min())) / price < 0.15
     if vol_dry and near_sup and (r["stability"] or range_narrow):
@@ -936,12 +936,24 @@ def detect_families(hist, r):
 
 
 # ============================================================
-# ===== زناد السحب (4H) =====
+# ===== زناد السحب (4H) — شموع مغلقة فقط =====
 # ============================================================
+def _us_market_open():
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+        mins = now.hour * 60 + now.minute
+        return now.weekday() < 5 and 570 <= mins < 960
+    except Exception:
+        return False
+
+
 def detect_sweep_reclaim(h4, support):
     """زناد الدخول: مسح سيولة ثم استرداد على 4H — ذيل تحت الدعم وإغلاق فوقه"""
     if h4 is None or len(h4) < 3 or not support:
         return None
+    if _us_market_open() and len(h4) > 3:
+        h4 = h4.iloc[:-1]   # الشمعة الجارية ليست حقيقة بعد
     last3 = h4.tail(3)
     for i in range(len(last3)):
         c = last3.iloc[i]
@@ -953,7 +965,6 @@ def detect_sweep_reclaim(h4, support):
 
 
 def sweep_mode_candidate(h4, hist, support, dist_sup):
-    """هل السهم من فصيلة السحب؟ قرب الدعم + بصمة ذيل تحت الدعم سابقاً"""
     if not support or dist_sup is None or dist_sup > 15:
         return False
     if h4 is not None and len(h4) >= 10:
@@ -979,7 +990,10 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
 
     live = get_realtime_price(sym)
     if live:
-        st.info(f"🟢 السعر اللحظي: ${live['price']:.3f} ({live.get('percent_change', 0):+.2f}%)")
+        chg = live.get("percent_change", 0)
+        if abs(chg) >= 25:
+            st.markdown(f'<div class="warn-box">⚡ <b>فجوة ≥25%:</b> حدث زخم جارٍ — مراقبة لا مطاردة (الدليل ص 5)</div>', unsafe_allow_html=True)
+        st.info(f"🟢 السعر اللحظي: ${live['price']:.3f} ({chg:+.2f}%)")
 
     fam = detect_families(hist, r)
     if fam:
@@ -1080,11 +1094,11 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         w3 = heads_x[2] if len(heads_x) > 2 and heads_x[2] > w2 else round(w1 * 1.5, 3)
         st.markdown("### 📊 خطة الدخول: وضع انتظار الزناد")
         st.markdown(f'<div class="warn-box">🌀 <b>نمط سحب السيولة:</b> المضارب لا يُصعد وفي حضنه ركّاب — <b>لا تضع طلبات قبل السحب</b>.<br>'
-                    f'⏳ <b>الزناد:</b> شمعة 4H ذيلها تحت <b>{sup0}</b> وإغلاقها فوقه.<br>'
+                    f'⏳ <b>الزناد:</b> شمعة 4H مغلقة ذيلها تحت <b>{sup0}</b> وإغلاقها فوقه.<br>'
                     f'📌 إن تحقق: دخول سوقاً عند الإغلاق المسترد، وقف تحت قاع السحب ×0.97، أهداف: {w1} → {w2} → {w3}.<br>'
                     f'🚫 إن أُغلق تحت {round(sup0*0.80,3)} بدون استرداد: السحب تحوّل انهياراً — لا شيء يُشترى.</div>', unsafe_allow_html=True)
 
-    # سلّم الطلبات يبقى لأنماط الثبات/التجميع فقط (يُخفى لأسهم السحب)
+    # سلّم الطلبات يبقى لأنماط الثبات/التجميع فقط
     if r["support"] and r["resistance"] and not sweep and not sweep_wait:
         sup_val, res_val, current_price = r["support"], r["resistance"], r["price"]
         atr_val = atr(hist["High"], hist["Low"], hist["Close"], 14)
@@ -1263,8 +1277,8 @@ with tab2:
     st.markdown("### 🛰️ الرادار الموحد — مسح واحد، كل الفصائل")
     st.markdown(
         '<div class="filter-box"><b>فصائل ما قبل الانفجار:</b> ضغط RSI | تجميع/قاعدة | عدّاء سابق | سحب سيولة | W | تغطية فجوات | تقسيم عكسي | جس نبض | طرح جديد<br>'
-        '<b>بوابة السيولة:</b> سعر ≥ $1 + حجم ≥ 100K + قيمة تداول ≥ 150K + نبض حيوي<br>'
-        '<b>جاهز دخول كامل =</b> معادلة مكتملة + نقاط ≥50 + (داخل 15% من الدعم <b>أو</b> زناد سحب تحقق)</div>',
+        '<b>بوابة السيولة:</b> سعر ≥ $1 + نبضة ≥ 200K/60يوم + متوسط ≥ 50K + قيمة ≥ 75K<br>'
+        '<b>جاهز دخول كامل =</b> معادلة مكتملة (ضغط RSI <i>أو</i> جفاف قاعدة) + نقاط ≥50 + (قرب الدعم <b>أو</b> زناد سحب) + بلا فجوة ≥25%</div>',
         unsafe_allow_html=True)
 
     if st.button("🛰️ امسح بالرادار الموحد", key="uni"):
@@ -1315,9 +1329,14 @@ with tab2:
                 sweep = detect_sweep_reclaim(h4, r["support"])
                 sweep_wait = sweep is None and sweep_mode_candidate(h4, h, r["support"], r["dist_sup"])
                 missing = []
-                if not (20 <= r["rsi"] <= 30): missing.append(f"RSI {r['rsi']} خارج 23-27")
-                if not r["macd_imp"]: missing.append("MACD لا يتحسن")
-                if not r["stability"] and not sweep: missing.append("لا ثبات فوق الدعم")
+                base_fam = "تجميع/قاعدة" in fam
+                macd_flat = abs(r["macd_hist"]) / max(r["price"], 0.01) < 0.005
+                if not (20 <= r["rsi"] <= 30) and not base_fam:
+                    missing.append(f"RSI {r['rsi']} خارج الضغط ولا قاعدة مسطحة")
+                if not (r["macd_imp"] or (base_fam and macd_flat)):
+                    missing.append("MACD لا يتحسن")
+                if not r["stability"] and not sweep:
+                    missing.append("لا ثبات فوق الدعم")
                 near_support = r["dist_sup"] is not None and r["dist_sup"] <= 15
                 guide_ready = (not missing) and r["total"] >= 50 and (near_support or bool(sweep))
                 tags = []
@@ -1327,6 +1346,11 @@ with tab2:
                 if r["accum"]: tags.append("تجميع هادئ")
                 if sweep: tags.append("🌀 زناد السحب تحقق")
                 elif sweep_wait: tags.append("🌀 نمط سحب — انتظر الزناد")
+                if guide_ready:
+                    lq = get_realtime_price(s)
+                    if lq and abs(lq.get("percent_change", 0)) >= 25:
+                        guide_ready = False
+                        tags.append("⚡ فجوة ≥25% — حدث زخم: مراقبة لا مطاردة")
                 results.append({"symbol": s, "total": r["total"], "rsi": r["rsi"],
                                 "guide_ready": guide_ready, "missing": missing,
                                 "support": r["support"], "dist_sup": r["dist_sup"],
