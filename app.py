@@ -24,7 +24,7 @@ FLOAT_MAX      = 5_000_000
 PRICE_MAX      = 5.0
 VOLUME_MIN     = 50_000   # مخفّض لرؤية القواعد النائمة ذات النبضات
 
-MAX_WORKERS = 6
+MAX_WORKERS = 12          # مضاعف للسرعة (لا تتجاوز 15 حمايةً للبروكسي)
 LADDER_MIN_CANDLES = 2
 MA_TOUCH_PCT = 3.0
 
@@ -269,32 +269,34 @@ def _metrics_uncached(symbol):
 
 
 def finnhub_metrics(symbol):
-    return _ttl(_f_store, _f_lock, symbol, 300, lambda: _metrics_uncached(symbol))
+    return _ttl(_f_store, _f_lock, symbol, 3600, lambda: _metrics_uncached(symbol))
+
+
+@st.cache_data(ttl=86400)
+def _sec_tickers_map():
+    """فهرس SEC يُنزّل مرة واحدة يومياً لكل التطبيق"""
+    try:
+        r = requests.get("https://www.sec.gov/files/company_tickers.json",
+                         headers={"User-Agent": "FaisalBot contact@example.com"}, timeout=15)
+        return {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in r.json().values()}
+    except Exception:
+        return {}
 
 
 def check_offering(symbol):
     try:
-        headers = {"User-Agent": "FaisalBot contact@example.com"}
-        r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=10)
-        if r.status_code != 200:
-            return {"has_offering": False}
-        cik = None
-        for v in r.json().values():
-            if v["ticker"].upper() == symbol.upper():
-                cik = str(v["cik_str"]).zfill(10)
-                break
+        cik = _sec_tickers_map().get(symbol.upper())
         if not cik:
             return {"has_offering": False}
         time.sleep(0.15)
-        r = requests.get("https://data.sec.gov/submissions/CIK" + cik + ".json", headers=headers, timeout=10)
+        r = requests.get("https://data.sec.gov/submissions/CIK" + cik + ".json",
+                         headers={"User-Agent": "FaisalBot contact@example.com"}, timeout=10)
         if r.status_code != 200:
             return {"has_offering": False}
         recent = r.json().get("filings", {}).get("recent", {})
-        forms = recent.get("form", [])
-        dates = recent.get("filingDate", [])
         cutoff = datetime.now() - timedelta(days=30)
         of = {"S-1", "S-3", "424B3", "424B5"}
-        for form, date_str in zip(forms, dates):
+        for form, date_str in zip(recent.get("form", []), recent.get("filingDate", [])):
             if form in of:
                 try:
                     fdate = datetime.strptime(date_str, "%Y-%m-%d")
@@ -314,7 +316,7 @@ POS_WORDS = ["approval", "approved", "contract", "award", "awarded", "partnershi
              "merger", "merger closed", "protocol", "strategic update",
              "regulation fd", "study initiation"]
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=1800)
 def check_news(symbol):
     base = {"has_negative": False, "items": [], "status": "no_key",
             "critical_count": 0, "offering_count": 0, "high_count": 0,
@@ -1094,7 +1096,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         w3 = heads_x[2] if len(heads_x) > 2 and heads_x[2] > w2 else round(w1 * 1.5, 3)
         st.markdown("### 📊 خطة الدخول: وضع انتظار الزناد")
         st.markdown(f'<div class="warn-box">🌀 <b>نمط سحب السيولة:</b> المضارب لا يُصعد وفي حضنه ركّاب — <b>لا تضع طلبات قبل السحب</b>.<br>'
-                    f'⏳ <b>الزناد:</b> شمعة 4H مغلقة ذيلها تحت <b>{sup0}</b> وإغلاقها فوقه.<br>'
+                    f'⏳ <b>الزناد:</b> شمعة 4H مغلقة ذيلها تحت <b>{round(sup0, 3)}</b> وإغلاقها فوقه.<br>'
                     f'📌 إن تحقق: دخول سوقاً عند الإغلاق المسترد، وقف تحت قاع السحب ×0.97، أهداف: {w1} → {w2} → {w3}.<br>'
                     f'🚫 إن أُغلق تحت {round(sup0*0.80,3)} بدون استرداد: السحب تحوّل انهياراً — لا شيء يُشترى.</div>', unsafe_allow_html=True)
 
@@ -1319,12 +1321,11 @@ with tab2:
             try:
                 inf = finnhub_metrics(s)
                 news = check_news(s)
-                off = check_offering(s)
-                r = score(s, h, inf, sps, news, offering=off)
+                r = score(s, h, inf, sps, news)
                 if r["hard_veto"]:
-                    excluded.append({"symbol": s, "reason": " | ".join(veto_reasons(r, news, off))})
+                    excluded.append({"symbol": s, "reason": " | ".join(veto_reasons(r, news, None))})
                     continue
-                h4 = get_4h(s)
+                h4 = get_4h(s) if (r["dist_sup"] is not None and r["dist_sup"] <= 20) else None
                 lad = build_red_ladder(h4)
                 sweep = detect_sweep_reclaim(h4, r["support"])
                 sweep_wait = sweep is None and sweep_mode_candidate(h4, h, r["support"], r["dist_sup"])
@@ -1346,6 +1347,12 @@ with tab2:
                 if r["accum"]: tags.append("تجميع هادئ")
                 if sweep: tags.append("🌀 زناد السحب تحقق")
                 elif sweep_wait: tags.append("🌀 نمط سحب — انتظر الزناد")
+                off = {"has_offering": False}
+                if guide_ready or r["total"] >= 55:
+                    off = check_offering(s)
+                    if off.get("has_offering"):
+                        excluded.append({"symbol": s, "reason": f"طرح SEC نشط ({off.get('form','?')})"})
+                        continue
                 if guide_ready:
                     lq = get_realtime_price(s)
                     if lq and abs(lq.get("percent_change", 0)) >= 25:
