@@ -145,11 +145,11 @@ def scan_parallel(symbols, period, progress_cb=None):
             s = futs[f]; done += 1
             if progress_cb:
                 try: progress_cb(done, total)
-                except: pass
+                except Exception: pass
             try:
                 hist, splits, src = f.result()
                 if not hist.empty and len(hist) >= 30: out.append((s, hist, splits, src))
-            except: pass
+            except Exception: pass
     return out
 
 @st.cache_data(ttl=60)
@@ -163,7 +163,7 @@ def get_realtime_price(symbol):
                 q = r.json()
                 if q.get("c", 0) > 0:
                     return {"price": float(q["c"]), "percent_change": float(q.get("dp", 0)), "source": "finnhub"}
-        except: pass
+        except Exception: pass
     return None
 
 def get_dynamic_universe(limit=500):
@@ -188,7 +188,7 @@ def get_dynamic_universe(limit=500):
             st.session_state[cache_key] = {"data": tickers, "ts": now}
             st.session_state["universe_source"] = "TradingView"
             return tickers
-    except: pass
+    except Exception: pass
     st.session_state[cache_key] = {"data": FALLBACK_UNIVERSE, "ts": now}
     st.session_state["universe_source"] = "قائمة احتياطية قديمة"
     return FALLBACK_UNIVERSE
@@ -209,7 +209,7 @@ def _metrics_uncached(symbol):
             info["sharesShort"] = m.get("sharesShort") or 0
             mc = m.get("marketCapitalization") or 0
             info["marketCap"] = mc * 1000000 if mc and mc < 100000 else mc
-    except: pass
+    except Exception: pass
     return info
 
 def finnhub_metrics(symbol):
@@ -221,7 +221,7 @@ def _sec_tickers_map():
         r = requests.get("https://www.sec.gov/files/company_tickers.json",
                          headers={"User-Agent": "FaisalBot contact@example.com"}, timeout=15)
         return {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in r.json().values()}
-    except: return {}
+    except Exception: return {}
 
 def check_offering(symbol):
     try:
@@ -240,9 +240,9 @@ def check_offering(symbol):
                     fdate = datetime.strptime(date_str, "%Y-%m-%d")
                     if fdate >= cutoff:
                         return {"has_offering": True, "form": form, "days": (datetime.now() - fdate).days}
-                except: continue
+                except Exception: continue
         return {"has_offering": False}
-    except: return {"has_offering": False}
+    except Exception: return {"has_offering": False}
 
 POS_WORDS = ["approval", "approved", "contract", "award", "awarded", "partnership",
              "patent", "license", "agreement", "acquisition", "positive results",
@@ -294,7 +294,7 @@ def check_news(symbol):
                     if kw in text: level, keyword = "MEDIUM", kw; break
             if level:
                 try: date_str = datetime.fromtimestamp(item.get("datetime", 0)).strftime("%Y-%m-%d")
-                except: date_str = "?"
+                except Exception: date_str = "?"
                 matches.append({"headline": head[:120], "source": item.get("source", "?"),
                                 "date": date_str, "level": level, "keyword": keyword, "url": item.get("url", "")})
         return {"has_negative": len(matches) > 0, "items": matches[:5], "status": "done",
@@ -302,7 +302,7 @@ def check_news(symbol):
                 "offering_count": sum(1 for m in matches if m["level"] == "OFFERING"),
                 "high_count": sum(1 for m in matches if m["level"] == "HIGH"),
                 "positive_count": len(pos_matches), "positive_items": pos_matches[:3]}
-    except: return base
+    except Exception: return base
 
 def atr(high, low, close, period=14):
     if len(close) < period + 1: return None
@@ -430,7 +430,7 @@ def detect_gap_fill(hist):
                     return {"direction": "down", "gap_price": round(curr_open, 3), "gap_pct": round(gap_pct, 1)}
                 elif gap_pct > 0 and current > curr_open:
                     return {"direction": "up", "gap_price": round(curr_open, 3), "gap_pct": round(gap_pct, 1)}
-        except: continue
+        except Exception: continue
     return None
 
 def detect_candle_patterns(hist):
@@ -448,7 +448,7 @@ def detect_candle_patterns(hist):
                 po, pc = hist["Open"].iloc[i - 1], hist["Close"].iloc[i - 1]
                 if pc < po and c > o and c > po and o < pc:
                     patterns.append("Bullish Engulfing")
-        except: continue
+        except Exception: continue
     return patterns if patterns else None
 
 def detect_reverse_split(splits, max_days=365):
@@ -462,7 +462,7 @@ def detect_reverse_split(splits, max_days=365):
                 den = int(sp.get("denominator", 1))
                 return {"has_split": num < den, "date": sp["date"],
                         "ratio": f"{num}:{den}", "days_since": (datetime.now() - sp_date).days}
-        except: continue
+        except Exception: continue
     return {"has_split": False, "days_since": 9999}
 
 def detect_stability(hist, support, min_sessions=2):
@@ -510,7 +510,7 @@ def count_reverse_splits(splits, months=36):
         try:
             d = datetime.strptime(sp["date"], "%Y-%m-%d")
             if d >= cutoff and int(sp.get("numerator", 1)) < int(sp.get("denominator", 1)): cnt += 1
-        except: continue
+        except Exception: continue
     return cnt
 
 def post_split_phase(symbol, hist, splits, min_days=10, max_days=90):
@@ -518,7 +518,7 @@ def post_split_phase(symbol, hist, splits, min_days=10, max_days=90):
     if not sp.get("has_split"): return None
     D, ratio = sp["days_since"], sp["ratio"]
     try: den = int(ratio.split(":")[1])
-    except: den = 10
+    except Exception: den = 10
     if den >= 20: min_days = max(min_days, 20)
     if den >= 50: min_days = max(min_days, 30)
     post = hist[hist.index >= pd.Timestamp(sp["date"])]
@@ -571,7 +571,7 @@ def get_4h(symbol):
                    Low=("Low", "min"), Close=("Close", "last"),
                    Volume=("Volume", "sum")).reset_index(drop=True)
         return h4.set_index("t").sort_index()
-    except: return None
+    except Exception: return None
 
 def build_red_ladder(h4):
     if h4 is None or len(h4) < 10: return None
@@ -726,14 +726,6 @@ def veto_reasons(r, news, offering):
 # ===== 🎯 وقود الشورت — محور نظرية الارتكاز =====
 # ============================================================
 def short_fuel(r):
-    """
-    فصيلتان:
-    🚀 وقود محشور (شورت عالي غير مُغطّى) = Short Squeeze محتمل
-    🧹 استنفاد الشورت (شورت مُغطّى فعلاً) = Post-Covering Rally — أكثر أماناً
-    ⛽ وقود متوسط
-    🎈 بلا وقود = تضخم حر بلا غطاء (خطر)
-    ❓ بيانات مفقودة = فحص يدوي مطلوب
-    """
     sp = r.get("short_pct") or 0
     sh = r.get("shares_short") or 0
     fl = r.get("float") or 0
@@ -746,9 +738,9 @@ def short_fuel(r):
     if eff >= 0.10:
         return "present", "⛽ وقود موجود 10-30% — ارتكاز كلاسيكي"
     if eff < 0.05 and r.get("runner"):
-        return "exhausted", "🧹 استنفاد الشورت — Former Runner مع شورت منخفض = Post-Covering Rally"
+        return "exhausted", "🧹 استنفاد الشورت — Former Runner بشورت منخفض = Post-Covering Rally"
     if eff < 0.10:
-        return "none", "🎈 بلا وقود <10% — تضخم حر بلا غطاء: لا ترتكز"
+        return "none", "🎈 بلا وقود <10% — تضخم حر بلا غطاء: لا تُطارد، ولا ترتكز"
     return "present", "⛽ وقود متوسط"
 
 def tradeability_veto(hist, splits=None):
@@ -787,6 +779,35 @@ def manipulator_script(hist):
                 "sweep_date": str(hist.index[sweep_idx[0]])[:10]}
     return None
 
+# ============================================================
+# ===== 🎯 الزناد الفني: ثلاثة اختراقات كلاسيكية =====
+# ============================================================
+def technical_trigger(hist, r):
+    """1) كسر عنق W | 2) اختراق رأس آخر شمعة هابطة قوية | 3) اختراق قمة القاعدة (كسر حديث)"""
+    triggers = []
+    price = r["price"]
+    wp = r.get("w_pattern")
+    if wp and price > wp["neckline"] * 1.01:
+        triggers.append(f"كسر عنق W عند {wp['neckline']}")
+    if len(hist) >= 10:
+        recent = hist.tail(10)
+        for i in range(len(recent) - 1, -1, -1):
+            c = recent.iloc[i]
+            o = float(c["Open"])
+            if o <= 0:
+                continue
+            drop = (float(c["Close"]) - o) / o * 100
+            if drop < -5:
+                head = float(c["High"])
+                if price > head * 1.01:
+                    triggers.append(f"اختراق رأس الشمعة الهابطة عند {round(head, 3)}")
+                break
+    if len(hist) >= 21:
+        base_high = float(hist["High"].iloc[-21:-1].max())
+        if base_high > 0 and price > base_high * 1.01 and (price - base_high) / base_high < 0.08:
+            triggers.append(f"اختراق قمة القاعدة عند {round(base_high, 3)}")
+    return triggers
+
 def detect_families(hist, r):
     fam = []
     vol = hist["Volume"]
@@ -813,7 +834,6 @@ def detect_families(hist, r):
     if r["stability"] and r["stability"].get("higher_lows") \
        and r["stability"]["sessions_held"] >= 2 and near_sup:
         fam.append("درج ثبات")
-    # 🎯 فصائل الشورت (وايكوف + إليوت + كلاسيكي)
     fuel_kind, _ = short_fuel(r)
     if fuel_kind == "packed": fam.append("🚀 وقود محشور (Squeeze)")
     elif fuel_kind == "exhausted": fam.append("🧹 استنفاد الشورت (Post-Covering)")
@@ -826,7 +846,7 @@ def _us_market_open():
         now = datetime.now(ZoneInfo("America/New_York"))
         mins = now.hour * 60 + now.minute
         return now.weekday() < 5 and 570 <= mins < 960
-    except: return False
+    except Exception: return False
 
 def detect_sweep_reclaim(h4, support):
     if h4 is None or len(h4) < 3 or not support: return None
@@ -869,7 +889,6 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     if fam:
         st.markdown(f'<div class="info-box">🧬 <b>فصيلة ما قبل الانفجار:</b> {" | ".join(fam)}</div>', unsafe_allow_html=True)
 
-    # 🎯 وقود الشورت — المحور
     fuel_kind, fuel_txt = short_fuel(r)
     fuel_color = {"packed": "#d63031", "exhausted": "#00b894", "present": "#0984e3",
                   "none": "#fdcb6e", "missing": "#636e72"}.get(fuel_kind, "#636e72")
@@ -878,6 +897,9 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     script = manipulator_script(hist)
     if script:
         st.markdown(f'<div class="success-box">🎭 <b>سيناريو المضارب مكتمل الترتيب:</b> قاعدة جافة → جس نبض {script["probe_date"]} → سحب/اختبار {script["sweep_date"]} عند {script["base_low"]} → استرداد</div>', unsafe_allow_html=True)
+    tech = technical_trigger(hist, r)
+    if tech:
+        st.markdown(f'<div class="success-box">🎯 <b>زناد فني تحقق:</b> {" | ".join(tech)} — الدخول بعد الثبات فوق المستوى المخترق، والوقف تحته</div>', unsafe_allow_html=True)
     if "درج ثبات" in fam:
         st.markdown(f'<div class="success-box">🪜 <b>درج ثبات:</b> جلستان متتاليتان بقيعان أعلى فوق الدعم</div>', unsafe_allow_html=True)
     if r.get("accum"):
@@ -1143,10 +1165,9 @@ with tab1:
 with tab2:
     st.markdown("### 🛰️ الرادار الموحد — نظرية الارتكاز (الشورت محوراً)")
     st.markdown(
-        '<div class="filter-box"><b>🎯 وقود الشورت:</b> 🚀 محشور ≥30% (Squeeze) | 🧹 استنفاد (Post-Covering) | ⛽ متوسط | 🎈 بلا وقود<br>'
-        '<b>المدارس الثلاث:</b> وايكوف (ضغط/سبرينغ) + إليوت (موجات تصحيحية) + كلاسيكي (دعم/مقاومة)<br>'
-        '<b>الجاهزية تشترط:</b> وقوداً (محشوراً/موجوداً/مستنفَداً) + نقاط ≥50 + (قرب الدعم أو زناد سحب) + بلا فجوة ≥25%<br>'
-        '<b>⚠️ بلا وقود:</b> تضخم حر بلا غطاء — لا ترتكز ولا تُطارد</div>',
+        '<div class="filter-box"><b>🎯 وقود الشورت:</b> 🚀 محشور ≥30% | 🧹 استنفاد | ⛽ متوسط | 🎈 بلا وقود<br>'
+        '<b>🎯 الزناد الفني:</b> كسر عنق W | اختراق رأس شمعة هابطة قوية | اختراق قمة القاعدة (كسر حديث ≤8%)<br>'
+        '<b>الجاهزية =</b> وقود مقبول + معادلة مكتملة + نقاط ≥50 + (قرب الدعم <b>أو</b> زناد سحب <b>أو</b> زناد فني) + بلا فجوة ≥25%</div>',
         unsafe_allow_html=True)
 
     if st.button("🛰️ امسح بالرادار الموحد", key="uni"):
@@ -1173,7 +1194,7 @@ with tab2:
                 phase_ok = phase and phase["phase_key"] in ("READY", "WATCH", "RETEST", "PROOF")
                 if fam or phase_ok or cheap["rsi"] <= 35:
                     stage1.append((s, h, sps, phase, fam))
-            except: continue
+            except Exception: continue
         st.info(f"🔎 {len(stage1)} سهم حي يحمل بصمة فصيلة")
 
         results = []
@@ -1191,6 +1212,7 @@ with tab2:
                 lad = build_red_ladder(h4)
                 sweep = detect_sweep_reclaim(h4, r["support"])
                 sweep_wait = sweep is None and sweep_mode_candidate(h4, h, r["support"], r["dist_sup"])
+                tech = technical_trigger(h, r)
                 missing = []
                 base_fam = ("تجميع/قاعدة" in fam) or ("سيناريو المضارب" in fam) or ("درج ثبات" in fam)
                 macd_flat = abs(r["macd_hist"]) / max(r["price"], 0.01) < 0.005
@@ -1198,12 +1220,11 @@ with tab2:
                     missing.append(f"RSI {r['rsi']} خارج الضغط ولا قاعدة/درج")
                 if not (r["macd_imp"] or (base_fam and macd_flat)):
                     missing.append("MACD لا يتحسن")
-                if not r["stability"] and not sweep and not ("سيناريو المضارب" in fam) and not ("درج ثبات" in fam):
+                if not r["stability"] and not sweep and not tech and not ("سيناريو المضارب" in fam) and not ("درج ثبات" in fam):
                     missing.append("لا ثبات فوق الدعم")
                 near_support = r["dist_sup"] is not None and r["dist_sup"] <= 15
-                # 🎯 الشورت شرط للجاهزية (ما عدا missing الذي يُفحص يدوياً)
                 fuel_ok = fuel_kind in ("packed", "present", "exhausted", "missing")
-                guide_ready = fuel_ok and (not missing) and r["total"] >= 50 and (near_support or bool(sweep))
+                guide_ready = fuel_ok and (not missing) and r["total"] >= 50 and (near_support or bool(sweep) or bool(tech))
                 tags = []
                 if phase and phase["phase_key"] in ("READY", "WATCH", "RETEST"):
                     tags.append(f"تقسيم: {PHASE_META[phase['phase_key']]} {phase['ratio']}")
@@ -1215,9 +1236,10 @@ with tab2:
                 elif "🧹 استنفاد الشورت (Post-Covering)" in fam: tags.append("🧹 استنفاد الشورت")
                 elif "⛽ وقود متوسط" in fam: tags.append("⛽ وقود متوسط")
                 if fuel_kind == "none": tags.append("🎈 بلا وقود")
+                if tech: tags.append("🎯 زناد فني")
                 if sweep: tags.append("🌀 زناد السحب تحقق")
                 elif sweep_wait: tags.append("🌀 نمط سحب — انتظر الزناد")
-                if not fuel_ok and fuel_kind == "none":
+                if fuel_kind == "none":
                     missing.append("🎈 بلا وقود شورت — تضخم حر بلا غطاء")
                 off = {"has_offering": False}
                 if guide_ready or r["total"] >= 55:
@@ -1234,11 +1256,10 @@ with tab2:
                                 "support": r["support"], "dist_sup": r["dist_sup"],
                                 "rvol": r["rvol"], "tags": tags, "fam": fam,
                                 "phase": phase, "ladder": lad, "sweep": sweep, "sweep_wait": sweep_wait,
-                                "fuel_kind": fuel_kind, "fuel_txt": fuel_txt,
+                                "tech": tech, "fuel_kind": fuel_kind, "fuel_txt": fuel_txt,
                                 "short_pct": r["short_pct"], "shares_short": r["shares_short"]})
-            except: continue
+            except Exception: continue
         pg2.empty()
-        # ترتيب: 🚀 أولاً، ثم 🧹، ثم ⛽، ثم ⏳
         fuel_order = {"packed": 0, "exhausted": 1, "present": 2, "missing": 3, "none": 4}
         results.sort(key=lambda x: (not x["guide_ready"], fuel_order.get(x["fuel_kind"], 5), -x["total"]))
         st.session_state["uni_results"] = results
@@ -1274,6 +1295,8 @@ with tab2:
             sp_display = round((x["short_pct"] or 0) * 100, 2)
             with st.expander(f"{badge} {fuel_emoji} **{x['symbol']}** — {x['total']}/100 | 🧬 {fam_txt} | RSI {x['rsi']} | شورت {sp_display}%"):
                 st.markdown(f'<div class="info-box">🎯 <b>{x["fuel_txt"]}</b></div>', unsafe_allow_html=True)
+                if x.get("tech"):
+                    st.markdown(f'<div class="success-box">🎯 <b>زناد فني تحقق:</b> {" | ".join(x["tech"])} — الدخول بعد الثبات فوق المستوى، والوقف تحته</div>', unsafe_allow_html=True)
                 if x["fam"]:
                     st.markdown(f'<div class="info-box">🧬 <b>فصيلة ما قبل الانفجار:</b> {" | ".join(x["fam"])}</div>', unsafe_allow_html=True)
                 if x["tags"]:
