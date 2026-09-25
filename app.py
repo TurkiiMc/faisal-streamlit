@@ -14,7 +14,6 @@ st.set_page_config(page_title="Stock Screener Pro", page_icon="🎯", layout="wi
 
 PROXY_URL   = os.environ.get("PROXY_URL", "https://faisal-proxy.onrender.com").rstrip("/")
 FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")
-FMP_KEY     = os.environ.get("FMP_KEY", "")
 ON_RENDER   = bool(os.environ.get("RENDER_SERVICE_NAME"))
 
 MARKET_CAP_MAX = 20_000_000
@@ -152,32 +151,46 @@ def get_realtime_price(symbol):
     return None
 
 # ============================================================
-# ===== الكون الحي: FMP مصدراً وحيداً =====
+# ===== الكون الحي الآلي: قوائم Yahoo الجاهزة =====
 # ============================================================
-def fmp_universe(limit=500):
-    """طلب واحد لكل مسح: NASDAQ + كاب ≤20M + سعر 0.5-5 + حجم ≥50K"""
-    if not FMP_KEY:
-        st.session_state["universe_error"] = "FMP_KEY غير مضبوط في البيئة"
-        return []
-    try:
-        r = requests.get("https://financialmodelingprep.com/api/v3/stock_screener",
-                         params={"exchange": "NASDAQ",
-                                 "marketCapLowerThan": MARKET_CAP_MAX,
-                                 "priceMoreThan": 0.5,
-                                 "priceLowerThan": PRICE_MAX,
-                                 "volumeMoreThan": VOLUME_MIN,
-                                 "limit": limit,
-                                 "apikey": FMP_KEY}, timeout=25)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list):
-                syms = [x.get("symbol") for x in data if x.get("symbol")]
-                if syms:
-                    return syms
-        st.session_state["universe_error"] = f"FMP HTTP {r.status_code}"
-    except Exception as e:
-        st.session_state["universe_error"] = f"FMP {type(e).__name__}: {e}"
-    return []
+YAHOO_SCREENS = ["aggressive_small_caps", "conservative_small_caps",
+                 "undervalued_small_caps", "small_cap_gainers", "most_shorted_stocks"]
+
+def yahoo_universe(limit=500):
+    """كون حي مجاني: 5 قوائم Yahoo + فلاتر المنهجية تُطبق محلياً + crumb ذكي عند الحاجة"""
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    crumb = None
+    out = []
+    for scr in YAHOO_SCREENS:
+        try:
+            url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+            params = {"scrIds": scr, "count": 250}
+            r = sess.get(url, params=params, timeout=20)
+            if r.status_code in (401, 403) and not crumb:
+                sess.get("https://fc.yahoo.com", timeout=20)
+                rc = sess.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=20)
+                if rc.status_code == 200 and rc.text and len(rc.text.strip()) < 30:
+                    crumb = rc.text.strip()
+                if crumb:
+                    params["crumb"] = crumb
+                    r = sess.get(url, params=params, timeout=20)
+            if r.status_code != 200:
+                st.session_state["universe_error"] = f"Yahoo {scr}: HTTP {r.status_code}"
+                continue
+            for q in r.json().get("quotes", []):
+                sym = q.get("symbol")
+                price = q.get("regularMarketPrice") or 0
+                vol = q.get("regularMarketVolume") or 0
+                cap = q.get("marketCap") or 0
+                if not sym: continue
+                if price and not (0.5 <= price <= PRICE_MAX): continue
+                if vol and vol < VOLUME_MIN: continue
+                if cap and cap > MARKET_CAP_MAX: continue
+                out.append(sym)
+        except Exception as e:
+            st.session_state["universe_error"] = f"Yahoo {scr}: {type(e).__name__}"
+    return list(dict.fromkeys(out))[:limit]
 
 def get_dynamic_universe(limit=500):
     cache_key = f"universe_{limit}"
@@ -185,11 +198,11 @@ def get_dynamic_universe(limit=500):
     now = datetime.now().timestamp()
     cache = st.session_state[cache_key]
     if cache["data"] and (now - cache["ts"]) < 3600: return cache["data"]
-    fmp = fmp_universe(limit)
-    if fmp:
-        st.session_state[cache_key] = {"data": fmp, "ts": now}
-        st.session_state["universe_source"] = "FMP"
-        return fmp
+    yu = yahoo_universe(limit)
+    if yu:
+        st.session_state[cache_key] = {"data": yu, "ts": now}
+        st.session_state["universe_source"] = "Yahoo Live"
+        return yu
     st.session_state["universe_source"] = "لا مصدر حي"
     return []
 
@@ -916,7 +929,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         st.markdown(f'<div class="success-box">🎯 <b>زناد فني تحقق:</b> {" | ".join(tech)} — الدخول بعد الثبات فوق المستوى المخترق، والوقف تحته</div>', unsafe_allow_html=True)
     gwt = geometric_wash_target(hist, splits)
     if gwt:
-        st.markdown(f'<div class="warn-box">📐 <b>قاعدة MWC:</b> أعلى شمعة بعد التقسيم {gwt["target"]} ÷2 — {gwt["status"]}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="warn-box">📐 <b>قاعدة MWC:</b> هدف الغسل ${gwt["target"]} — {gwt["status"]}</div>', unsafe_allow_html=True)
     if "درج ثبات" in fam:
         st.markdown(f'<div class="success-box">🪜 <b>درج ثبات:</b> جلستان متتاليتان بقيعان أعلى فوق الدعم</div>', unsafe_allow_html=True)
     if r.get("accum"):
@@ -1124,7 +1137,6 @@ with st.sidebar:
     risk_percent = st.slider("نسبة المخاطرة (%)", 0.5, 5.0, 2.0, 0.5)
     st.markdown("### 🔌 المصادر")
     st.markdown(f"**Finnhub:** {'🟢' if FINNHUB_KEY else '🔴'}")
-    st.markdown(f"**FMP:** {'🟢' if FMP_KEY else '🔴'}")
     st.markdown(f"**Proxy:** {'🟢' if PROXY_URL else '🔴'}")
 
 tab1, tab2 = st.tabs(["📈 تحليل سهم", "🛰️ الرادار الموحد"])
@@ -1181,7 +1193,7 @@ with tab1:
 with tab2:
     st.markdown("### 🛰️ الرادار الموحد — نظرية الارتكاز (الشورت محوراً)")
     st.markdown(
-        '<div class="filter-box"><b>🌐 الكون:</b> FMP حي (NASDAQ ≤20M / 0.5-5$ / حجم ≥50K) + رموزك المكتشفة + دفترك + الإضافي<br>'
+        '<div class="filter-box"><b>🌐 الكون:</b> Yahoo Live آلياً (5 قوائم حية + فلاتر المنهجية) + رموزك المكتشفة + دفترك + الإضافي<br>'
         '<b>🎯 وقود الشورت:</b> 🚀 محشور ≥30% | 🧹 استنفاد | ⛽ متوسط | 🎈 بلا وقود<br>'
         '<b>🎯 الزناد الفني:</b> كسر عنق W | اختراق رأس شمعة هابطة قوية | اختراق قمة القاعدة (كسر حديث ≤8%)<br>'
         '<b>الجاهزية =</b> وقود مقبول + معادلة مكتملة + نقاط ≥50 + (قرب الدعم <b>أو</b> زناد سحب <b>أو</b> زناد فني) + بلا فجوة ≥25%</div>',
@@ -1196,10 +1208,10 @@ with tab2:
         universe = list(dict.fromkeys(universe + [s for s in grown if s]))
         if extra.strip():
             universe = list(dict.fromkeys([u.strip().upper() for u in extra.split(",") if u.strip()] + universe))
-        if st.session_state.get("universe_source") != "FMP":
-            st.warning(f"⚠️ فشل المصدر الحي FMP: {st.session_state.get('universe_error', 'غير معروف')} — المسح على قائمتك الذاتية فقط ({len(universe)} رمز)")
+        if st.session_state.get("universe_source") != "Yahoo Live":
+            st.warning(f"⚠️ فشل المصدر الحي Yahoo: {st.session_state.get('universe_error', 'غير معروف')} — المسح على قائمتك الذاتية فقط ({len(universe)} رمز)")
         if not universe:
-            st.error("❌ لا كون للمسح: FMP متوقف وقائمتك الذاتية فارغة — أضف رموزاً في الحقل أعلاه ثم أعد المسح")
+            st.error("❌ لا كون للمسح: Yahoo متوقف وقائمتك الذاتية فارغة — أضف رموزاً في الحقل أعلاه ثم أعد المسح")
         else:
             pg = st.progress(0)
             raw = scan_parallel(universe, "6mo", progress_cb=lambda i, n: pg.progress(i / n))
@@ -1220,7 +1232,7 @@ with tab2:
                     phase_ok = phase and phase["phase_key"] in ("READY", "WATCH", "RETEST", "PROOF")
                     if fam or phase_ok or cheap["rsi"] <= 35:
                         stage1.append((s, h, sps, phase, fam))
-                except Exception: continue
+            except Exception: continue
             st.info(f"🔎 {len(stage1)} سهم حي يحمل بصمة فصيلة")
 
             results = []
