@@ -14,6 +14,7 @@ st.set_page_config(page_title="Stock Screener Pro", page_icon="🎯", layout="wi
 
 PROXY_URL   = os.environ.get("PROXY_URL", "https://faisal-proxy.onrender.com").rstrip("/")
 FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")
+FMP_KEY     = os.environ.get("FMP_KEY", "")
 ON_RENDER   = bool(os.environ.get("RENDER_SERVICE_NAME"))
 
 MARKET_CAP_MAX = 20_000_000
@@ -57,22 +58,6 @@ st.markdown("""<style>
 .plan-table{width:100%;border-collapse:collapse;margin-top:10px}
 .plan-table td{padding:8px;border-bottom:1px solid #d0e4f5;font-size:16px}
 </style>""", unsafe_allow_html=True)
-
-FALLBACK_UNIVERSE = [
-    "AEMD","AKAN","LFS","GDHG","BJDX","DXST","VSME","CLIK","DGHG","CPOP",
-    "HTCR","MBRX","MWC","NXTS","SVRE","YYAI","BFRG","BIAF","BNKK","CDTG",
-    "SHPH","SONN","TNXP","PHIO","SNPX","AVGR","BDRX","BIOR","CLRB","CRKN",
-    "CYTX","DTSS","EEIQ","ELAB","EVGN","EYEN","FWBI","GCTK","GNPX","HCDI",
-    "HILS","HOTH","IMCC","INBS","INDP","IPDN","IVDA","JWEL","KITT","KRKR",
-    "LGMK","LGVN","LUCY","LUXH","MEGL","MLGO","MNPR","MRIN","MTNB","MYNZ",
-    "NEXI","NITO","NKGN","NUKK","NVOS","OMQS","ONCO","OPGN","OPTT","PAVM",
-    "PHGE","PLRX","PMN","PRFX","PRST","PXMD","QNRX","RDHL","RIME","RKDA",
-    "RSLS","SBFM","SCPX","SEEL","SGBX","SLXN","SNDL","SOBR","SPRB","STAF",
-    "STI","SXTP","SYRA","TCON","TCRT","THMO","TIVC","TNON","TOMZ","TRNR",
-    "TRVN","TSBX","UPC","USEG","VBIV","VERO","VINO","VIRI","VRPX","VTVT",
-    "WATT","WISA","WKEY","XELB","XERS","XLO","XRTX","YCBD","ZAPP","ZCMD",
-    "ZJYL","SOPA","PRSO","ELYM","ALLR","AGRI","ALZN","AMST","APRE","AUID"
-]
 
 _c_store, _c_lock = {}, threading.Lock()
 _f_store, _f_lock = {}, threading.Lock()
@@ -166,43 +151,47 @@ def get_realtime_price(symbol):
         except Exception: pass
     return None
 
+# ============================================================
+# ===== الكون الحي: FMP مصدراً وحيداً =====
+# ============================================================
+def fmp_universe(limit=500):
+    """طلب واحد لكل مسح: NASDAQ + كاب ≤20M + سعر 0.5-5 + حجم ≥50K"""
+    if not FMP_KEY:
+        st.session_state["universe_error"] = "FMP_KEY غير مضبوط في البيئة"
+        return []
+    try:
+        r = requests.get("https://financialmodelingprep.com/api/v3/stock_screener",
+                         params={"exchange": "NASDAQ",
+                                 "marketCapLowerThan": MARKET_CAP_MAX,
+                                 "priceMoreThan": 0.5,
+                                 "priceLowerThan": PRICE_MAX,
+                                 "volumeMoreThan": VOLUME_MIN,
+                                 "limit": limit,
+                                 "apikey": FMP_KEY}, timeout=25)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list):
+                syms = [x.get("symbol") for x in data if x.get("symbol")]
+                if syms:
+                    return syms
+        st.session_state["universe_error"] = f"FMP HTTP {r.status_code}"
+    except Exception as e:
+        st.session_state["universe_error"] = f"FMP {type(e).__name__}: {e}"
+    return []
+
 def get_dynamic_universe(limit=500):
     cache_key = f"universe_{limit}"
     if cache_key not in st.session_state: st.session_state[cache_key] = {"data": None, "ts": 0}
     now = datetime.now().timestamp()
     cache = st.session_state[cache_key]
     if cache["data"] and (now - cache["ts"]) < 3600: return cache["data"]
-    try:
-        from tradingview_screener import Query, col
-        q = (Query()
-             .select('name', 'close', 'volume', 'market_cap_basic', 'float_shares')
-             .where(col('exchange') == 'NASDAQ', col('market_cap_basic') <= MARKET_CAP_MAX,
-                    col('float_shares') < FLOAT_MAX, col('close') < PRICE_MAX,
-                    col('volume') > VOLUME_MIN, col('type') == 'stock')
-             .order_by('market_cap_basic', ascending=True).limit(limit))
-        out = q.get_scanner_data()
-        df = None
-        if isinstance(out, pd.DataFrame):
-            df = out
-        elif isinstance(out, tuple):
-            for item in out:
-                if isinstance(item, pd.DataFrame):
-                    df = item
-                    break
-        if df is None or df.empty:
-            st.session_state["universe_error"] = "استجابة TradingView بلا جدول — حظر IP أو تغيير واجهة"
-        if df is not None and not df.empty:
-            tickers = df['ticker'].tolist() if 'ticker' in df.columns else df['name'].tolist()
-            tickers = [t.split(':')[-1] if ':' in t else t for t in tickers]
-            tickers = list(dict.fromkeys(tickers))
-            st.session_state[cache_key] = {"data": tickers, "ts": now}
-            st.session_state["universe_source"] = "TradingView"
-            return tickers
-    except Exception as e:
-        st.session_state["universe_error"] = f"{type(e).__name__}: {e}"
-    st.session_state[cache_key] = {"data": FALLBACK_UNIVERSE, "ts": now}
-    st.session_state["universe_source"] = "قائمة احتياطية قديمة"
-    return FALLBACK_UNIVERSE
+    fmp = fmp_universe(limit)
+    if fmp:
+        st.session_state[cache_key] = {"data": fmp, "ts": now}
+        st.session_state["universe_source"] = "FMP"
+        return fmp
+    st.session_state["universe_source"] = "لا مصدر حي"
+    return []
 
 def _metrics_uncached(symbol):
     info = {"floatShares": 0, "shortPercentOfFloat": 0, "sharesShort": 0, "marketCap": 0}
@@ -384,12 +373,32 @@ def selling_volume_drying(hist):
     prior = float(down["Volume"].iloc[-6:-3].mean())
     return prior > 0 and recent < prior * 0.7
 
-def geometric_wash_target(hist):
-    if not (30 <= len(hist) <= 260): return None
-    first_low = float(hist["Low"].head(20).min())
-    current = float(hist["Close"].iloc[-1])
-    if first_low > 0 and current < first_low * 0.999: return round(first_low * 0.5, 3)
-    return None
+def geometric_wash_target(hist, splits=None):
+    """قاعدة MWC الصحيحة: أعلى شمعة بعد التقسيم ÷ 2 + انتظار شهر"""
+    if not splits: return None
+    sp = detect_reverse_split(splits, max_days=365)
+    if not sp.get("has_split"): return None
+    post_split = hist[hist.index >= pd.Timestamp(sp["date"])]
+    if len(post_split) < 5: return None
+    peak = float(post_split["High"].max())
+    target = round(peak / 2, 3)
+    days_since_split = sp["days_since"]
+    if days_since_split < 30:
+        return {"target": target, "reached": False,
+                "status": f"⏳ انتظر {30 - days_since_split} يوم بعد التقسيم"}
+    min_since = float(post_split["Low"].min())
+    reached = min_since <= target
+    if reached:
+        first_below = post_split[post_split["Low"] <= target]
+        if len(first_below) > 0:
+            days_since_target = (datetime.now() - first_below.index[0]).days
+            if days_since_target >= 30:
+                return {"target": target, "reached": True,
+                        "status": "✅ اكتمل الغسل + شهر — ابدأ المراقبة"}
+            return {"target": target, "reached": True,
+                    "status": f"⏳ اكتمل الغسل، انتظر {30 - days_since_target} يوم"}
+        return {"target": target, "reached": True, "status": "وصل لهدف الغسل"}
+    return {"target": target, "reached": False, "status": "لم يصل لهدف الغسل بعد"}
 
 def detect_former_runner(hist):
     if len(hist) < 20: return False
@@ -698,7 +707,8 @@ def score(symbol, hist, info, splits=None, news=None, offering=None):
 
     failed_spike = detect_failed_spike(hist)
     distribution = detect_distribution(hist)
-    hard_veto = support_broken or bool(failed_spike) or distribution
+    bull_trap = detect_bull_trap(hist)
+    hard_veto = support_broken or bool(failed_spike) or distribution or bull_trap
     if news and news.get("critical_count", 0) > 0: hard_veto = True
     if offering and offering.get("has_offering"): hard_veto = True
 
@@ -719,7 +729,7 @@ def score(symbol, hist, info, splits=None, news=None, offering=None):
         "rebound": rebound, "split_info": split_info, "stability": stability,
         "accum": accum, "distribution": distribution,
         "sweep": detect_liquidity_sweep(hist), "w_pattern": w_pat, "runner": is_runner,
-        "bull_trapering": detect_bull_trap(hist), "failed_spike": failed_spike,
+        "bull_trapering": bull_trap, "failed_spike": failed_spike,
         "gap": detect_gap_fill(hist), "candles": detect_candle_patterns(hist),
         "support_broken": support_broken, "hard_veto": hard_veto,
     }
@@ -729,6 +739,7 @@ def veto_reasons(r, news, offering):
     if r.get("support_broken"): reasons.append("الدعم مكسور")
     if r.get("failed_spike"): reasons.append("Failed Spike")
     if r.get("distribution"): reasons.append("تصريف")
+    if r.get("bull_trapering"): reasons.append("Bull Trap")
     if news and news.get("critical_count", 0) > 0: reasons.append("أخبار حرجة")
     if offering and offering.get("has_offering"): reasons.append("طرح SEC")
     return reasons
@@ -903,15 +914,15 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     tech = technical_trigger(hist, r)
     if tech:
         st.markdown(f'<div class="success-box">🎯 <b>زناد فني تحقق:</b> {" | ".join(tech)} — الدخول بعد الثبات فوق المستوى المخترق، والوقف تحته</div>', unsafe_allow_html=True)
+    gwt = geometric_wash_target(hist, splits)
+    if gwt:
+        st.markdown(f'<div class="warn-box">📐 <b>قاعدة MWC:</b> أعلى شمعة بعد التقسيم {gwt["target"]} ÷2 — {gwt["status"]}</div>', unsafe_allow_html=True)
     if "درج ثبات" in fam:
         st.markdown(f'<div class="success-box">🪜 <b>درج ثبات:</b> جلستان متتاليتان بقيعان أعلى فوق الدعم</div>', unsafe_allow_html=True)
     if r.get("accum"):
         st.markdown('<div class="success-box">🤫 <b>تجميع هادئ:</b> فوليوم الهبوط يتناقص والسعر متماسك</div>', unsafe_allow_html=True)
     if news and news.get("positive_count", 0) > 0:
         st.markdown(f'<div class="success-box">📰 <b>محفز إيجابي:</b> {news["positive_count"]} خبر</div>', unsafe_allow_html=True)
-    gwt = geometric_wash_target(hist)
-    if gwt:
-        st.markdown(f'<div class="warn-box">📐 <b>قاعدة MWC:</b> القاع الأول مكسور → هدف الغسل ${gwt}</div>', unsafe_allow_html=True)
     if news.get("items"):
         st.markdown("#### 📰 آخر الأخبار السلبية")
         for item in news["items"]:
@@ -926,7 +937,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     elif r["support"]:
         st.markdown('<div class="warn-box">⚠️ <b>الثبات:</b> أقل من جلستين فوق الدعم - انتظر</div>', unsafe_allow_html=True)
     if r["bull_trapering"]:
-        st.markdown('<div class="danger-box">Bull Trap: كسر مقاومة ثم فشل</div>', unsafe_allow_html=True)
+        st.markdown('<div class="danger-box">Bull Trap: كسر مقاومة ثم فشل — اشترِ الثبات لا الاختراق</div>', unsafe_allow_html=True)
     if r["split_info"].get("has_split"):
         d = r["split_info"]["days_since"]
         st.markdown(f'<div class="split-box">Reverse Split: {r["split_info"]["ratio"]} - قبل {d} يوم</div>', unsafe_allow_html=True)
@@ -1113,6 +1124,7 @@ with st.sidebar:
     risk_percent = st.slider("نسبة المخاطرة (%)", 0.5, 5.0, 2.0, 0.5)
     st.markdown("### 🔌 المصادر")
     st.markdown(f"**Finnhub:** {'🟢' if FINNHUB_KEY else '🔴'}")
+    st.markdown(f"**FMP:** {'🟢' if FMP_KEY else '🔴'}")
     st.markdown(f"**Proxy:** {'🟢' if PROXY_URL else '🔴'}")
 
 tab1, tab2 = st.tabs(["📈 تحليل سهم", "🛰️ الرادار الموحد"])
@@ -1129,6 +1141,7 @@ with tab1:
             if hist.empty: st.error("❌ لا بيانات لـ " + sym)
             else:
                 st.success(f"✅ المصدر: **{source}** ({len(hist)} شمعة)")
+                st.session_state.setdefault("discovered", set()).add(sym)
                 info = finnhub_metrics(sym)
                 offering = check_offering(sym)
                 news = check_news(sym)
@@ -1168,7 +1181,8 @@ with tab1:
 with tab2:
     st.markdown("### 🛰️ الرادار الموحد — نظرية الارتكاز (الشورت محوراً)")
     st.markdown(
-        '<div class="filter-box"><b>🎯 وقود الشورت:</b> 🚀 محشور ≥30% | 🧹 استنفاد | ⛽ متوسط | 🎈 بلا وقود<br>'
+        '<div class="filter-box"><b>🌐 الكون:</b> FMP حي (NASDAQ ≤20M / 0.5-5$ / حجم ≥50K) + رموزك المكتشفة + دفترك + الإضافي<br>'
+        '<b>🎯 وقود الشورت:</b> 🚀 محشور ≥30% | 🧹 استنفاد | ⛽ متوسط | 🎈 بلا وقود<br>'
         '<b>🎯 الزناد الفني:</b> كسر عنق W | اختراق رأس شمعة هابطة قوية | اختراق قمة القاعدة (كسر حديث ≤8%)<br>'
         '<b>الجاهزية =</b> وقود مقبول + معادلة مكتملة + نقاط ≥50 + (قرب الدعم <b>أو</b> زناد سحب <b>أو</b> زناد فني) + بلا فجوة ≥25%</div>',
         unsafe_allow_html=True)
@@ -1177,100 +1191,106 @@ with tab2:
     if st.button("🛰️ امسح بالرادار الموحد", key="uni"):
         with st.spinner("تحميل القائمة..."):
             universe = get_dynamic_universe(limit=300)
+        grown = list(st.session_state.get("discovered", set())) + \
+                [e.get("السهم") for e in st.session_state.get("journal", [])]
+        universe = list(dict.fromkeys(universe + [s for s in grown if s]))
         if extra.strip():
             universe = list(dict.fromkeys([u.strip().upper() for u in extra.split(",") if u.strip()] + universe))
-        if st.session_state.get("universe_source") != "TradingView":
-            st.warning(f"⚠️ المسح على القائمة الاحتياطية — سبب فشل المصدر الحي: {st.session_state.get('universe_error', 'غير معروف')}")
-        pg = st.progress(0)
-        raw = scan_parallel(universe, "6mo", progress_cb=lambda i, n: pg.progress(i / n))
-        pg.empty()
+        if st.session_state.get("universe_source") != "FMP":
+            st.warning(f"⚠️ فشل المصدر الحي FMP: {st.session_state.get('universe_error', 'غير معروف')} — المسح على قائمتك الذاتية فقط ({len(universe)} رمز)")
+        if not universe:
+            st.error("❌ لا كون للمسح: FMP متوقف وقائمتك الذاتية فارغة — أضف رموزاً في الحقل أعلاه ثم أعد المسح")
+        else:
+            pg = st.progress(0)
+            raw = scan_parallel(universe, "6mo", progress_cb=lambda i, n: pg.progress(i / n))
+            pg.empty()
 
-        stage1, excluded = [], []
-        for s, h, sps, src in raw:
-            if src == "stooq": continue
-            try:
-                dead = tradeability_veto(h, sps)
-                if dead:
-                    excluded.append({"symbol": s, "reason": dead}); continue
-                cheap = score(s, h, {}, sps)
-                if cheap["hard_veto"]:
-                    excluded.append({"symbol": s, "reason": " | ".join(veto_reasons(cheap, None, None)) or "إقصاء"}); continue
-                phase = post_split_phase(s, h, sps)
-                fam = detect_families(h, cheap)
-                phase_ok = phase and phase["phase_key"] in ("READY", "WATCH", "RETEST", "PROOF")
-                if fam or phase_ok or cheap["rsi"] <= 35:
-                    stage1.append((s, h, sps, phase, fam))
-            except Exception: continue
-        st.info(f"🔎 {len(stage1)} سهم حي يحمل بصمة فصيلة")
+            stage1, excluded = [], []
+            for s, h, sps, src in raw:
+                if src == "stooq": continue
+                try:
+                    dead = tradeability_veto(h, sps)
+                    if dead:
+                        excluded.append({"symbol": s, "reason": dead}); continue
+                    cheap = score(s, h, {}, sps)
+                    if cheap["hard_veto"]:
+                        excluded.append({"symbol": s, "reason": " | ".join(veto_reasons(cheap, None, None)) or "إقصاء"}); continue
+                    phase = post_split_phase(s, h, sps)
+                    fam = detect_families(h, cheap)
+                    phase_ok = phase and phase["phase_key"] in ("READY", "WATCH", "RETEST", "PROOF")
+                    if fam or phase_ok or cheap["rsi"] <= 35:
+                        stage1.append((s, h, sps, phase, fam))
+                except Exception: continue
+            st.info(f"🔎 {len(stage1)} سهم حي يحمل بصمة فصيلة")
 
-        results = []
-        pg2 = st.progress(0)
-        for i, (s, h, sps, phase, fam) in enumerate(stage1):
-            pg2.progress((i + 1) / max(len(stage1), 1))
-            try:
-                inf = finnhub_metrics(s)
-                news = check_news(s)
-                r = score(s, h, inf, sps, news)
-                if r["hard_veto"]:
-                    excluded.append({"symbol": s, "reason": " | ".join(veto_reasons(r, news, None))}); continue
-                fuel_kind, fuel_txt = short_fuel(r)
-                h4 = get_4h(s) if (r["dist_sup"] is not None and r["dist_sup"] <= 20) else None
-                lad = build_red_ladder(h4)
-                sweep = detect_sweep_reclaim(h4, r["support"])
-                sweep_wait = sweep is None and sweep_mode_candidate(h4, h, r["support"], r["dist_sup"])
-                tech = technical_trigger(h, r)
-                missing = []
-                base_fam = ("تجميع/قاعدة" in fam) or ("سيناريو المضارب" in fam) or ("درج ثبات" in fam)
-                macd_flat = abs(r["macd_hist"]) / max(r["price"], 0.01) < 0.005
-                if not (20 <= r["rsi"] <= 30) and not base_fam:
-                    missing.append(f"RSI {r['rsi']} خارج الضغط ولا قاعدة/درج")
-                if not (r["macd_imp"] or (base_fam and macd_flat)):
-                    missing.append("MACD لا يتحسن")
-                if not r["stability"] and not sweep and not tech and not ("سيناريو المضارب" in fam) and not ("درج ثبات" in fam):
-                    missing.append("لا ثبات فوق الدعم")
-                near_support = r["dist_sup"] is not None and r["dist_sup"] <= 15
-                fuel_ok = fuel_kind in ("packed", "present", "exhausted", "missing")
-                guide_ready = fuel_ok and (not missing) and r["total"] >= 50 and (near_support or bool(sweep) or bool(tech))
-                tags = []
-                if phase and phase["phase_key"] in ("READY", "WATCH", "RETEST"):
-                    tags.append(f"تقسيم: {PHASE_META[phase['phase_key']]} {phase['ratio']}")
-                if lad: tags.append(f"سلّم 4H: {len(lad['ladder'])} شموع")
-                if r["accum"]: tags.append("تجميع هادئ")
-                if "سيناريو المضارب" in fam: tags.append("🎭 سيناريو المضارب")
-                if "درج ثبات" in fam: tags.append("🪜 درج ثبات")
-                if "🚀 وقود محشور (Squeeze)" in fam: tags.append("🚀 وقود محشور")
-                elif "🧹 استنفاد الشورت (Post-Covering)" in fam: tags.append("🧹 استنفاد الشورت")
-                elif "⛽ وقود متوسط" in fam: tags.append("⛽ وقود متوسط")
-                if fuel_kind == "none": tags.append("🎈 بلا وقود")
-                if tech: tags.append("🎯 زناد فني")
-                if sweep: tags.append("🌀 زناد السحب تحقق")
-                elif sweep_wait: tags.append("🌀 نمط سحب — انتظر الزناد")
-                if fuel_kind == "none":
-                    missing.append("🎈 بلا وقود شورت — تضخم حر بلا غطاء")
-                off = {"has_offering": False}
-                if guide_ready or r["total"] >= 55:
-                    off = check_offering(s)
-                    if off.get("has_offering"):
-                        excluded.append({"symbol": s, "reason": f"طرح SEC نشط ({off.get('form','?')})"}); continue
-                if guide_ready:
-                    lq = get_realtime_price(s)
-                    if lq and abs(lq.get("percent_change", 0)) >= 25:
-                        guide_ready = False
-                        tags.append("⚡ فجوة ≥25% — مراقبة لا مطاردة")
-                results.append({"symbol": s, "total": r["total"], "rsi": r["rsi"],
-                                "guide_ready": guide_ready, "missing": missing,
-                                "support": r["support"], "dist_sup": r["dist_sup"],
-                                "rvol": r["rvol"], "tags": tags, "fam": fam,
-                                "phase": phase, "ladder": lad, "sweep": sweep, "sweep_wait": sweep_wait,
-                                "tech": tech, "fuel_kind": fuel_kind, "fuel_txt": fuel_txt,
-                                "short_pct": r["short_pct"], "shares_short": r["shares_short"]})
-            except Exception: continue
-        pg2.empty()
-        fuel_order = {"packed": 0, "exhausted": 1, "present": 2, "missing": 3, "none": 4}
-        results.sort(key=lambda x: (not x["guide_ready"], fuel_order.get(x["fuel_kind"], 5), -x["total"]))
-        st.session_state["uni_results"] = results
-        st.session_state["uni_excluded"] = excluded
-        st.success(f"✅ المسح اكتمل: {len(results)} مرشح | {len(excluded)} مقصيّ")
+            results = []
+            pg2 = st.progress(0)
+            for i, (s, h, sps, phase, fam) in enumerate(stage1):
+                pg2.progress((i + 1) / max(len(stage1), 1))
+                try:
+                    inf = finnhub_metrics(s)
+                    news = check_news(s)
+                    r = score(s, h, inf, sps, news)
+                    if r["hard_veto"]:
+                        excluded.append({"symbol": s, "reason": " | ".join(veto_reasons(r, news, None))}); continue
+                    fuel_kind, fuel_txt = short_fuel(r)
+                    h4 = get_4h(s) if (r["dist_sup"] is not None and r["dist_sup"] <= 20) else None
+                    lad = build_red_ladder(h4)
+                    sweep = detect_sweep_reclaim(h4, r["support"])
+                    sweep_wait = sweep is None and sweep_mode_candidate(h4, h, r["support"], r["dist_sup"])
+                    tech = technical_trigger(h, r)
+                    missing = []
+                    base_fam = ("تجميع/قاعدة" in fam) or ("سيناريو المضارب" in fam) or ("درج ثبات" in fam)
+                    macd_flat = abs(r["macd_hist"]) / max(r["price"], 0.01) < 0.005
+                    if not (20 <= r["rsi"] <= 30) and not base_fam:
+                        missing.append(f"RSI {r['rsi']} خارج الضغط ولا قاعدة/درج")
+                    if not (r["macd_imp"] or (base_fam and macd_flat)):
+                        missing.append("MACD لا يتحسن")
+                    if not r["stability"] and not sweep and not tech and not ("سيناريو المضارب" in fam) and not ("درج ثبات" in fam):
+                        missing.append("لا ثبات فوق الدعم")
+                    near_support = r["dist_sup"] is not None and r["dist_sup"] <= 15
+                    fuel_ok = fuel_kind in ("packed", "present", "exhausted", "missing")
+                    guide_ready = fuel_ok and (not missing) and r["total"] >= 50 and (near_support or bool(sweep) or bool(tech))
+                    tags = []
+                    if phase and phase["phase_key"] in ("READY", "WATCH", "RETEST"):
+                        tags.append(f"تقسيم: {PHASE_META[phase['phase_key']]} {phase['ratio']}")
+                    if lad: tags.append(f"سلّم 4H: {len(lad['ladder'])} شموع")
+                    if r["accum"]: tags.append("تجميع هادئ")
+                    if "سيناريو المضارب" in fam: tags.append("🎭 سيناريو المضارب")
+                    if "درج ثبات" in fam: tags.append("🪜 درج ثبات")
+                    if "🚀 وقود محشور (Squeeze)" in fam: tags.append("🚀 وقود محشور")
+                    elif "🧹 استنفاد الشورت (Post-Covering)" in fam: tags.append("🧹 استنفاد الشورت")
+                    elif "⛽ وقود متوسط" in fam: tags.append("⛽ وقود متوسط")
+                    if fuel_kind == "none": tags.append("🎈 بلا وقود")
+                    if tech: tags.append("🎯 زناد فني")
+                    if sweep: tags.append("🌀 زناد السحب تحقق")
+                    elif sweep_wait: tags.append("🌀 نمط سحب — انتظر الزناد")
+                    if fuel_kind == "none":
+                        missing.append("🎈 بلا وقود شورت — تضخم حر بلا غطاء")
+                    off = {"has_offering": False}
+                    if guide_ready or r["total"] >= 55:
+                        off = check_offering(s)
+                        if off.get("has_offering"):
+                            excluded.append({"symbol": s, "reason": f"طرح SEC نشط ({off.get('form','?')})"}); continue
+                    if guide_ready:
+                        lq = get_realtime_price(s)
+                        if lq and abs(lq.get("percent_change", 0)) >= 25:
+                            guide_ready = False
+                            tags.append("⚡ فجوة ≥25% — مراقبة لا مطاردة")
+                    results.append({"symbol": s, "total": r["total"], "rsi": r["rsi"],
+                                    "guide_ready": guide_ready, "missing": missing,
+                                    "support": r["support"], "dist_sup": r["dist_sup"],
+                                    "rvol": r["rvol"], "tags": tags, "fam": fam,
+                                    "phase": phase, "ladder": lad, "sweep": sweep, "sweep_wait": sweep_wait,
+                                    "tech": tech, "fuel_kind": fuel_kind, "fuel_txt": fuel_txt,
+                                    "short_pct": r["short_pct"], "shares_short": r["shares_short"]})
+                except Exception: continue
+            pg2.empty()
+            fuel_order = {"packed": 0, "exhausted": 1, "present": 2, "missing": 3, "none": 4}
+            results.sort(key=lambda x: (not x["guide_ready"], fuel_order.get(x["fuel_kind"], 5), -x["total"]))
+            st.session_state["uni_results"] = results
+            st.session_state["uni_excluded"] = excluded
+            st.success(f"✅ المسح اكتمل: {len(results)} مرشح | {len(excluded)} مقصيّ")
 
     if "uni_results" in st.session_state:
         results = st.session_state["uni_results"]
