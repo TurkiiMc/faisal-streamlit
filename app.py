@@ -1232,7 +1232,7 @@ with tab2:
                     phase_ok = phase and phase["phase_key"] in ("READY", "WATCH", "RETEST", "PROOF")
                     if fam or phase_ok or cheap["rsi"] <= 35:
                         stage1.append((s, h, sps, phase, fam))
-            except Exception: continue
+                except Exception: continue
             st.info(f"🔎 {len(stage1)} سهم حي يحمل بصمة فصيلة")
 
             results = []
