@@ -151,13 +151,14 @@ def get_realtime_price(symbol):
     return None
 
 # ============================================================
-# ===== الكون الحي الآلي: قوائم Yahoo الجاهزة =====
+# ===== الكون الحي الآلي: قوائم Yahoo الجاهزة (مرن) =====
 # ============================================================
 YAHOO_SCREENS = ["aggressive_small_caps", "conservative_small_caps",
-                 "undervalued_small_caps", "small_cap_gainers", "most_shorted_stocks"]
+                 "small_cap_gainers", "most_shorted_stocks", "top_losers"]
 
 def yahoo_universe(limit=500):
-    """كون حي مجاني: 5 قوائم Yahoo + فلاتر المنهجية تُطبق محلياً + crumb ذكي عند الحاجة"""
+    """كون حي مجاني: 5 قوائم Yahoo + فلاتر المنهجية تُطبق محلياً + crumb ذكي عند الحاجة + فشل جزئي"""
+    st.session_state.pop("yahoo_errors", None)
     sess = requests.Session()
     sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     crumb = None
@@ -176,7 +177,8 @@ def yahoo_universe(limit=500):
                     params["crumb"] = crumb
                     r = sess.get(url, params=params, timeout=20)
             if r.status_code != 200:
-                st.session_state["universe_error"] = f"Yahoo {scr}: HTTP {r.status_code}"
+                errs = st.session_state.setdefault("yahoo_errors", [])
+                errs.append(f"{scr}: HTTP {r.status_code}")
                 continue
             for q in r.json().get("quotes", []):
                 sym = q.get("symbol")
@@ -189,7 +191,8 @@ def yahoo_universe(limit=500):
                 if cap and cap > MARKET_CAP_MAX: continue
                 out.append(sym)
         except Exception as e:
-            st.session_state["universe_error"] = f"Yahoo {scr}: {type(e).__name__}"
+            errs = st.session_state.setdefault("yahoo_errors", [])
+            errs.append(f"{scr}: {type(e).__name__}")
     return list(dict.fromkeys(out))[:limit]
 
 def get_dynamic_universe(limit=500):
@@ -344,7 +347,7 @@ def macd(close):
 
 def macd_status(mp, mi, hist):
     if mp and mi: return "إيجابي ويتحسن ✅", "#00b894"
-    elif mp: return "إيجابي لكن يضعف 🟡", "#fdcb6e"
+    elif mp: return "إيجابي لكن يضعف ", "#fdcb6e"
     elif mi: return "سلبي لكن يتحسن 🟡", "#fdcb6e"
     else: return "سلبي ويضعف ❌", "#d63031"
 
@@ -510,7 +513,7 @@ def detect_stability(hist, support, min_sessions=2):
     if sessions_held < min_sessions: return None
     recent_lows = lows[-sessions_held:]
     higher_lows = all(recent_lows[i] >= recent_lows[i-1] * 0.99 for i in range(1, len(recent_lows))) if len(recent_lows) > 1 else False
-    if sessions_held >= 3 and higher_lows: strength, color, points = "🔥 ثبات قوي", "#00b894", 10
+    if sessions_held >= 3 and higher_lows: strength, color, points = " ثبات قوي", "#00b894", 10
     elif sessions_held >= 2 and higher_lows: strength, color, points = "✅ ثبات جيد", "#00b894", 7
     elif sessions_held >= 2: strength, color, points = "🟡 ثبات مقبول", "#fdcb6e", 5
     else: strength, color, points = "⚠️ ثبات ضعيف", "#fdcb6e", 0
@@ -768,12 +771,12 @@ def short_fuel(r):
     if eff >= 0.30:
         return "packed", "🚀 وقود محشور ≥30% — Short Squeeze محتمل"
     if eff >= 0.10:
-        return "present", "⛽ وقود موجود 10-30% — ارتكاز كلاسيكي"
+        return "present", " وقود موجود 10-30% — ارتكاز كلاسيكي"
     if eff < 0.05 and r.get("runner"):
         return "exhausted", "🧹 استنفاد الشورت — Former Runner بشورت منخفض = Post-Covering Rally"
     if eff < 0.10:
         return "none", "🎈 بلا وقود <10% — تضخم حر بلا غطاء: لا تُطارد، ولا ترتكز"
-    return "present", "⛽ وقود متوسط"
+    return "present", " وقود متوسط"
 
 def tradeability_veto(hist, splits=None):
     price = float(hist["Close"].iloc[-1])
@@ -862,7 +865,7 @@ def detect_families(hist, r):
        and r["stability"]["sessions_held"] >= 2 and near_sup:
         fam.append("درج ثبات")
     fuel_kind, _ = short_fuel(r)
-    if fuel_kind == "packed": fam.append("🚀 وقود محشور (Squeeze)")
+    if fuel_kind == "packed": fam.append(" وقود محشور (Squeeze)")
     elif fuel_kind == "exhausted": fam.append("🧹 استنفاد الشورت (Post-Covering)")
     elif fuel_kind == "present": fam.append("⛽ وقود متوسط")
     return fam
@@ -902,7 +905,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
 
     dead = tradeability_veto(hist, splits)
     if dead:
-        st.markdown(f'<div class="danger-box">🧟 <b>سهم غير قابل للتداول:</b> {dead}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="danger-box"> <b>سهم غير قابل للتداول:</b> {dead}</div>', unsafe_allow_html=True)
         return
 
     live = get_realtime_price(sym)
@@ -926,7 +929,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         st.markdown(f'<div class="success-box">🎭 <b>سيناريو المضارب مكتمل الترتيب:</b> قاعدة جافة → جس نبض {script["probe_date"]} → سحب/اختبار {script["sweep_date"]} عند {script["base_low"]} → استرداد</div>', unsafe_allow_html=True)
     tech = technical_trigger(hist, r)
     if tech:
-        st.markdown(f'<div class="success-box">🎯 <b>زناد فني تحقق:</b> {" | ".join(tech)} — الدخول بعد الثبات فوق المستوى المخترق، والوقف تحته</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="success-box"> <b>زناد فني تحقق:</b> {" | ".join(tech)} — الدخول بعد الثبات فوق المستوى المخترق، والوقف تحته</div>', unsafe_allow_html=True)
     gwt = geometric_wash_target(hist, splits)
     if gwt:
         st.markdown(f'<div class="warn-box">📐 <b>قاعدة MWC:</b> هدف الغسل ${gwt["target"]} — {gwt["status"]}</div>', unsafe_allow_html=True)
@@ -939,14 +942,14 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     if news.get("items"):
         st.markdown("#### 📰 آخر الأخبار السلبية")
         for item in news["items"]:
-            emoji, color = {"CRITICAL": ("🚨", "#d63031"), "OFFERING": ("💰", "#d63031"),
+            emoji, color = {"CRITICAL": ("🚨", "#d63031"), "OFFERING": ("", "#d63031"),
                             "HIGH": ("⚠️", "#e17055")}.get(item["level"], ("🟡", "#fdcb6e"))
             st.markdown(f'<div class="news-item" style="border-right-color:{color}">{emoji} <b>{item["headline"]}</b><br><small>{item["source"]} - {item["date"]}</small></div>', unsafe_allow_html=True)
 
     if r["stability"]:
         s = r["stability"]
         hl = " + قيعان أعلى ✅" if s["higher_lows"] else ""
-        st.markdown(f'<div class="success-box" style="border-right-color:{s["color"]}">📊 <b>الثبات:</b> {s["strength"]} - {s["sessions_held"]} جلسات فوق الدعم{hl}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="success-box" style="border-right-color:{s["color"]}"> <b>الثبات:</b> {s["strength"]} - {s["sessions_held"]} جلسات فوق الدعم{hl}</div>', unsafe_allow_html=True)
     elif r["support"]:
         st.markdown('<div class="warn-box">⚠️ <b>الثبات:</b> أقل من جلستين فوق الدعم - انتظر</div>', unsafe_allow_html=True)
     if r["bull_trapering"]:
@@ -1007,9 +1010,9 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         <div class="plan-box"><table class="plan-table">
         <tr><td><b>⚡ الدخول سوقاً عند الاسترداد</b></td><td style="color:#00b894"><b>${entry}</b></td><td>{shares0} سهم</td></tr>
         <tr><td><b>🛡️ الوقف تحت قاع السحب</b></td><td style="color:#d63031"><b>${stop}</b></td><td>-{round(risk_ps/entry*100,1)}%</td></tr>
-        <tr><td><b>🎯 هدف 1 (33%)</b></td><td style="color:#00b894"><b>${st1}</b> (+{rew0[0]}%)</td><td>R:R 1:{rr0[0]}</td></tr>
+        <tr><td><b> هدف 1 (33%)</b></td><td style="color:#00b894"><b>${st1}</b> (+{rew0[0]}%)</td><td>R:R 1:{rr0[0]}</td></tr>
         <tr><td><b>🚀 هدف 2 (33%+Trailing)</b></td><td style="color:#0984e3"><b>${st2}</b> (+{rew0[1]}%)</td><td>R:R 1:{rr0[1]}</td></tr>
-        <tr><td><b>🌟 هدف 3 (الباقي)</b></td><td style="color:#6c5ce7"><b>${st3}</b> (+{rew0[2]}%)</td><td>R:R 1:{rr0[2]}</td></tr>
+        <tr><td><b> هدف 3 (الباقي)</b></td><td style="color:#6c5ce7"><b>${st3}</b> (+{rew0[2]}%)</td><td>R:R 1:{rr0[2]}</td></tr>
         <tr><td><b>⚖️ المخاطرة القصوى</b></td><td style="color:#d63031">${round(max_risk0,2)}</td><td>{eff_risk0}%</td></tr>
         </table></div>""", unsafe_allow_html=True)
     elif sweep_wait:
@@ -1017,11 +1020,11 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         w1 = heads_x[0] if heads_x and heads_x[0] > r["price"] else r["resistance"]
         w2 = heads_x[1] if len(heads_x) > 1 and heads_x[1] > w1 else round(w1 * 1.2, 3)
         w3 = heads_x[2] if len(heads_x) > 2 and heads_x[2] > w2 else round(w1 * 1.5, 3)
-        st.markdown("### 📊 خطة الدخول: وضع انتظار الزناد")
+        st.markdown("###  خطة الدخول: وضع انتظار الزناد")
         st.markdown(f'<div class="warn-box">🌀 <b>نمط سحب السيولة:</b> لا تضع طلبات قبل السحب.<br>'
                     f'⏳ <b>الزناد:</b> شمعة 4H مغلقة ذيلها تحت <b>{round(sup0, 3)}</b> وإغلاقها فوقه.<br>'
                     f'📌 إن تحقق: دخول سوقاً عند الإغلاق المسترد، وقف تحت قاع السحب ×0.97، أهداف: {w1} → {w2} → {w3}.<br>'
-                    f'🚫 إن أُغلق تحت {round(sup0*0.80,3)} بدون استرداد: السحب تحوّل انهياراً.</div>', unsafe_allow_html=True)
+                    f' إن أُغلق تحت {round(sup0*0.80,3)} بدون استرداد: السحب تحوّل انهياراً.</div>', unsafe_allow_html=True)
 
     if r["support"] and r["resistance"] and not sweep and not sweep_wait:
         sup_val, res_val, current_price = r["support"], r["resistance"], r["price"]
@@ -1056,7 +1059,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         elif current_price > entry1:
             ladder = [
                 {"t": "🥇 دخول أولي (40%)", "p": entry1, "ord": "Limit", "pct": 0.40},
-                {"t": "🥈 تعزيز (35%)",     "p": entry2, "ord": "Limit", "pct": 0.35},
+                {"t": " تعزيز (35%)",     "p": entry2, "ord": "Limit", "pct": 0.35},
                 {"t": "🥉 دخول أخير (25%)", "p": entry3, "ord": "Limit", "pct": 0.25},
             ]
             avg_entry = round(entry1*0.40 + entry2*0.35 + entry3*0.25, 3)
@@ -1068,10 +1071,10 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
                 {"t": "🥉 دخول أخير (25%)", "p": entry3, "ord": "Limit",  "pct": 0.25},
             ]
             avg_entry = round(mkt*0.40 + entry2*0.35 + entry3*0.25, 3)
-            note = "⚡ داخل السلّم — الأولى سوقاً والبقية معلقة"; note_color = "#00b894"
+            note = " داخل السلّم — الأولى سوقاً والبقية معلقة"; note_color = "#00b894"
         elif current_price >= entry3:
             ladder = [
-                {"t": "🥇 دخول فوري (40%)",  "p": mkt, "ord": "Market", "pct": 0.40},
+                {"t": " دخول فوري (40%)",  "p": mkt, "ord": "Market", "pct": 0.40},
                 {"t": "🥈 تعزيز فوري (35%)", "p": mkt, "ord": "Market", "pct": 0.35},
                 {"t": "🥉 دخول أخير (25%)",  "p": entry3, "ord": "Limit", "pct": 0.25},
             ]
@@ -1104,7 +1107,7 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         st.markdown(f'<div style="background:{note_color}22;padding:15px;border-radius:10px;margin:10px 0;border:2px solid {note_color};text-align:center;font-size:18px;font-weight:bold">{note}</div>', unsafe_allow_html=True)
         st.markdown(f'<div style="background:{trend_color}15;padding:10px;border-radius:8px;margin:5px 0;border-right:4px solid {trend_color}"><b>📈 الاتجاه:</b> {trend_txt}</div>', unsafe_allow_html=True)
         if vol_flag:
-            st.markdown(f'<div class="warn-box">⚠️ تقلب {atr_pct}% — المخاطرة خُفّضت إلى {eff_risk}%. 📌 وقف القرار: إغلاق يومي تحت ${stop_struct} = خروج.</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="warn-box">⚠️ تقلب {atr_pct}% — المخاطرة خُفّضت إلى {eff_risk}%.  وقف القرار: إغلاق يومي تحت ${stop_struct} = خروج.</div>', unsafe_allow_html=True)
 
         rows_html = ""
         for L in ladder:
@@ -1121,8 +1124,8 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
         <tr><td><b>🎯 هدف 1 (33%)</b></td><td style="color:#00b894"><b>${target1}</b> (+{rew_pct[0]}%)</td><td>R:R 1:{rr[0]}</td></tr>
         <tr><td><b>🚀 هدف 2 (33%+Trailing)</b></td><td style="color:#0984e3"><b>${target2}</b> (+{rew_pct[1]}%)</td><td>R:R 1:{rr[1]}</td></tr>
         <tr><td><b>🌟 هدف 3 (الباقي)</b></td><td style="color:#6c5ce7"><b>${target3}</b> (+{rew_pct[2]}%)</td><td>R:R 1:{rr[2]}</td></tr>
-        <tr><td><b>💵 قيمة الصفقة</b></td><td>${pos_value:,}</td><td>{round(pos_value/portfolio_size*100, 1)}%</td></tr>
-        <tr><td><b>⚖️ المخاطرة القصوى</b></td><td style="color:#d63031">${round(max_risk, 2)}</td><td>{eff_risk}%</td></tr>
+        <tr><td><b> قيمة الصفقة</b></td><td>${pos_value:,}</td><td>{round(pos_value/portfolio_size*100, 1)}%</td></tr>
+        <tr><td><b>️ المخاطرة القصوى</b></td><td style="color:#d63031">${round(max_risk, 2)}</td><td>{eff_risk}%</td></tr>
         </table></div>""", unsafe_allow_html=True)
 
     st.markdown("### تفصيل النقاط")
@@ -1162,7 +1165,7 @@ with tab1:
                 h4 = get_4h(sym)
                 lad = build_red_ladder(h4)
                 if lad:
-                    st.markdown("#### 🕯️ سلّم الشموع الساقطة (4H)")
+                    st.markdown("#### ️ سلّم الشموع الساقطة (4H)")
                     st.dataframe(pd.DataFrame(lad["ladder"]), use_container_width=True, hide_index=True)
                     if lad["supports"]:
                         st.markdown(f'<div class="success-box">🛡️ ذيول تحولت لدعم: {lad["supports"]}</div>', unsafe_allow_html=True)
@@ -1208,8 +1211,11 @@ with tab2:
         universe = list(dict.fromkeys(universe + [s for s in grown if s]))
         if extra.strip():
             universe = list(dict.fromkeys([u.strip().upper() for u in extra.split(",") if u.strip()] + universe))
+        partial = st.session_state.get("yahoo_errors", [])
         if st.session_state.get("universe_source") != "Yahoo Live":
             st.warning(f"⚠️ فشل المصدر الحي Yahoo: {st.session_state.get('universe_error', 'غير معروف')} — المسح على قائمتك الذاتية فقط ({len(universe)} رمز)")
+        elif partial:
+            st.info(f"️ Yahoo: {len(partial)} قائمة معطوبة ({', '.join(partial)}) — بقية القوائم نجحت")
         if not universe:
             st.error("❌ لا كون للمسح: Yahoo متوقف وقائمتك الذاتية فارغة — أضف رموزاً في الحقل أعلاه ثم أعد المسح")
         else:
@@ -1233,7 +1239,7 @@ with tab2:
                     if fam or phase_ok or cheap["rsi"] <= 35:
                         stage1.append((s, h, sps, phase, fam))
                 except Exception: continue
-            st.info(f"🔎 {len(stage1)} سهم حي يحمل بصمة فصيلة")
+            st.info(f" {len(stage1)} سهم حي يحمل بصمة فصيلة")
 
             results = []
             pg2 = st.progress(0)
@@ -1270,13 +1276,13 @@ with tab2:
                     if r["accum"]: tags.append("تجميع هادئ")
                     if "سيناريو المضارب" in fam: tags.append("🎭 سيناريو المضارب")
                     if "درج ثبات" in fam: tags.append("🪜 درج ثبات")
-                    if "🚀 وقود محشور (Squeeze)" in fam: tags.append("🚀 وقود محشور")
+                    if " وقود محشور (Squeeze)" in fam: tags.append("🚀 وقود محشور")
                     elif "🧹 استنفاد الشورت (Post-Covering)" in fam: tags.append("🧹 استنفاد الشورت")
                     elif "⛽ وقود متوسط" in fam: tags.append("⛽ وقود متوسط")
-                    if fuel_kind == "none": tags.append("🎈 بلا وقود")
+                    if fuel_kind == "none": tags.append(" بلا وقود")
                     if tech: tags.append("🎯 زناد فني")
                     if sweep: tags.append("🌀 زناد السحب تحقق")
-                    elif sweep_wait: tags.append("🌀 نمط سحب — انتظر الزناد")
+                    elif sweep_wait: tags.append(" نمط سحب — انتظر الزناد")
                     if fuel_kind == "none":
                         missing.append("🎈 بلا وقود شورت — تضخم حر بلا غطاء")
                     off = {"has_offering": False}
@@ -1318,7 +1324,7 @@ with tab2:
         with cols[1]:
             st.markdown(f'<div style="background:#00b89415;border:1.5px solid #00b894;border-radius:12px;padding:12px;text-align:center"><div style="font-size:28px;font-weight:bold;color:#00b894">{len(exhausted)}</div><div>🧹 استنفاد شورت</div></div>', unsafe_allow_html=True)
         with cols[2]:
-            st.markdown(f'<div style="background:#0984e315;border:1.5px solid #0984e3;border-radius:12px;padding:12px;text-align:center"><div style="font-size:28px;font-weight:bold;color:#0984e3">{len(present)}</div><div>⛽ وقود متوسط/مفقود</div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="background:#0984e315;border:1.5px solid #0984e3;border-radius:12px;padding:12px;text-align:center"><div style="font-size:28px;font-weight:bold;color:#0984e3">{len(present)}</div><div> وقود متوسط/مفقود</div></div>', unsafe_allow_html=True)
 
         if ready:
             names = ", ".join(x["symbol"] for x in ready[:6])
@@ -1328,7 +1334,7 @@ with tab2:
 
         for x in results[:20]:
             badge = "✅" if x["guide_ready"] else "⏳"
-            fuel_emoji = {"packed": "🚀", "exhausted": "🧹", "present": "⛽", "none": "🎈", "missing": "❓"}.get(x["fuel_kind"], "")
+            fuel_emoji = {"packed": "🚀", "exhausted": "🧹", "present": "", "none": "🎈", "missing": "❓"}.get(x["fuel_kind"], "")
             fam_txt = " | ".join(x["fam"][:2]) if x["fam"] else "—"
             sp_display = round((x["short_pct"] or 0) * 100, 2)
             with st.expander(f"{badge} {fuel_emoji} **{x['symbol']}** — {x['total']}/100 | 🧬 {fam_txt} | RSI {x['rsi']} | شورت {sp_display}%"):
