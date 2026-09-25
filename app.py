@@ -188,7 +188,8 @@ def get_dynamic_universe(limit=500):
             st.session_state[cache_key] = {"data": tickers, "ts": now}
             st.session_state["universe_source"] = "TradingView"
             return tickers
-    except Exception: pass
+    except Exception as e:
+        st.session_state["universe_error"] = f"{type(e).__name__}: {e}"
     st.session_state[cache_key] = {"data": FALLBACK_UNIVERSE, "ts": now}
     st.session_state["universe_source"] = "قائمة احتياطية قديمة"
     return FALLBACK_UNIVERSE
@@ -722,9 +723,6 @@ def veto_reasons(r, news, offering):
     if offering and offering.get("has_offering"): reasons.append("طرح SEC")
     return reasons
 
-# ============================================================
-# ===== 🎯 وقود الشورت — محور نظرية الارتكاز =====
-# ============================================================
 def short_fuel(r):
     sp = r.get("short_pct") or 0
     sh = r.get("shares_short") or 0
@@ -779,11 +777,7 @@ def manipulator_script(hist):
                 "sweep_date": str(hist.index[sweep_idx[0]])[:10]}
     return None
 
-# ============================================================
-# ===== 🎯 الزناد الفني: ثلاثة اختراقات كلاسيكية =====
-# ============================================================
 def technical_trigger(hist, r):
-    """1) كسر عنق W | 2) اختراق رأس آخر شمعة هابطة قوية | 3) اختراق قمة القاعدة (كسر حديث)"""
     triggers = []
     price = r["price"]
     wp = r.get("w_pattern")
@@ -794,8 +788,7 @@ def technical_trigger(hist, r):
         for i in range(len(recent) - 1, -1, -1):
             c = recent.iloc[i]
             o = float(c["Open"])
-            if o <= 0:
-                continue
+            if o <= 0: continue
             drop = (float(c["Close"]) - o) / o * 100
             if drop < -5:
                 head = float(c["High"])
@@ -1169,12 +1162,15 @@ with tab2:
         '<b>🎯 الزناد الفني:</b> كسر عنق W | اختراق رأس شمعة هابطة قوية | اختراق قمة القاعدة (كسر حديث ≤8%)<br>'
         '<b>الجاهزية =</b> وقود مقبول + معادلة مكتملة + نقاط ≥50 + (قرب الدعم <b>أو</b> زناد سحب <b>أو</b> زناد فني) + بلا فجوة ≥25%</div>',
         unsafe_allow_html=True)
+    extra = st.text_input("➕ رموز إضافية تُدمج في هذا المسح (افصل بفاصلة): مثل SXTC, OFAL, INLF", "")
 
     if st.button("🛰️ امسح بالرادار الموحد", key="uni"):
         with st.spinner("تحميل القائمة..."):
             universe = get_dynamic_universe(limit=300)
+        if extra.strip():
+            universe = list(dict.fromkeys([u.strip().upper() for u in extra.split(",") if u.strip()] + universe))
         if st.session_state.get("universe_source") != "TradingView":
-            st.warning("⚠️ المسح على القائمة الاحتياطية القديمة")
+            st.warning(f"⚠️ المسح على القائمة الاحتياطية — سبب فشل المصدر الحي: {st.session_state.get('universe_error', 'غير معروف')}")
         pg = st.progress(0)
         raw = scan_parallel(universe, "6mo", progress_cb=lambda i, n: pg.progress(i / n))
         pg.empty()
