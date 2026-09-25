@@ -180,7 +180,17 @@ def get_dynamic_universe(limit=500):
                     col('float_shares') < FLOAT_MAX, col('close') < PRICE_MAX,
                     col('volume') > VOLUME_MIN, col('type') == 'stock')
              .order_by('market_cap_basic', ascending=True).limit(limit))
-        df, _ = q.get_scanner_data()
+        out = q.get_scanner_data()
+        df = None
+        if isinstance(out, pd.DataFrame):
+            df = out
+        elif isinstance(out, tuple):
+            for item in out:
+                if isinstance(item, pd.DataFrame):
+                    df = item
+                    break
+        if df is None or df.empty:
+            st.session_state["universe_error"] = "استجابة TradingView بلا جدول — حظر IP أو تغيير واجهة"
         if df is not None and not df.empty:
             tickers = df['ticker'].tolist() if 'ticker' in df.columns else df['name'].tolist()
             tickers = [t.split(':')[-1] if ':' in t else t for t in tickers]
