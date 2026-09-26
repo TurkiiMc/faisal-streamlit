@@ -367,7 +367,6 @@ def rsi_series(close, period=14):
     return 100 - (100 / (1 + rs))
 
 def detect_rsi_build(hist):
-    """تسريب ما قبل الانفجار: السعر يلتف وRSI يبني قيعاناً أعلى ويصعد"""
     if len(hist) < 30: return None
     rs = rsi_series(hist["Close"]).dropna()
     if len(rs) < 15: return None
@@ -435,7 +434,6 @@ def selling_volume_drying(hist):
     return prior > 0 and recent < prior * 0.7
 
 def geometric_wash_target(hist, splits=None):
-    """قاعدة MWC الصحيحة: أعلى شمعة بعد التقسيم ÷ 2 + انتظار شهر"""
     if not splits: return None
     sp = detect_reverse_split(splits, max_days=365)
     if not sp.get("has_split"): return None
@@ -519,12 +517,51 @@ def spike_context(hist):
     return {"kind": "broken", "base_low": round(base_low, 3)}
 
 def ladder_summary(lad, n=3):
-    """سلّم مبسط: أقرب 3 درجات بصيغة مقروءة بدل الجدول"""
     if not lad: return ""
     parts = []
     for i, L in enumerate(lad["ladder"][:n], 1):
         parts.append(f"الدرجة {i}: مقاومة {L['tail']} → سقف {L['head']}")
     return " | ".join(parts)
+
+def accumulation_zone(hist, lookback=40):
+    """منطقة تركيز المضارب: الشريحة السعرية التي تجمّع فيها أكبر فوليوم"""
+    if len(hist) < 20: return None
+    win = hist.tail(lookback)
+    lo, hi = float(win["Low"].min()), float(win["High"].max())
+    if hi <= lo: return None
+    bins, step = 10, (hi - lo) / 10
+    vols = [0.0] * bins
+    for _, c in win.iterrows():
+        i0 = max(0, int((float(c["Low"]) - lo) / step))
+        i1 = min(bins - 1, int((float(c["High"]) - lo) / step))
+        for i in range(i0, i1 + 1):
+            vols[i] += float(c["Volume"]) / (i1 - i0 + 1)
+    best_i, best_v = 0, -1.0
+    for i in range(bins - 2):
+        v = vols[i] + vols[i+1] + vols[i+2]
+        if v > best_v: best_v, best_i = v, i
+    z_lo, z_hi = lo + best_i * step, lo + (best_i + 3) * step
+    return {"low": round(z_lo, 3), "high": round(z_hi, 3), "avg": round((z_lo + z_hi) / 2, 3)}
+
+def expected_sweep_zone(zone_avg):
+    """وقوفات الأفراد تنام 10-15% تحت المتوسط — هناك يسحب المضارب"""
+    return round(zone_avg * 0.85, 3), round(zone_avg * 0.90, 3)
+
+def wick_rebound_trigger(hist):
+    """ذيل سفلي طويل وارتد السعر فوقه ≥5% = إيجابي"""
+    if len(hist) < 5: return None
+    for i in range(-5, 0):
+        c = hist.iloc[i]
+        o, cl, lo = float(c["Open"]), float(c["Close"]), float(c["Low"])
+        body = abs(cl - o)
+        lw = min(o, cl) - lo
+        if lw > 0 and lw >= 2 * max(body, 1e-9):
+            price = float(hist["Close"].iloc[-1])
+            if price >= lo * 1.05:
+                return {"wick_low": round(lo, 3),
+                        "rebound_pct": round((price - lo) / lo * 100, 1),
+                        "date": str(hist.index[i])[:10]}
+    return None
 
 def detect_gap_fill(hist):
     if len(hist) < 10: return None
@@ -610,17 +647,6 @@ PHASE_META = {
     "READY":   "🟢 جاهز (دورة)", "WATCH": "👁️ مراقبة", "RETEST": "🔄 اختبار",
     "PROOF":   "⏳ إثبات حياة", "ZONE": "🔍 منطقة", "WASHOUT": "🌪️ غسيل",
 }
-
-def count_reverse_splits(splits, months=36):
-    if not splits: return 0
-    cutoff = datetime.now() - timedelta(days=months * 30)
-    cnt = 0
-    for sp in splits:
-        try:
-            d = datetime.strptime(sp["date"], "%Y-%m-%d")
-            if d >= cutoff and int(sp.get("numerator", 1)) < int(sp.get("denominator", 1)): cnt += 1
-        except Exception: continue
-    return cnt
 
 def post_split_phase(symbol, hist, splits, min_days=10, max_days=90):
     sp = detect_reverse_split(splits, max_days=max_days)
@@ -793,6 +819,10 @@ def score(symbol, hist, info, splits=None, news=None, offering=None):
     w_pat = detect_w_pattern(hist)
     bd["W_Pattern"] = 10 if w_pat else 0
 
+    zone = accumulation_zone(hist)
+    wick_rb = wick_rebound_trigger(hist)
+    bd["WickRebound"] = 5 if wick_rb else 0
+
     total = max(0, min(sum(bd.values()), 100))
     if news:
         if news.get("offering_count", 0) > 0: total = max(0, total - 20)
@@ -824,6 +854,7 @@ def score(symbol, hist, info, splits=None, news=None, offering=None):
         "rebound": rebound, "split_info": split_info, "stability": stability,
         "accum": accum, "distribution": distribution, "rsi_build": rsi_build,
         "spike_return": spike_return, "spike_ctx": fs_ctx,
+        "zone": zone, "wick_rebound": wick_rb,
         "sweep": detect_liquidity_sweep(hist), "w_pattern": w_pat, "runner": is_runner,
         "bull_trapering": bull_trap, "failed_spike": failed_spike,
         "gap": detect_gap_fill(hist), "candles": detect_candle_patterns(hist),
@@ -927,6 +958,7 @@ def detect_families(hist, r):
     if 20 <= r["rsi"] <= 30: fam.append("ضغط RSI")
     if r.get("rsi_build"): fam.append("📈 تراكم RSI")
     if r.get("spike_return"): fam.append("🔁 عودة لقاعدة بعد سبايك")
+    if r.get("wick_rebound"): fam.append("🕯️ ارتداد ذيل +5%")
     vol_dry = n >= 30 and float(vol.tail(30).mean()) >= 50_000 \
               and float(vol.tail(5).mean()) < float(vol.tail(30).mean()) * 0.5
     range_narrow = n >= 10 and (float(hist["High"].tail(10).max()) - float(hist["Low"].tail(10).min())) / price < 0.15
@@ -1015,6 +1047,12 @@ def render_full_analysis(sym, hist, splits, info, news, offering, r):
     if r.get("spike_return") and r.get("spike_ctx"):
         ctx = r["spike_ctx"]
         st.markdown(f'<div class="info-box">🔁 <b>سبايك ثم عودة للقاعدة:</b> الهبوط بعد السبايك اختبار دعم لا انهيار — خط الرمل: إغلاق يومي تحت {ctx["base_low"]}</div>', unsafe_allow_html=True)
+    if r.get("zone"):
+        sl, sh = expected_sweep_zone(r["zone"]["avg"])
+        st.markdown(f'<div class="info-box">🎯 <b>منطقة تركيز المضارب:</b> {r["zone"]["low"]}–{r["zone"]["high"]} (متوسط {r["zone"]["avg"]})<br>🌀 <b>نطاق السحب المتوقع:</b> {sl}–{sh} (10–15% تحت المتوسط) — التحميل بعد السحب وليس قبل</div>', unsafe_allow_html=True)
+    if r.get("wick_rebound"):
+        wr = r["wick_rebound"]
+        st.markdown(f'<div class="success-box">🕯️ <b>ارتداد الذيل:</b> ذيل طويل عند {wr["wick_low"]} والسعر فوقه +{wr["rebound_pct"]}% ({wr["date"]}) — إيجابي</div>', unsafe_allow_html=True)
     if r.get("rsi_build"):
         rb = r["rsi_build"]
         st.markdown(f'<div class="success-box">📈 <b>تراكم RSI (قوة خفية):</b> RSI {rb["rsi_now"]} صاعد +{rb["rise"]} نقاط خلال 10 جلسات والسعر ملتف — يد على الزناد</div>', unsafe_allow_html=True)
@@ -1260,7 +1298,7 @@ with tab1:
             j_sym = st.text_input("السهم").upper()
             j_type = st.selectbox("النوع", ["ارتكاز", "زخم", "Former Runner", "Gap Fill", "W", "سحب سيولة",
                                             "سيناريو المضارب", "درج ثبات", "🚀 وقود محشور", "🧹 استنفاد شورت",
-                                            "📈 تراكم RSI", "🔁 عودة لقاعدة بعد سبايك", "طرح جديد"])
+                                            "📈 تراكم RSI", "🔁 عودة لقاعدة بعد سبايك", "🕯️ ارتداد ذيل", "طرح جديد"])
             j_fuel = st.selectbox("مقياس الوقود", ["وقود محشور", "وقود متوسط", "استنفاد شورت", "بلا وقود", "بيانات مفقودة", "غير مفحوص"])
             j_fee = st.text_input("رسوم الاقتراض السنوية (IBorrowDesk، إن توفرت)")
             j_levels = st.text_input("المستويات (دعم / طلب / مقاومة / هدف)")
@@ -1283,10 +1321,11 @@ with tab2:
     st.markdown("### 🛰️ الرادار الموحد — نظرية الارتكاز (الشورت محوراً)")
     st.markdown(
         '<div class="filter-box"><b>🌐 الكون:</b> Yahoo Live (crumb دائم) → قائمتك الذاتية → قائمة الطوارئ<br>'
-        '<b>🎯 وقود الشورت:</b> 🚀 محشور ≥30% | 🧹 استنفاد | ⛽ متوسط | 🎈 بلا وقود<br>'
+        '<b>🎯 وقود الشورت:</b> 🚀 محشور ≥30% | 🧹 استنفاد | ⛽ متوسط |  بلا وقود<br>'
         '<b>🎯 الزناد الفني:</b> كسر عنق W | اختراق رأس شمعة هابطة قوية | اختراق قمة القاعدة (كسر حديث ≤8%)<br>'
         '<b>📈 نافذة الإشعال:</b> RSI 45-57 + تراكم (قيعان أعلى + صعود ≥8 + سعر ملتف) = يد على الزناد<br>'
         '<b>🔁 السبايك:</b> سقط تحت قاعدته = جثة (إقصاء) | سقط داخل قاعدته وثبت = اختبار دعم (مراقبة)<br>'
+        '<b>🎯 منطقة التركيز:</b> متوسط التجمع → نطاق السحب المتوقع 10-15% تحته — التحميل بعد السحب لا قبله<br>'
         '<b>الجاهزية =</b> وقود مقبول + معادلة مكتملة + نقاط ≥50 + (قرب الدعم <b>أو</b> زناد سحب <b>أو</b> زناد فني) + بلا فجوة ≥25%</div>',
         unsafe_allow_html=True)
     extra = st.text_input("➕ رموز إضافية تُدمج في هذا المسح (افصل بفاصلة): مثل SXTC, OFAL, INLF", "")
@@ -1348,6 +1387,9 @@ with tab2:
                     sweep_wait = sweep is None and sweep_mode_candidate(h4, h, r["support"], r["dist_sup"])
                     tech = technical_trigger(h, r)
                     missing = []
+                    sweep_ever = bool(sweep) or bool(r.get("sweep"))
+                    if not sweep_ever and not r["stability"]:
+                        missing.append("لا سحب تاريخي → إعادة الاختبار شرط أساسي (ثبات على الدعم)")
                     base_fam = ("تجميع/قاعدة" in fam) or ("سيناريو المضارب" in fam) or ("درج ثبات" in fam) \
                                or ("📈 تراكم RSI" in fam) or ("🔁 عودة لقاعدة بعد سبايك" in fam)
                     macd_flat = abs(r["macd_hist"]) / max(r["price"], 0.01) < 0.005
@@ -1369,6 +1411,7 @@ with tab2:
                     if "درج ثبات" in fam: tags.append("🪜 درج ثبات")
                     if "📈 تراكم RSI" in fam: tags.append("📈 تراكم RSI")
                     if "🔁 عودة لقاعدة بعد سبايك" in fam: tags.append("🔁 عودة لقاعدة")
+                    if "🕯️ ارتداد ذيل +5%" in fam: tags.append("🕯️ ارتداد ذيل")
                     if "🚀 وقود محشور (Squeeze)" in fam: tags.append("🚀 وقود محشور")
                     elif "🧹 استنفاد الشورت (Post-Covering)" in fam: tags.append("🧹 استنفاد الشورت")
                     elif "⛽ وقود متوسط" in fam: tags.append("⛽ وقود متوسط")
@@ -1394,7 +1437,7 @@ with tab2:
                                     "rvol": r["rvol"], "tags": tags, "fam": fam,
                                     "phase": phase, "ladder": lad, "sweep": sweep, "sweep_wait": sweep_wait,
                                     "tech": tech, "rsi_build": r.get("rsi_build"),
-                                    "spike_return": r.get("spike_return"),
+                                    "spike_return": r.get("spike_return"), "zone": r.get("zone"),
                                     "fuel_kind": fuel_kind, "fuel_txt": fuel_txt,
                                     "short_pct": r["short_pct"], "shares_short": r["shares_short"]})
                 except Exception: continue
@@ -1439,6 +1482,9 @@ with tab2:
                     st.markdown(f'<div class="success-box">📈 <b>تراكم RSI:</b> RSI {rb["rsi_now"]} صاعد +{rb["rise"]} خلال 10 جلسات والسعر ملتف — نافذة الإشعال</div>', unsafe_allow_html=True)
                 if x.get("spike_return"):
                     st.markdown('<div class="info-box">🔁 <b>سبايك ثم عودة للقاعدة:</b> الهبوط اختبار دعم لا انهيار — خط الرمل قاع القاعدة</div>', unsafe_allow_html=True)
+                if x.get("zone"):
+                    sl, sh = expected_sweep_zone(x["zone"]["avg"])
+                    st.markdown(f'<div class="info-box">🎯 <b>منطقة التركيز:</b> {x["zone"]["low"]}–{x["zone"]["high"]} (متوسط {x["zone"]["avg"]}) | 🌀 السحب المتوقع: {sl}–{sh}</div>', unsafe_allow_html=True)
                 if x.get("tech"):
                     st.markdown(f'<div class="success-box">🎯 <b>زناد فني تحقق:</b> {" | ".join(x["tech"])} — الدخول بعد الثبات فوق المستوى، والوقف تحته</div>', unsafe_allow_html=True)
                 if x["fam"]:
