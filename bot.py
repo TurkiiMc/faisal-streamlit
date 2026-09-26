@@ -1,4 +1,4 @@
-import os, time, threading, requests
+import os, time, threading, requests, json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -23,6 +23,34 @@ NOTES = {
 }
 
 _alerted, _fired = {}, {}
+
+# ===== القائمة الحية + الحفظ =====
+WL_FILE = "watchlist.json"
+
+def load_wl():
+    base = []
+    for p in WATCHLIST.split(";"):
+        p = p.strip()
+        if not p: continue
+        parts = p.split(":")
+        if len(parts) >= 3:
+            try: base.append({"sym": parts[0].upper(), "sup": float(parts[1]), "res": float(parts[2]), "src": "env"})
+            except Exception: pass
+    try:
+        with open(WL_FILE) as f:
+            for e in json.load(f):
+                if not any(b["sym"] == e["sym"] for b in base):
+                    base.append(e)
+    except Exception: pass
+    return base
+
+def save_wl(wl):
+    try:
+        with open(WL_FILE, "w") as f:
+            json.dump([w for w in wl if w["src"] == "tg"], f)
+    except Exception: pass
+
+_WL = load_wl()
 
 # ===== Telegram =====
 def tg_send(chat, msg):
@@ -91,10 +119,10 @@ def sma_val(closes, p):
     if len(closes) < p: return None
     return sum(closes[-p:]) / p
 
-def support_resistance(candles, w=20):
-    if len(candles) < w: return None, None
-    lows = [c["low"] for c in candles[-w:]]
-    highs = [c["high"] for c in candles[-w:]]
+def support_resistance(cd, w=20):
+    if len(cd) < w: return None, None
+    lows = [c["low"] for c in cd[-w:]]
+    highs = [c["high"] for c in cd[-w:]]
     return min(lows), max(highs)
 
 def ladder_summary(lad, n=3):
@@ -111,12 +139,12 @@ def build_ladder(h4, price):
     supports = [round(c["low"], 3) for c in reds if c["low"] <= price][-3:]
     return {"ladder": ladder, "supports": supports}
 
-def detect_failed_spike(candles):
-    if len(candles) < 20: return None
-    rec = candles[-20:]
+def detect_failed_spike(cd):
+    if len(cd) < 20: return None
+    rec = cd[-20:]
     mx = max(c["high"] for c in rec)
     mn = min(c["low"] for c in rec)
-    cur = candles[-1]["close"]
+    cur = cd[-1]["close"]
     if mn <= 0: return None
     sp = (mx - mn) / mn * 100
     dr = (mx - cur) / mx * 100
@@ -124,16 +152,16 @@ def detect_failed_spike(candles):
         return {"spike_pct": round(sp, 1), "drop_pct": round(dr, 1), "peak": mx}
     return None
 
-def detect_bull_trap(candles):
-    if len(candles) < 25: return False
-    res = max(c["high"] for c in candles[-20:])
-    rec = candles[-5:]
+def detect_bull_trap(cd):
+    if len(cd) < 25: return False
+    res = max(c["high"] for c in cd[-20:])
+    rec = cd[-5:]
     if not any(c["high"] > res * 0.98 for c in rec): return False
-    return candles[-1]["close"] < res * 0.97
+    return cd[-1]["close"] < res * 0.97
 
-def detect_distribution(candles):
-    if len(candles) < 30: return False
-    last = candles[-10:]; prev = candles[-30:-10]
+def detect_distribution(cd):
+    if len(cd) < 30: return False
+    last = cd[-10:]; prev = cd[-30:-10]
     vp = sum(c["volume"] for c in prev) / len(prev)
     vl = sum(c["volume"] for c in last) / len(last)
     base = last[0]["close"]
@@ -141,9 +169,9 @@ def detect_distribution(candles):
     move = abs(last[-1]["close"] - base) / base * 100
     return vl > vp * 1.5 and move < 2.0
 
-def stability(candles, sup, min_sess=2):
-    if not sup or len(candles) < min_sess + 2: return None
-    rec = candles[-(min_sess + 3):]
+def stability(cd, sup, min_sess=2):
+    if not sup or len(cd) < min_sess + 2: return None
+    rec = cd[-(min_sess + 3):]
     th = sup * 0.98
     held = 0
     for c in reversed(rec):
@@ -152,9 +180,9 @@ def stability(candles, sup, min_sess=2):
     if held < min_sess: return None
     return held
 
-def rsi_build(candles):
-    if len(candles) < 30: return None
-    closes = [c["close"] for c in candles]
+def rsi_build(cd):
+    if len(cd) < 30: return None
+    closes = [c["close"] for c in cd]
     rs = []
     for i in range(14, len(closes)):
         rs.append(rsi_val(closes[:i+1], 14))
@@ -174,19 +202,19 @@ def analyze(sym):
     d = candles(sym, "6mo", "1d")
     if not d or len(d) < 30:
         return f"❌ <b>{sym}</b>: لا بيانات كافية"
-    
+
     closes = [c["close"] for c in d]
     price = closes[-1]
     prev = closes[-2] if len(closes) > 1 else price
     chg = (price - prev) / prev * 100 if prev else 0
-    
+
     rsi = rsi_val(closes)
     s20 = sma_val(closes, 20)
     s50 = sma_val(closes, 50)
     sup, res = support_resistance(d)
     m = finnhub_metrics(sym)
     q = quote(sym)
-    
+
     fs = (m.get("freeFloat") or 0)
     if fs and fs < 1000: fs *= 1000000
     sp = m.get("shortPercentOfFloat") or 0
@@ -194,14 +222,13 @@ def analyze(sym):
     sh = m.get("sharesShort") or 0
     mc = m.get("marketCapitalization") or 0
     if mc and mc < 100000: mc *= 1000000
-    
+
     eff = max(sp, sh / fs if fs else 0)
     if eff >= 0.30: fuel_t, fuel_e = "🚀 وقود محشور", f"{round(eff*100,1)}%"
     elif eff >= 0.10: fuel_t, fuel_e = "⛽ وقود متوسط", f"{round(eff*100,1)}%"
     elif eff < 0.05: fuel_t, fuel_e = "🎈 بلا وقود", f"{round(eff*100,1)}%"
     else: fuel_t, fuel_e = "❓ بيانات ناقصة", "—"
-    
-    # النقاط
+
     pts = 0
     if 23 <= rsi <= 27: pts += 25
     elif 20 <= rsi < 23 or 27 < rsi <= 30: pts += 15
@@ -219,8 +246,7 @@ def analyze(sym):
     stab = stability(d, sup) if sup else None
     if stab and stab >= 3: pts += 10
     elif stab and stab >= 2: pts += 7
-    
-    # الفصائل
+
     fams = []
     if 20 <= rsi <= 30: fams.append("ضغط RSI")
     rb = rsi_build(d)
@@ -230,26 +256,17 @@ def analyze(sym):
     dist = detect_distribution(d)
     sup_broken = sup and price < sup
     hard_veto = sup_broken or failed or bull or dist
-    
-    if hard_veto:
-        verdict = "🚫 مرفوض"
-        color = "#d63031"
-    elif pts >= 65:
-        verdict = "✅ ممتاز"
-        color = "#00b894"
-    elif pts >= 50:
-        verdict = "🟡 جيد"
-        color = "#fdcb6e"
-    else:
-        verdict = "⏳ ضعيف"
-        color = "#e17055"
-    
+
+    if hard_veto: verdict = "🚫 مرفوض"
+    elif pts >= 65: verdict = "✅ ممتاز"
+    elif pts >= 50: verdict = "🟡 جيد"
+    else: verdict = "⏳ ضعيف"
+
     if failed: fams.append("Failed Spike")
     if bull: fams.append("Bull Trap")
     if dist: fams.append("تصريف")
     if stab and stab >= 2: fams.append(f"ثبات {stab} جلسات")
-    
-    # 4H + سلّم
+
     h4 = candles(sym, "3mo", "1h")
     h4_agg = []
     for i in range(0, len(h4) - 3, 4):
@@ -257,22 +274,20 @@ def analyze(sym):
         h4_agg.append({"low": min(x["low"] for x in ch), "high": max(x["high"] for x in ch),
                        "close": ch[-1]["close"], "open": ch[0]["open"]})
     lad = build_ladder(h4_agg, price)
-    
-    # الزناد
+
     trigger = None
-    if sup:
+    if sup and res:
         dist_pct = (price - sup) / sup * 100
         if dist_pct <= 5 and stab and stab >= 2:
-            trigger = f"ثبات فوق الدعم {sup} — دخول Limit قرب الدعم، وقف {round(sup*0.97,3)}"
-        elif sup and price > res and (res / sup - 1) < 0.3:
-            trigger = f"اختراق للمقاومة {round(res,3)} — تأكيد بإغلاق ثانٍ فوقها"
+            trigger = f"ثبات فوق الدعم {round(sup,3)} — دخول Limit قرب الدعم، وقف {round(sup*0.97,3)}"
+        elif price > res:
+            trigger = f"اختراق المقاومة {round(res,3)} — تأكيد بإغلاق ثانٍ فوقها"
         elif dist_pct <= 15:
-            trigger = f"قرب الدعم {sup} ({round(dist_pct,1)}%) — انتظار ثبات أو سحب"
-    
-    # بناء الرسالة
+            trigger = f"قرب الدعم {round(sup,3)} ({round(dist_pct,1)}%) — انتظار ثبات أو سحب"
+
     live_p = q.get("c", price) if q else price
     live_chg = q.get("dp", chg) if q else chg
-    
+
     lines = []
     lines.append(f"📊 <b>{sym}</b> @ ${round(live_p, 3)} ({live_chg:+.1f}%)")
     lines.append("─" * 20)
@@ -287,76 +302,93 @@ def analyze(sym):
         lines.append(f"📈 SMA20: {round(s20,3)} | SMA50: {round(s50,3)}")
     if rb: lines.append(f"📈 تراكم RSI: {rb} — نافذة إشعال")
     if lad: lines.append(f"🕯️ السلّم: {ladder_summary(lad)}")
-    if trigger:
-        lines.append(f"🎯 <b>الزناد:</b> {trigger}")
-    else:
-        lines.append(f"⏳ الزناد: لم يتحقق بعد")
-    if hard_veto:
-        lines.append(f"🚫 <b>إقصاء فوري</b> — لا تتداول هذه الحالة")
-    
+    if trigger: lines.append(f"🎯 <b>الزناد:</b> {trigger}")
+    else: lines.append("⏳ الزناد: لم يتحقق بعد")
+    if hard_veto: lines.append("🚫 <b>إقصاء فوري</b> — لا تتداول هذه الحالة")
     return "\n".join(lines)
 
 # ===== معالجة الأوامر =====
-def get_watchlist():
-    return [p.split(":") for p in WATCHLIST.split(";") if ":" in p]
-
 def handle_cmd(text, chat_id):
+    global _WL
     text = text.strip()
     parts = text.split(maxsplit=1)
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
-    
+
     if cmd == "/help":
         return ("📋 <b>الأوامر:</b>\n"
                 "/s SYMBOL — تحليل شامل\n"
-                "/w SYM:sup:res — أضف للقائمة\n"
-                "/d SYM — احذف من القائمة\n"
+                "/w SYM — إضافة بمستويات تلقائية (قاع/قمة 20 يوم)\n"
+                "/w SYM:دعم:مقاومة — إضافة بمستوياتك\n"
+                "/d SYM — حذف من القائمة والتنبيهات\n"
                 "/list — عرض القائمة\n"
-                "/now — لقطة فورية للجميع\n\n"
+                "/now — لقطة فورية للجميع\n"
+                "/export — نص القائمة لنسخه إلى Render\n\n"
                 "أو اكتب اسم السهم مباشرة للتحليل السريع.")
-    
+
     elif cmd == "/s" or (not cmd.startswith("/") and text.isalnum()):
         sym = arg if cmd == "/s" else text
         return analyze(sym.upper())
-    
-    elif cmd == "/list":
-        wl = get_watchlist()
-        if not wl: return "📋 القائمة فارغة"
-        lines = ["📋 <b>القائمة المراقبة:</b>"]
-        for p in wl:
-            if len(p) >= 3:
-                lines.append(f"• {p[0]}: دعم {p[1]} | مقاومة {p[2]}")
-        lines.append(f"\nلتعديل القائمة: عدّل WATCHLIST في Render")
-        return "\n".join(lines)
-    
+
     elif cmd == "/w":
-        return ("⚠️ لإضافة سهم للقائمة الدائمة:\n"
-                "عدّل WATCHLIST في Render\n"
-                f"الصيغة الحالية: {WATCHLIST}\n"
-                "للتحليل الفوري استخدم: /s SYMBOL")
-    
+        a = arg.strip().upper().replace(",", ":").replace(";", ":")
+        p = a.split(":")
+        sym = p[0].strip()
+        if not sym: return "❓ الصيغة: /w SYM أو /w SYM:دعم:مقاومة"
+        if len(p) >= 3:
+            try: sup, res = float(p[1]), float(p[2])
+            except Exception: return "❓ أرقام غير صالحة"
+        else:
+            d = candles(sym, "6mo", "1d")
+            if not d or len(d) < 20:
+                return f"❌ {sym}: لا بيانات كافية — أدخل المستويات يدوياً: /w {sym}:دعم:مقاومة"
+            sup = min(c["low"] for c in d[-20:])
+            res = max(c["high"] for c in d[-20:])
+        _WL = [w for w in _WL if w["sym"] != sym]
+        _WL.append({"sym": sym, "sup": round(sup, 3), "res": round(res, 3), "src": "tg"})
+        save_wl(_WL)
+        return (f"✅ أُضيف <b>{sym}</b>: دعم {round(sup,3)} | مقاومة {round(res,3)}\n"
+                "🔔 التنبيهات فعّالة فوراً (سحب/اختراق/لمس/إبطال + الرسائل الأربع)")
+
     elif cmd == "/d":
-        return "⚠️ للحذف: عدّل WATCHLIST في Render"
-    
-    elif cmd == "/now":
-        wl = get_watchlist()
-        if not wl: return "📋 القائمة فارغة"
-        lines = [f"📋 <b>لقطة {datetime.now(ET).strftime('%H:%M ET')}</b>"]
-        for p in wl:
-            if len(p) >= 3:
-                d = candles(p[0], "6mo", "1d")
-                if d and len(d) >= 2:
-                    pr = d[-1]["close"]; pp = d[-2]["close"]
-                    chg = (pr - pp) / pp * 100 if pp else 0
-                    ds = (pr - float(p[1])) / float(p[1]) * 100
-                    state = "👀 عند الدعم" if abs(pr - float(p[1])) / float(p[1]) <= 0.02 else (
-                        "🎯 فوق المقاومة" if pr > float(p[2]) else "⏳ بين")
-                    lines.append(f"• <b>{p[0]}</b>: {round(pr,3)} ({chg:+.1f}%) | {state}")
+        sym = arg.strip().upper()
+        before = len(_WL)
+        _WL = [w for w in _WL if w["sym"] != sym]
+        save_wl(_WL)
+        return f"🗑️ حُذف <b>{sym}</b> من القائمة والتنبيهات" if len(_WL) < before else f"❓ {sym} غير موجود"
+
+    elif cmd == "/list":
+        if not _WL: return "📋 القائمة فارغة — أضف سهماً بـ: /w SYM"
+        lines = ["📋 <b>القائمة المراقبة:</b>"]
+        for w in _WL:
+            tag = "📌" if w["src"] == "env" else "➕"
+            lines.append(f"{tag} <b>{w['sym']}</b>: دعم {w['sup']} | مقاومة {w['res']}")
+        lines.append("\n➕ أضفتها من تليجرام | 📌 من Render")
         return "\n".join(lines)
-    
+
+    elif cmd == "/export":
+        s = ";".join(f"{w['sym']}:{w['sup']}:{w['res']}" for w in _WL)
+        return f"📋 انسخ هذا إلى WATCHLIST في Render للحفظ الدائم:\n<code>{s}</code>"
+
+    elif cmd == "/now":
+        if not _WL: return "📋 القائمة فارغة"
+        lines = [f"📋 <b>لقطة {datetime.now(ET).strftime('%H:%M ET')}</b>"]
+        for w in _WL:
+            d = candles(w["sym"], "6mo", "1d")
+            if d and len(d) >= 2:
+                pr = d[-1]["close"]; pp = d[-2]["close"]
+                chg = (pr - pp) / pp * 100 if pp else 0
+                if pr < w["sup"] * 0.97: state = "🚫 مُبطَل"
+                elif abs(pr - w["sup"]) / w["sup"] <= 0.02: state = "👀 عند الدعم"
+                elif pr > w["res"]: state = "🎯 فوق المقاومة"
+                else: state = "⏳ بين المستويين"
+                ds = (pr - w["sup"]) / w["sup"] * 100
+                lines.append(f"• <b>{w['sym']}</b>: {round(pr,3)} ({chg:+.1f}%) | عن الدعم {round(ds,1)}% | {state}")
+        return "\n".join(lines)
+
     return "❓ أمر غير معروف — أرسل /help"
 
-# ===== Polling loop =====
+# ===== Polling =====
 def polling():
     offset = 0
     while True:
@@ -368,13 +400,12 @@ def polling():
                 text = msg.get("text", "")
                 chat_id = msg.get("chat", {}).get("id")
                 if text and chat_id:
-                    reply = handle_cmd(text, chat_id)
-                    tg_send(chat_id, reply)
+                    tg_send(chat_id, handle_cmd(text, chat_id))
         except Exception as e:
             print("polling error", e)
         time.sleep(2)
 
-# ===== Scheduler =====
+# ===== اللقطات والجدولة =====
 def snapshot(sym, sup, res):
     d = candles(sym, "6mo", "1d")
     if not d or len(d) < 2: return f"• {sym}: لا بيانات"
@@ -390,10 +421,8 @@ def snapshot(sym, sup, res):
 def build_message(title, key):
     now = datetime.now(ET)
     lines = [f"📋 <b>{title}</b> — {now.strftime('%A %H:%M ET')}"]
-    for item in WATCHLIST.split(";"):
-        p = item.strip().split(":")
-        if len(p) >= 3:
-            lines.append(snapshot(p[0].upper(), float(p[1]), float(p[2])))
+    for w in _WL:
+        lines.append(snapshot(w["sym"], w["sup"], w["res"]))
     lines.append(NOTES[key])
     return "\n".join(lines)
 
@@ -412,6 +441,7 @@ def scheduler():
             print("sched error", e)
         time.sleep(30)
 
+# ===== مراقبة الزنادات =====
 def alert_once(sym, kind, msg):
     key = sym + kind
     now = time.time()
@@ -438,11 +468,11 @@ def check_symbol(sym, sup, res):
     if not d or len(d) < 3: return
     price = d[-1]["close"]; prev = d[-2]["close"]
     if prev <= res and price > res:
-        alert_once(sym, "break", f"🎯 <b>{sym}</b>: إغلاق يومي فوق المقاومة {res}")
+        alert_once(sym, "break", f"🎯 <b>{sym}</b>: إغلاق يومي فوق المقاومة {res} — باب الاختراق فُتح")
     if price < sup * 0.97:
-        alert_once(sym, "inv", f"🚫 <b>{sym}</b>: إغلاق تحت {round(sup*0.97,3)} — الدورة مُبطلة")
+        alert_once(sym, "inv", f"🚫 <b>{sym}</b>: إغلاق تحت {round(sup*0.97,3)} — الدورة مُبطلة، احذف الخطة")
     if abs(price - sup) / sup <= 0.02:
-        alert_once(sym, "zone", f"👀 <b>{sym}</b>: لمس الدعم {sup}")
+        alert_once(sym, "zone", f"👀 <b>{sym}</b>: لمس منطقة الدعم {sup} — راقب الثبات أو السحب")
     h = candles(sym, "3mo", "1h")
     if h:
         bars = agg4h(h)
@@ -450,15 +480,13 @@ def check_symbol(sym, sup, res):
         if bars:
             last4 = bars[-1]
             if last4["low"] < sup * 0.99 and last4["close"] > sup:
-                alert_once(sym, "sweep", f"🌀 <b>{sym}</b>: سحب ثم استرداد 4H (ذيل {round(last4['low'],3)} إغلاق {round(last4['close'],3)})")
+                alert_once(sym, "sweep", f"🌀 <b>{sym}</b>: سحب سيولة ثم استرداد على 4H (ذيل {round(last4['low'],3)} وإغلاق {round(last4['close'],3)}) — الزناد تحقق")
 
 def monitor():
     while True:
         try:
-            for item in WATCHLIST.split(";"):
-                p = item.strip().split(":")
-                if len(p) >= 3:
-                    check_symbol(p[0].upper(), float(p[1]), float(p[2]))
+            for w in _WL:
+                check_symbol(w["sym"], w["sup"], w["res"])
         except Exception as e:
             print("monitor error", e)
         time.sleep(600)
@@ -469,13 +497,12 @@ app = FastAPI()
 
 @app.get("/health")
 def health():
-    return {"ok": True, "watching": WATCHLIST}
+    return {"ok": True, "watching": len(_WL), "schedule": [s[0] for s in SCHEDULE]}
 
 @app.get("/")
 def root():
-    return {"bot": "faisal-alerts-v3", "features": ["schedule", "alerts", "commands"]}
+    return {"bot": "faisal-alerts-v4", "features": ["commands", "schedule", "alerts", "live-watchlist"]}
 
-# ===== بدء الخيوط =====
 threading.Thread(target=scheduler, daemon=True).start()
 threading.Thread(target=monitor, daemon=True).start()
 threading.Thread(target=polling, daemon=True).start()
