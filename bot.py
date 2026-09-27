@@ -7,6 +7,7 @@ CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
 PROXY = os.environ.get("PROXY_URL", "https://faisal-proxy.onrender.com").rstrip("/")
 FINNHUB = os.environ.get("FINNHUB_KEY", "")
 WATCHLIST = os.environ.get("WATCHLIST", "NTCL:1.735:2.223;CIIT:2.26:3.0")
+DISCOVERY_URL = os.environ.get("DISCOVERY_URL", "").rstrip("/")
 
 ET = ZoneInfo("America/New_York")
 SCHEDULE = [
@@ -24,7 +25,6 @@ NOTES = {
 
 _alerted, _fired = {}, {}
 
-# ===== القائمة الحية + الحفظ =====
 WL_FILE = "watchlist.json"
 
 def load_wl():
@@ -52,7 +52,6 @@ def save_wl(wl):
 
 _WL = load_wl()
 
-# ===== Telegram =====
 def tg_send(chat, msg):
     if TOKEN and chat:
         try:
@@ -73,7 +72,6 @@ def tg_get_updates(offset=0):
     except Exception: pass
     return []
 
-# ===== بيانات السوق =====
 def candles(sym, period="6mo", interval="1d"):
     try:
         r = requests.get(PROXY + "/yahoo/candles",
@@ -103,7 +101,6 @@ def quote(sym):
     except Exception: pass
     return None
 
-# ===== حسابات =====
 def rsi_val(closes, p=14):
     if len(closes) < p + 1: return 50.0
     d = [closes[i] - closes[i-1] for i in range(1, len(closes))]
@@ -196,7 +193,6 @@ def rsi_build(cd):
     if min(last10[-5:]) <= min(last10[-10:-5]): return None
     return round(last10[-1], 1)
 
-# ===== التحليل الشامل =====
 def analyze(sym):
     sym = sym.upper().strip()
     d = candles(sym, "6mo", "1d")
@@ -307,7 +303,6 @@ def analyze(sym):
     if hard_veto: lines.append("🚫 <b>إقصاء فوري</b> — لا تتداول هذه الحالة")
     return "\n".join(lines)
 
-# ===== معالجة الأوامر =====
 def handle_cmd(text, chat_id):
     global _WL
     text = text.strip()
@@ -318,6 +313,7 @@ def handle_cmd(text, chat_id):
     if cmd == "/help":
         return ("📋 <b>الأوامر:</b>\n"
                 "/s SYMBOL — تحليل شامل\n"
+                "/scan — اكتشافات السوق (فوري من آخر مسح)\n"
                 "/w SYM — إضافة بمستويات تلقائية (قاع/قمة 20 يوم)\n"
                 "/w SYM:دعم:مقاومة — إضافة بمستوياتك\n"
                 "/d SYM — حذف من القائمة والتنبيهات\n"
@@ -329,6 +325,39 @@ def handle_cmd(text, chat_id):
     elif cmd == "/s" or (not cmd.startswith("/") and text.isalnum()):
         sym = arg if cmd == "/s" else text
         return analyze(sym.upper())
+
+    elif cmd == "/scan":
+        if not DISCOVERY_URL:
+            return "⚠️ DISCOVERY_URL غير مضبوط في Environment"
+        try:
+            r = requests.get(DISCOVERY_URL + "/latest", timeout=15)
+            if r.status_code == 404:
+                return "⚠️ محرك الاكتشاف لا يملك /latest — حدّث discovery.py أولاً"
+            if r.status_code != 200:
+                return f"❌ فشل الاتصال بالمحرك: HTTP {r.status_code}"
+            data = r.json()
+            if not data.get("ok") or not data.get("items"):
+                return f"⏳ {data.get('msg', 'لا نتائج بعد')} — أول مسح تلقائي يعمل الآن، أعد /scan بعد قليل"
+            disc = data["items"]
+            age_h = data.get("age_hours", 0)
+            packed = [d for d in disc if d.get("fuel") == "packed"]
+            present = [d for d in disc if d.get("fuel") in ("present", "missing")]
+            lines = [f"🌊 <b>اكتشافات السوق ({len(disc)})</b>",
+                     f"🕐 آخر مسح قبل {round(age_h, 1)} ساعة", ""]
+            if packed:
+                lines.append(f"🚀 <b>وقود محشور ({len(packed)}):</b>")
+                for d in packed[:8]:
+                    ne = "📰+" if d.get("positive_news") else ""
+                    lines.append(f"• <b>{d['sym']}</b>: {d['score']}/100 | ${d['price']} | RSI {d['rsi']} | شورت {d['short_pct']}% {ne}")
+            if present:
+                lines.append(f"\n⛽ <b>وقود متوسط ({len(present)}):</b>")
+                for d in present[:8]:
+                    ne = "📰+" if d.get("positive_news") else ""
+                    lines.append(f"• <b>{d['sym']}</b>: {d['score']}/100 | ${d['price']} | RSI {d['rsi']} | شورت {d['short_pct']}% {ne}")
+            lines.append("\n💡 أرسل <code>/s SYM</code> للتحليل الكامل — الاكتشافات تُضاف لقائمة التنبيهات تلقائياً")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"❌ خطأ: {type(e).__name__}"
 
     elif cmd == "/w":
         a = arg.strip().upper().replace(",", ":").replace(";", ":")
@@ -388,7 +417,6 @@ def handle_cmd(text, chat_id):
 
     return "❓ أمر غير معروف — أرسل /help"
 
-# ===== Polling =====
 def polling():
     offset = 0
     while True:
@@ -405,7 +433,6 @@ def polling():
             print("polling error", e)
         time.sleep(2)
 
-# ===== اللقطات والجدولة =====
 def snapshot(sym, sup, res):
     d = candles(sym, "6mo", "1d")
     if not d or len(d) < 2: return f"• {sym}: لا بيانات"
@@ -441,7 +468,6 @@ def scheduler():
             print("sched error", e)
         time.sleep(30)
 
-# ===== مراقبة الزنادات =====
 def alert_once(sym, kind, msg):
     key = sym + kind
     now = time.time()
@@ -491,7 +517,6 @@ def monitor():
             print("monitor error", e)
         time.sleep(600)
 
-# ===== FastAPI =====
 from fastapi import FastAPI
 app = FastAPI()
 
@@ -501,11 +526,10 @@ def health():
 
 @app.get("/")
 def root():
-    return {"bot": "faisal-alerts-v5", "features": ["commands", "schedule", "alerts", "live-watchlist", "add-api"]}
+    return {"bot": "faisal-alerts-v6", "features": ["commands", "schedule", "alerts", "live-watchlist", "add-api", "instant-scan"]}
 
 @app.post("/add")
 def add_sym(payload: dict):
-    """نقطة دخول خدمة الاكتشاف: إضافة رمز للقائمة مباشرة"""
     global _WL
     sym = str(payload.get("sym", "")).upper().strip()
     try:
