@@ -16,6 +16,17 @@ PROXY_URL   = os.environ.get("PROXY_URL", "https://faisal-proxy.onrender.com").r
 FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")
 ON_RENDER   = bool(os.environ.get("RENDER_SERVICE_NAME"))
 
+def _env(key, default=""):
+    val = os.environ.get(key)
+    if val: return val
+    try:
+        v = st.secrets.get(key)
+        if v: return str(v)
+    except Exception: pass
+    return default
+
+CORE_LIST_RAW = _env("CORE_LIST", "")
+
 MARKET_CAP_MAX = 20_000_000
 FLOAT_MAX      = 5_000_000
 PRICE_MAX      = 5.0
@@ -23,22 +34,6 @@ VOLUME_MIN     = 50_000
 MAX_WORKERS = 12
 LADDER_MIN_CANDLES = 2
 MA_TOUCH_PCT = 3.0
-
-EMERGENCY_LIST = [
-    "SXTC","OFAL","INLF","PHIO","TOMZ","LFS","GNPX","DKI","STAK","APUS",
-    "AEMD","JWEL","ZJYL","MWC","NXTS","SVRE","GDHG","DXST","VSME","CLIK",
-    "BFRG","BIAF","BNKK","CDTG","SHPH","SONN","TNXP","SNPX","AVGR","BDRX",
-    "BIOR","CLRB","CRKN","CYTX","DTSS","EEIQ","ELAB","EVGN","EYEN","FWBI",
-    "GCTK","HCDI","HILS","HOTH","IMCC","INBS","INDP","IPDN","IVDA","KITT",
-    "KRKR","LGMK","LGVN","LUCY","LUXH","MEGL","MLGO","MNPR","MRIN","MTNB",
-    "MYNZ","NEXI","NITO","NKGN","NUKK","NVOS","OMQS","ONCO","OPGN","OPTT",
-    "PAVM","PHGE","PLRX","PMN","PRFX","PRST","PXMD","QNRX","RDHL","RIME",
-    "RKDA","RSLS","SBFM","SCPX","SEEL","SGBX","SLXN","SNDL","SOBR","SPRB",
-    "STAF","STI","SXTP","SYRA","TCON","TCRT","THMO","TIVC","TNON","TRNR",
-    "TRVN","TSBX","UPC","USEG","VBIV","VERO","VINO","VIRI","VRPX","VTVT",
-    "WATT","WISA","WKEY","XELB","XERS","XLO","XRTX","YCBD","ZAPP","ZCMD",
-    "SOPA","PRSO","ELYM","ALLR","AGRI","ALZN","AMST","APRE","AUID"
-]
 
 class RateLimiter:
     def __init__(self, max_calls=55, period=60):
@@ -166,11 +161,10 @@ def get_realtime_price(symbol):
         except Exception: pass
     return None
 
-YAHOO_SCREENS = ["aggressive_small_caps", "conservative_small_caps",
-                 "small_cap_gainers", "most_shorted_stocks", "top_losers"]
+YAHOO_SCREENS = ["day_losers", "most_actives", "small_cap_gainers",
+                 "aggressive_small_caps", "most_shorted_stocks"]
 
 def yahoo_universe(limit=500):
-    """كون حي: crumb يُجتلب دائماً أولاً + قراءة مرنة + فشل جزئي مُسجَّل"""
     st.session_state.pop("yahoo_errors", None)
     sess = requests.Session()
     sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -1271,6 +1265,7 @@ with st.sidebar:
     st.markdown("### 🔌 المصادر")
     st.markdown(f"**Finnhub:** {'🟢' if FINNHUB_KEY else '🔴'}")
     st.markdown(f"**Proxy:** {'🟢' if PROXY_URL else '🔴'}")
+    st.markdown(f"**CORE_LIST:** {'🟢 ' + str(len([t for t in CORE_LIST_RAW.replace(';', ',').split(',') if t.strip()])) + ' رمز' if CORE_LIST_RAW.strip() else '🔴 فارغة'}")
 
 tab1, tab2 = st.tabs(["📈 تحليل سهم", "🛰️ الرادار الموحد"])
 
@@ -1320,8 +1315,8 @@ with tab1:
 with tab2:
     st.markdown("### 🛰️ الرادار الموحد — نظرية الارتكاز (الشورت محوراً)")
     st.markdown(
-        '<div class="filter-box"><b>🌐 الكون:</b> Yahoo Live (crumb دائم) → قائمتك الذاتية → قائمة الطوارئ<br>'
-        '<b>🎯 وقود الشورت:</b> 🚀 محشور ≥30% | 🧹 استنفاد | ⛽ متوسط |  بلا وقود<br>'
+        '<div class="filter-box"><b>🌐 الكون:</b> Yahoo Live → CORE_LIST الأساسية → ذاتية/دفتر → إضافية (<b>بلا شبكة طوارئ في هذه النسخة — عن قصد للاختبار</b>)<br>'
+        '<b>🎯 وقود الشورت:</b> 🚀 محشور ≥30% | 🧹 استنفاد | ⛽ متوسط | 🎈 بلا وقود<br>'
         '<b>🎯 الزناد الفني:</b> كسر عنق W | اختراق رأس شمعة هابطة قوية | اختراق قمة القاعدة (كسر حديث ≤8%)<br>'
         '<b>📈 نافذة الإشعال:</b> RSI 45-57 + تراكم (قيعان أعلى + صعود ≥8 + سعر ملتف) = يد على الزناد<br>'
         '<b>🔁 السبايك:</b> سقط تحت قاعدته = جثة (إقصاء) | سقط داخل قاعدته وثبت = اختبار دعم (مراقبة)<br>'
@@ -1333,21 +1328,27 @@ with tab2:
     if st.button("🛰️ امسح بالرادار الموحد", key="uni"):
         with st.spinner("تحميل القائمة..."):
             universe = get_dynamic_universe(limit=300)
+        core = []
+        for tok in CORE_LIST_RAW.replace(";", ",").split(","):
+            s = tok.split(":")[0].strip().upper()
+            if s: core.append(s)
         grown = list(st.session_state.get("discovered", set())) + \
                 [e.get("السهم") for e in st.session_state.get("journal", [])]
-        universe = list(dict.fromkeys(universe + [s for s in grown if s]))
+        n_yahoo, n_grown = len(universe), len([s for s in grown if s])
+        universe = list(dict.fromkeys(universe + core + [s for s in grown if s]))
         if extra.strip():
             universe = list(dict.fromkeys([u.strip().upper() for u in extra.split(",") if u.strip()] + universe))
+        n_extra = len([u for u in extra.split(",") if u.strip()]) if extra.strip() else 0
+        st.info(f"🧬 تركيبة الكون: Yahoo {n_yahoo} + أساسية {len(core)} + ذاتية/دفتر {n_grown} + إضافية {n_extra}")
         partial = st.session_state.get("yahoo_errors", [])
         if st.session_state.get("universe_source") != "Yahoo Live":
             why = "; ".join(partial) or st.session_state.get("universe_error", "غير معروف")
-            st.warning(f"⚠️ فشل المصدر الحي Yahoo: {why} — سيُستخدم البديل المتاح ({len(universe)} رمز قبل الطوارئ)")
+            st.warning(f"⚠️ فشل المصدر الحي Yahoo: {why} — الاعتماد على الأساسية والذاتية ({len(universe)} رمز)")
         elif partial:
             st.info(f"ℹ️ Yahoo: {len(partial)} قائمة معطوبة ({', '.join(partial)}) — بقية القوائم نجحت")
         if not universe:
-            universe = EMERGENCY_LIST.copy()
-            st.warning("⚠️ Yahoo متوقف وقائمتك الذاتية فارغة — استخدمنا قائمة الطوارئ (~120 رمز)")
-        if universe:
+            st.error("🛑 **الكون فارغ تماماً:** لا Yahoo ولا CORE_LIST ولا قائمة ذاتية. اضبط CORE_LIST في Environment (Render) أو Secrets (Streamlit) ثم أعد المسح. لا قائمة طوارئ في هذه النسخة — عن قصد، حتى لا تختبئ الأعطال تحتها.")
+        else:
             pg = st.progress(0)
             raw = scan_parallel(universe, "6mo", progress_cb=lambda i, n: pg.progress(i / n))
             pg.empty()
