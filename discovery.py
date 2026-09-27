@@ -479,12 +479,12 @@ def notify(disc):
     packed = [d for d in disc if d["fuel"] == "packed"]
     present = [d for d in disc if d["fuel"] == "present"]
     
-    lines = [f"️ <b>اكتشافات اليوم ({len(disc)})</b>", ""]
+    lines = [f"🛰️ <b>اكتشافات اليوم ({len(disc)})</b>", ""]
     
     if packed:
         lines.append(f"🚀 <b>وقود محشور ({len(packed)}):</b>")
         for d in packed[:8]:
-            ne = "📰+" if d["positive_news"] else ""
+            ne = "+" if d["positive_news"] else ""
             lines.append(
                 f"• <b>{d['sym']}</b>: {d['score']}/100 | ${d['price']} | "
                 f"RSI {d['rsi']} | شورت {d['short_pct']}% {ne}"
@@ -493,7 +493,7 @@ def notify(disc):
     if present:
         lines.append(f"\n⛽ <b>وقود متوسط ({len(present)}):</b>")
         for d in present[:8]:
-            ne = "📰+" if d["positive_news"] else ""
+            ne = "+" if d["positive_news"] else ""
             lines.append(
                 f"• <b>{d['sym']}</b>: {d['score']}/100 | ${d['price']} | "
                 f"RSI {d['rsi']} | شورت {d['short_pct']}% {ne}"
@@ -513,8 +513,7 @@ def last_scan_age_hours():
 
 def should_scan():
     now = datetime.now(ET)
-    if now.weekday() >= 5:
-        return False
+    # ✅ تم إزالة شرط عطلة نهاية الأسبوع — يعمل كل يوم
     if now.hour < 6 or now.hour >= 22:
         return False
     return last_scan_age_hours() >= SCAN_EVERY_HOURS
