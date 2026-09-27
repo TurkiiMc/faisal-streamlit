@@ -2,8 +2,8 @@ import os, time, threading, requests, json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "8910866855:AAHxH8DSy15nXEhCRCta8WYJdhbmHXyZSUc")
-CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "8910866855")
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
 PROXY = os.environ.get("PROXY_URL", "https://faisal-proxy.onrender.com").rstrip("/")
 FINNHUB = os.environ.get("FINNHUB_KEY", "")
 WATCHLIST = os.environ.get("WATCHLIST", "NTCL:1.735:2.223;CIIT:2.26:3.0")
@@ -363,7 +363,7 @@ def handle_cmd(text, chat_id):
         for w in _WL:
             tag = "📌" if w["src"] == "env" else "➕"
             lines.append(f"{tag} <b>{w['sym']}</b>: دعم {w['sup']} | مقاومة {w['res']}")
-        lines.append("\n➕ أضفتها من تليجرام | 📌 من Render")
+        lines.append("\n➕ أضفتها من تليجرام/الاكتشافات | 📌 من Render")
         return "\n".join(lines)
 
     elif cmd == "/export":
@@ -501,7 +501,22 @@ def health():
 
 @app.get("/")
 def root():
-    return {"bot": "faisal-alerts-v4", "features": ["commands", "schedule", "alerts", "live-watchlist"]}
+    return {"bot": "faisal-alerts-v5", "features": ["commands", "schedule", "alerts", "live-watchlist", "add-api"]}
+
+@app.post("/add")
+def add_sym(payload: dict):
+    """نقطة دخول خدمة الاكتشاف: إضافة رمز للقائمة مباشرة"""
+    global _WL
+    sym = str(payload.get("sym", "")).upper().strip()
+    try:
+        sup = float(payload.get("sup")); res = float(payload.get("res"))
+    except Exception:
+        return {"ok": False}
+    if not sym: return {"ok": False}
+    _WL = [w for w in _WL if w["sym"] != sym]
+    _WL.append({"sym": sym, "sup": round(sup, 3), "res": round(res, 3), "src": "tg"})
+    save_wl(_WL)
+    return {"ok": True, "watching": len(_WL)}
 
 threading.Thread(target=scheduler, daemon=True).start()
 threading.Thread(target=monitor, daemon=True).start()
