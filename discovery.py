@@ -1,6 +1,5 @@
 """
-Finnhub Discovery Engine — مسح ذاتي للسوق الأمريكي
-يبني pool أسبوعياً (stooq جماعي + Finnhub metrics) ويمسح يومياً ويرسل الاكتشافات.
+Finnhub Discovery Engine v2 — مسح استباقي كل 6 ساعات + نتائج فورية عبر /latest
 """
 import os, time, json, requests, threading, io, csv
 from datetime import datetime, timedelta
@@ -12,11 +11,13 @@ PROXY     = os.environ.get("PROXY_URL", "https://faisal-proxy.onrender.com").rst
 TG_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT   = os.environ.get("TELEGRAM_CHAT_ID", "")
 BOT_URL   = os.environ.get("BOT_URL", "").rstrip("/")
+CORE_LIST_RAW = os.environ.get("CORE_LIST", "")
 
 POOL_FILE = Path("universe_pool.json")
 DISC_FILE = Path("discoveries.json")
 LAST_SCAN = Path("last_scan.json")
 ET = ZoneInfo("America/New_York")
+SCAN_EVERY_HOURS = 6
 
 class Limiter:
     def __init__(self, rpm=55): self.rpm, self.times, self.lock = rpm, [], threading.Lock()
@@ -42,7 +43,23 @@ def fh_get(path, params=None):
 def all_us_symbols():
     data = fh_get("/stock/symbol", {"exchange": "US"})
     if not data: return []
-    return [s.get("symbol") for s in data if s.get("symbol")]
+    ok_mic = {"XNAS", "XNYS", "ARCX", "BATS", "XASE"}
+    out = []
+    for s in data:
+        if s.get("type") != "Common Stock": continue
+        if s.get("mic") not in ok_mic: continue
+        sym = s.get("symbol")
+        if sym: out.append(sym)
+    return out
+
+def sec_tickers():
+    try:
+        r = requests.get("https://www.sec.gov/files/company_tickers.json",
+                         headers={"User-Agent": "FaisalDiscovery faisal@example.com"}, timeout=30)
+        if r.status_code == 200:
+            return [v["ticker"].upper() for v in r.json().values()]
+    except Exception: pass
+    return []
 
 def metrics(sym):
     m = fh_get("/stock/metric", {"symbol": sym, "metric": "all"})
@@ -172,7 +189,6 @@ def score(sym, m, q, cs, nws):
             "stab": stab, "positive_news": is_positive_news(nws)}
 
 def stooq_bulk(symbols):
-    """اقتباس جماعي مجاني: سعر+حجم لمئات الرموز في طلب واحد"""
     out = {}
     for i in range(0, len(symbols), 150):
         chunk = symbols[i:i+150]
@@ -191,6 +207,19 @@ def stooq_bulk(symbols):
         time.sleep(0.5)
     return out
 
+def proxy_bulk(symbols):
+    out = {}
+    for i in range(0, len(symbols), 200):
+        chunk = symbols[i:i+200]
+        try:
+            r = requests.get(PROXY + "/yahoo/last",
+                             params={"symbols": ",".join(chunk)}, timeout=120)
+            if r.status_code == 200:
+                out.update(r.json().get("quotes", {}))
+        except Exception: pass
+        time.sleep(0.5)
+    return out
+
 def build_pool(force=False):
     if POOL_FILE.exists() and not force:
         age_h = (time.time() - POOL_FILE.stat().st_mtime) / 3600
@@ -198,15 +227,21 @@ def build_pool(force=False):
             return json.loads(POOL_FILE.read_text())
     print("[pool] بناء قائمة أسبوعية...")
     syms = all_us_symbols()
-    print(f"[pool] {len(syms)} رمز خام من Finnhub")
+    if not syms:
+        print("[pool] Finnhub symbols فارغ — SEC بديلاً")
+        syms = sec_tickers()
+    print(f"[pool] {len(syms)} رمز خام")
     quotes = stooq_bulk(syms)
-    print(f"[pool] {len(quotes)} اقتباس من stooq")
+    if not quotes:
+        print("[pool] stooq صامت — البروكسي بديلاً")
+        q2 = proxy_bulk(syms)
+        quotes = {k: {"close": v["price"], "volume": v["volume"]} for k, v in q2.items()}
+    print(f"[pool] {len(quotes)} اقتباس")
     if quotes:
         pre = [s for s, q in quotes.items()
                if 0.5 <= q["close"] <= 5.0 and q["volume"] >= 50_000]
     else:
-        print("[pool] تحذير: stooq لا يستجيب — تصفية محدودة")
-        pre = syms[:1500]
+        pre = []
     print(f"[pool] {len(pre)} اجتاز السعر+الحجم")
     pool = []
     for i, s in enumerate(pre):
@@ -217,8 +252,10 @@ def build_pool(force=False):
         mc = mc_raw * 1e6 if mc_raw and mc_raw < 100000 else mc_raw
         if 1_000_000 <= mc <= 20_000_000:
             pool.append(s)
+    core = [t.strip().upper() for t in CORE_LIST_RAW.replace(";", ",").split(",") if t.strip()]
+    pool = list(dict.fromkeys(pool + core))
+    print(f"[pool] نهائي مع CORE_LIST: {len(pool)}")
     POOL_FILE.write_text(json.dumps(pool))
-    print(f"[pool] حفظ {len(pool)} مرشح")
     return pool
 
 def daily_scan():
@@ -250,7 +287,6 @@ def send_tg(msg):
     except Exception as e: print("[tg]", e)
 
 def auto_watchlist(disc):
-    """إضافة مباشرة لقائمة البوت عبر نقطة /add — لا عبر رسائل تليجرام"""
     if not BOT_URL: return
     added = 0
     for d in disc[:15]:
@@ -293,14 +329,14 @@ def last_scan_age_hours():
 def should_scan():
     now = datetime.now(ET)
     if now.weekday() >= 5: return False
-    if now.hour < 6 or now.hour >= 20: return False
-    return last_scan_age_hours() >= 18
+    if now.hour < 6 or now.hour >= 22: return False
+    return last_scan_age_hours() >= SCAN_EVERY_HOURS
 
 def scheduler_loop():
     while True:
         try:
             if should_scan():
-                print("[sched] بدء المسح اليومي")
+                print("[sched] بدء المسح الدوري")
                 disc = daily_scan()
                 notify(disc)
                 auto_watchlist(disc)
@@ -316,16 +352,36 @@ def run_once():
     return disc
 
 from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
 app = FastAPI()
 
-@app.get("/")
-def root():
-    return {"engine": "finnhub-discovery", "pool": len(build_pool(force=False)),
-            "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
+@app.get("/ping", response_class=PlainTextResponse)
+def ping():
+    return "pong"
 
 @app.get("/health")
 def health():
     return {"ok": True, "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
+
+@app.get("/")
+def root():
+    n = 0
+    if POOL_FILE.exists():
+        try: n = len(json.loads(POOL_FILE.read_text()))
+        except Exception: pass
+    return {"engine": "finnhub-discovery-v2", "pool": n,
+            "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
+
+@app.get("/latest")
+def latest():
+    if not DISC_FILE.exists():
+        return {"ok": False, "msg": "لا مسح سابق بعد — أول مسح تلقائي يعمل", "items": []}
+    try:
+        data = json.loads(DISC_FILE.read_text())
+        return {"ok": True, "date": data.get("date"), "count": data.get("count", 0),
+                "age_hours": round(last_scan_age_hours(), 1), "items": data.get("items", [])}
+    except Exception:
+        return {"ok": False, "items": []}
 
 @app.post("/scan")
 def trigger_scan():
