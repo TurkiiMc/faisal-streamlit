@@ -1,20 +1,14 @@
 """
-Finnhub Discovery Engine v2 — مسح استباقي كل 6 ساعات + نتائج فورية عبر /latest
+Finnhub Discovery Engine v3 — سريع، شفاف، يعمل كل الأيام
 """
-import os
-import time
-import json
-import requests
-import threading
-import io
-import csv
+import os, time, json, requests, threading, io, csv
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
-# ===== الإعدادات =====
 FINNHUB = os.environ.get("FINNHUB_KEY", "")
 PROXY = os.environ.get("PROXY_URL", "https://faisal-proxy.onrender.com").rstrip("/")
 TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -27,14 +21,11 @@ DISC_FILE = Path("discoveries.json")
 LAST_SCAN = Path("last_scan.json")
 ET = ZoneInfo("America/New_York")
 SCAN_EVERY_HOURS = 6
+POOL_CAP = 400
 
-# ===== Rate Limiter =====
 class Limiter:
     def __init__(self, rpm=55):
-        self.rpm = rpm
-        self.times = []
-        self.lock = threading.Lock()
-    
+        self.rpm, self.times, self.lock = rpm, [], threading.Lock()
     def wait(self):
         with self.lock:
             now = time.time()
@@ -42,189 +33,129 @@ class Limiter:
             if len(self.times) >= self.rpm:
                 time.sleep(60 - (now - self.times[0]) + 0.5)
             self.times.append(time.time())
-
 lim = Limiter(55)
 
-# ===== Finnhub API =====
 def fh_get(path, params=None):
-    if not FINNHUB:
-        return None
+    if not FINNHUB: return None
     lim.wait()
     try:
-        r = requests.get(
-            f"https://finnhub.io/api/v1{path}",
-            params={**(params or {}), "token": FINNHUB},
-            timeout=20
-        )
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
+        r = requests.get(f"https://finnhub.io/api/v1{path}",
+                         params={**(params or {}), "token": FINNHUB}, timeout=20)
+        if r.status_code == 200: return r.json()
+    except Exception: pass
     return None
 
 def all_us_symbols():
-    """جلب كل الرموز الأمريكية من Finnhub"""
     data = fh_get("/stock/symbol", {"exchange": "US"})
-    if not data:
-        return []
+    if not data: return []
     ok_mic = {"XNAS", "XNYS", "ARCX", "BATS", "XASE"}
-    out = []
-    for s in data:
-        if s.get("type") != "Common Stock":
-            continue
-        if s.get("mic") not in ok_mic:
-            continue
-        sym = s.get("symbol")
-        if sym:
-            out.append(sym)
-    return out
+    return [s["symbol"] for s in data
+            if s.get("type") == "Common Stock"
+            and s.get("mic") in ok_mic and s.get("symbol")]
 
 def sec_tickers():
-    """بديل: جلب الرموز من SEC"""
     try:
-        r = requests.get(
-            "https://www.sec.gov/files/company_tickers.json",
-            headers={"User-Agent": "FaisalDiscovery faisal@example.com"},
-            timeout=30
-        )
+        r = requests.get("https://www.sec.gov/files/company_tickers.json",
+                         headers={"User-Agent": "FaisalDiscovery f@example.com"}, timeout=30)
         if r.status_code == 200:
             return [v["ticker"].upper() for v in r.json().values()]
-    except Exception:
-        pass
+    except Exception: pass
     return []
 
 def metrics(sym):
     m = fh_get("/stock/metric", {"symbol": sym, "metric": "all"})
     return (m or {}).get("metric", {})
 
-def quote(sym):
-    return fh_get("/quote", {"symbol": sym}) or {}
-
 def news(sym, days=7):
     today = datetime.now().strftime("%Y-%m-%d")
     frm = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     return fh_get("/company-news", {"symbol": sym, "from": frm, "to": today}) or []
 
-# ===== البروكسي =====
 def candles(sym, period="6mo"):
     try:
-        r = requests.get(
-            PROXY + "/yahoo/candles",
-            params={"symbol": sym, "period": period},
-            timeout=60
-        )
+        r = requests.get(PROXY + "/yahoo/candles",
+                         params={"symbol": sym, "period": period}, timeout=45)
         if r.status_code == 200:
             d = r.json()
             if d.get("success") and d.get("candles"):
                 return d["candles"]
-    except Exception:
-        pass
+    except Exception: pass
     return []
 
-def stooq_bulk(symbols):
-    """اقتباسات مجمعة من stooq"""
-    out = {}
-    for i in range(0, len(symbols), 150):
-        chunk = symbols[i:i+150]
-        q = ",".join(s.lower() + ".us" for s in chunk)
-        try:
-            r = requests.get(
-                "https://stooq.com/q/l/",
-                params={"s": q, "f": "sd2t2ohlcv", "h": "1", "e": "csv"},
-                timeout=30,
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            if r.status_code != 200:
-                continue
-            for row in csv.DictReader(io.StringIO(r.text)):
-                sym = (row.get("Symbol") or "").upper().replace(".US", "")
-                try:
-                    c = float(row.get("Close") or 0)
-                    v = float(row.get("Volume") or 0)
-                except Exception:
-                    continue
-                if c > 0:
-                    out[sym] = {"close": c, "volume": v}
-        except Exception:
-            continue
-        time.sleep(0.5)
-    return out
+# ===== اقتباسات مجمّعة شفافة =====
+def stooq_probe(symbols_150):
+    q = ",".join(s.lower() + ".us" for s in symbols_150)
+    try:
+        r = requests.get("https://stooq.com/q/l/",
+                         params={"s": q, "f": "sd2t2ohlcv", "h": "1", "e": "csv"},
+                         timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200: return {}
+        out = {}
+        for row in csv.DictReader(io.StringIO(r.text)):
+            sym = (row.get("Symbol") or "").upper().replace(".US", "")
+            try: c = float(row.get("Close") or 0); v = float(row.get("Volume") or 0)
+            except Exception: continue
+            if c > 0: out[sym] = {"close": c, "volume": v}
+        return out
+    except Exception:
+        return {}
 
 def proxy_bulk(symbols):
-    """اقتباسات مجمعة من البروكسي"""
     out = {}
-    for i in range(0, len(symbols), 200):
-        chunk = symbols[i:i+200]
+    chunks = [symbols[i:i+150] for i in range(0, len(symbols), 150)]
+    for ci, chunk in enumerate(chunks):
         try:
-            r = requests.get(
-                PROXY + "/yahoo/last",
-                params={"symbols": ",".join(chunk)},
-                timeout=120
-            )
+            r = requests.get(PROXY + "/yahoo/last",
+                             params={"symbols": ",".join(chunk)}, timeout=120)
             if r.status_code == 200:
                 out.update(r.json().get("quotes", {}))
-        except Exception:
-            pass
-        time.sleep(0.5)
+        except Exception: pass
+        if ci % 4 == 0 or ci == len(chunks) - 1:
+            print(f"[pool] بروكسي دفعة {ci+1}/{len(chunks)} — {len(out)} اقتباس حتى الآن")
+        time.sleep(0.3)
     return out
 
-# ===== الحسابات الفنية =====
+# ===== حسابات فنية =====
 def rsi(closes, p=14):
-    if len(closes) < p + 1:
-        return 50.0
+    if len(closes) < p + 1: return 50.0
     d = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    g = [max(x, 0) for x in d[-p:]]
-    l = [max(-x, 0) for x in d[-p:]]
-    ag = sum(g) / p
-    al = sum(l) / p
-    if al == 0:
-        return 100.0
+    g = [max(x, 0) for x in d[-p:]]; l = [max(-x, 0) for x in d[-p:]]
+    ag = sum(g) / p; al = sum(l) / p
+    if al == 0: return 100.0
     return 100 - (100 / (1 + ag / al))
 
 def sma(closes, p):
     return sum(closes[-p:]) / p if len(closes) >= p else None
 
 def support(cs, w=20):
-    if len(cs) < w:
-        return None
-    return min(c["low"] for c in cs[-w:])
+    return min(c["low"] for c in cs[-w:]) if len(cs) >= w else None
 
 def detect_failed_spike(cs):
-    if len(cs) < 20:
-        return False
+    if len(cs) < 20: return False
     rec = cs[-20:]
-    mx = max(c["high"] for c in rec)
-    mn = min(c["low"] for c in rec)
+    mx = max(c["high"] for c in rec); mn = min(c["low"] for c in rec)
     cur = cs[-1]["close"]
-    if mn <= 0:
-        return False
+    if mn <= 0: return False
     return (mx - mn) / mn * 100 > 50 and (mx - cur) / mx * 100 > 40
 
 def detect_bull_trap(cs):
-    if len(cs) < 25:
-        return False
+    if len(cs) < 25: return False
     res = max(c["high"] for c in cs[-20:])
-    if not any(c["high"] > res * 0.98 for c in cs[-5:]):
-        return False
+    if not any(c["high"] > res * 0.98 for c in cs[-5:]): return False
     return cs[-1]["close"] < res * 0.97
 
 def stability(cs, sup):
-    if not sup or len(cs) < 5:
-        return 0
+    if not sup or len(cs) < 5: return 0
     th = sup * 0.98
     held = 0
     for c in reversed(cs[-5:]):
-        if c["close"] >= th:
-            held += 1
-        else:
-            break
+        if c["close"] >= th: held += 1
+        else: break
     return held
 
 def _txt(items):
-    return [
-        ((it.get("headline") or "") + " " + (it.get("summary") or "")).lower()
-        for it in items[:10]
-    ]
+    return [((it.get("headline") or "") + " " + (it.get("summary") or "")).lower()
+            for it in items[:10]]
 
 def is_critical_news(items):
     k = ["bankruptcy", "delisting", "delisted", "fraud", "sec investigation",
@@ -238,17 +169,12 @@ def has_offering_news(items):
 def is_positive_news(items):
     k = ["approval", "contract", "award", "partnership", "patent", "acquisition",
          "phase 2", "phase 3", "positive results", "buyback", "insider buying"]
-    return any(
-        any(w in t for w in k)
-        for t in [(it.get("headline") or "").lower() for it in items[:10]]
-    )
+    return any(any(w in t for w in k)
+               for t in [(it.get("headline") or "").lower() for it in items[:10]])
 
 # ===== التقييم =====
-def score(sym, m, q, cs, nws):
-    price = q.get("c", 0) or 0
-    if price <= 0 or not cs or len(cs) < 30:
-        return None
-    
+def score(sym, m, price, cs, nws):
+    if price <= 0 or not cs or len(cs) < 30: return None
     fs_raw = m.get("freeFloat") or 0
     fs = fs_raw * 1e6 if fs_raw and fs_raw < 1000 else fs_raw
     sp_raw = m.get("shortPercentOfFloat") or 0
@@ -256,266 +182,208 @@ def score(sym, m, q, cs, nws):
     mc_raw = m.get("marketCapitalization") or 0
     mc = mc_raw * 1e6 if mc_raw and mc_raw < 100000 else mc_raw
 
-    if not (1_000_000 <= mc <= 20_000_000):
-        return None
-    if not (0.5 <= price <= 5.0):
-        return None
-    if not (0 < fs <= 5_000_000):
-        return None
-    if sp < 0.10:
-        return None
+    if not (1_000_000 <= mc <= 20_000_000): return None
+    if not (0.5 <= price <= 5.0): return None
+    if not (0 < fs <= 5_000_000): return None
+    if sp < 0.10: return None
 
     closes = [c["close"] for c in cs]
     r = rsi(closes)
     sup = support(cs)
-    s20 = sma(closes, 20)
-    s50 = sma(closes, 50)
-    
-    if detect_failed_spike(cs) or detect_bull_trap(cs):
-        return None
-    if sup and price < sup * 0.97:
-        return None
-    if is_critical_news(nws) or has_offering_news(nws):
-        return None
+    s20 = sma(closes, 20); s50 = sma(closes, 50)
+    if detect_failed_spike(cs) or detect_bull_trap(cs): return None
+    if sup and price < sup * 0.97: return None
+    if nws and (is_critical_news(nws) or has_offering_news(nws)): return None
 
     pts = 0
-    if 23 <= r <= 27:
-        pts += 25
-    elif 20 <= r < 23 or 27 < r <= 30:
-        pts += 15
-    elif 30 < r <= 35:
-        pts += 10
-    elif 45 <= r <= 57:
-        pts += 5
-    
-    if fs < 1e6:
-        pts += 15
-    elif fs < 5e6:
-        pts += 12
-    
-    if sp > 0.40:
-        pts += 20
-    elif sp > 0.30:
-        pts += 15
-    elif sp > 0.20:
-        pts += 10
-    
-    if s20 and price < s20:
-        pts += 5
-    if s50 and price < s50:
-        pts += 5
-    
+    if 23 <= r <= 27: pts += 25
+    elif 20 <= r < 23 or 27 < r <= 30: pts += 15
+    elif 30 < r <= 35: pts += 10
+    elif 45 <= r <= 57: pts += 5
+    if fs < 1e6: pts += 15
+    elif fs < 5e6: pts += 12
+    if sp > 0.40: pts += 20
+    elif sp > 0.30: pts += 15
+    elif sp > 0.20: pts += 10
+    if s20 and price < s20: pts += 5
+    if s50 and price < s50: pts += 5
     stab = stability(cs, sup) if sup else 0
-    if stab >= 3:
-        pts += 10
-    elif stab >= 2:
-        pts += 7
-    
-    if is_positive_news(nws):
-        pts += 10
-    
-    if pts < 50:
-        return None
+    if stab >= 3: pts += 10
+    elif stab >= 2: pts += 7
+    pos = is_positive_news(nws) if nws else False
+    if pos: pts += 10
+    if pts < 50: return None
 
     eff = max(sp, (m.get("sharesShort") or 0) / fs if fs else 0)
     fuel = "packed" if eff >= 0.30 else ("present" if eff >= 0.10 else "none")
-    
-    return {
-        "sym": sym,
-        "price": round(price, 3),
-        "rsi": round(r, 1),
-        "score": pts,
-        "fuel": fuel,
-        "sup": round(sup, 3) if sup else None,
-        "dist_sup": round((price - sup) / sup * 100, 1) if sup else None,
-        "float_m": round(fs / 1e6, 2),
-        "short_pct": round(eff * 100, 1),
-        "stab": stab,
-        "positive_news": is_positive_news(nws)
-    }
+    return {"sym": sym, "price": round(price, 3), "rsi": round(r, 1), "score": pts,
+            "fuel": fuel, "sup": round(sup, 3) if sup else None,
+            "dist_sup": round((price - sup) / sup * 100, 1) if sup else None,
+            "float_m": round(fs / 1e6, 2), "short_pct": round(eff * 100, 1),
+            "stab": stab, "positive_news": pos}
 
-# ===== بناء الـ Pool =====
+# ===== بناء الـ Pool (يخزن الـ metrics لتوفير نصف زمن المسح) =====
 def build_pool(force=False):
     if POOL_FILE.exists() and not force:
         age_h = (time.time() - POOL_FILE.stat().st_mtime) / 3600
         if age_h < 144:
             return json.loads(POOL_FILE.read_text())
-    
+
     print("[pool] بناء قائمة أسبوعية...")
-    
     syms = all_us_symbols()
     if not syms:
-        print("[pool] Finnhub symbols فارغ — SEC بديلاً")
+        print("[pool] Finnhub فارغ — SEC بديلاً")
         syms = sec_tickers()
-    
     print(f"[pool] {len(syms)} رمز خام")
-    
-    quotes = stooq_bulk(syms)
-    if not quotes:
-        print("[pool] stooq صامت — البروكسي بديلاً")
-        q2 = proxy_bulk(syms)
-        quotes = {
-            k: {"close": v.get("price", 0), "volume": v.get("volume", 0)}
-            for k, v in q2.items()
-        }
-    
-    print(f"[pool] {len(quotes)} اقتباس")
-    
-    if quotes:
-        pre = [
-            s for s, q in quotes.items()
-            if 0.5 <= q.get("close", 0) <= 5.0 and q.get("volume", 0) >= 50_000
-        ]
+
+    probe = stooq_probe(syms[:150])
+    if probe:
+        print("[pool] stooq يستجيب — استخدامه")
+        quotes = dict(probe)
+        for i in range(150, len(syms), 150):
+            quotes.update(stooq_probe(syms[i:i+150]))
+            if (i // 150) % 6 == 0:
+                print(f"[pool] stooq {i}/{len(syms)} — {len(quotes)} اقتباس")
     else:
-        pre = []
-    
-    print(f"[pool] {len(pre)} اجتاز السعر+الحجم")
-    
+        print("[pool] stooq صامت من السحابة — البروكسي مباشرة")
+        quotes = proxy_bulk(syms)
+    print(f"[pool] {len(quotes)} اقتباس")
+
+    pre = [s for s, q in quotes.items()
+           if 0.5 <= q.get("close", 0) <= 5.0 and q.get("volume", 0) >= 50_000]
+    pre.sort(key=lambda s: -quotes[s].get("volume", 0))
+    pre = pre[:POOL_CAP]
+    print(f"[pool] {len(pre)} اجتاز السعر+الحجم (الأعلى حجماً)")
+
     pool = []
     for i, s in enumerate(pre):
-        if i % 50 == 0:
-            print(f"[pool] metrics {i}/{len(pre)}")
         m = metrics(s)
-        if not m:
-            continue
-        mc_raw = m.get("marketCapitalization") or 0
-        mc = mc_raw * 1e6 if mc_raw and mc_raw < 100000 else mc_raw
-        if 1_000_000 <= mc <= 20_000_000:
-            pool.append(s)
-    
-    core = [
-        t.strip().upper()
-        for t in CORE_LIST_RAW.replace(";", ",").split(",")
-        if t.strip()
-    ]
-    pool = list(dict.fromkeys(pool + core))
-    
+        if m:
+            mc_raw = m.get("marketCapitalization") or 0
+            mc = mc_raw * 1e6 if mc_raw and mc_raw < 100000 else mc_raw
+            if 1_000_000 <= mc <= 20_000_000:
+                fs_raw = m.get("freeFloat") or 0
+                sp_raw = m.get("shortPercentOfFloat") or 0
+                pool.append({"sym": s,
+                             "fs": fs_raw * 1e6 if fs_raw and fs_raw < 1000 else fs_raw,
+                             "sp": sp_raw / 100 if sp_raw > 1 else sp_raw,
+                             "sh": m.get("sharesShort") or 0,
+                             "mc": mc})
+        if i % 40 == 0:
+            print(f"[pool] metrics {i}/{len(pre)} — مقبول {len(pool)}")
+    print(f"[pool] اجتاز الكب/العائمة: {len(pool)}")
+
+    for t in CORE_LIST_RAW.replace(";", ",").split(","):
+        s = t.split(":")[0].strip().upper()
+        if s and not any(p["sym"] == s for p in pool):
+            m = metrics(s)
+            if m:
+                fs_raw = m.get("freeFloat") or 0
+                sp_raw = m.get("shortPercentOfFloat") or 0
+                mc_raw = m.get("marketCapitalization") or 0
+                pool.append({"sym": s,
+                             "fs": fs_raw * 1e6 if fs_raw and fs_raw < 1000 else fs_raw,
+                             "sp": sp_raw / 100 if sp_raw > 1 else sp_raw,
+                             "sh": m.get("sharesShort") or 0,
+                             "mc": mc_raw * 1e6 if mc_raw and mc_raw < 100000 else mc_raw})
     print(f"[pool] نهائي مع CORE_LIST: {len(pool)}")
     POOL_FILE.write_text(json.dumps(pool))
-    
     return pool
 
-# ===== المسح اليومي =====
+# ===== المسح (شموع متوازية + أخبار للنهائيين فقط) =====
 def daily_scan():
     pool = build_pool()
-    print(f"[scan] فحص {len(pool)} مرشح...")
-    
+    print(f"[scan] جلب شموع متوازي لـ {len(pool)} مرشح...")
+    candles_map = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {ex.submit(candles, p["sym"], "6mo"): p["sym"] for p in pool}
+        done = 0
+        for f in futs:
+            done += 1
+            if done % 50 == 0:
+                print(f"[scan] شموع {done}/{len(pool)}")
+            try: candles_map[futs[f]] = f.result()
+            except Exception: pass
+    print(f"[scan] شموع جاهزة: {len(candles_map)}")
+
     disc = []
-    for i, sym in enumerate(pool):
+    for i, p in enumerate(pool):
+        cs = candles_map.get(p["sym"])
+        if not cs: continue
+        price = cs[-1]["close"]
+        m = {"freeFloat": p["fs"] / 1e6 if p["fs"] and p["fs"] < 1000 else p["fs"],
+             "shortPercentOfFloat": p["sp"] * 100 if p["sp"] <= 1 else p["sp"],
+             "sharesShort": p["sh"],
+             "marketCapitalization": p["mc"] / 1e6 if p["mc"] and p["mc"] < 100000 else p["mc"]}
+        r = score(p["sym"], m, price, cs, [])
+        if not r: continue
+        nws = news(p["sym"], 7)
+        if is_critical_news(nws) or has_offering_news(nws): continue
+        r = score(p["sym"], m, price, cs, nws)
+        if r: disc.append(r)
         if i % 20 == 0:
-            print(f"[scan] {i}/{len(pool)}")
-        
-        m = metrics(sym)
-        q = quote(sym)
-        if not m or not q:
-            continue
-        
-        cs = candles(sym, "6mo")
-        nws = news(sym, 7)
-        r = score(sym, m, q, cs, nws)
-        if r:
-            disc.append(r)
-    
-    disc.sort(
-        key=lambda x: (
-            -x["score"],
-            -{"packed": 3, "present": 2, "none": 0}.get(x["fuel"], 1)
-        )
-    )
+            print(f"[scan] تحليل {i}/{len(pool)} — اكتشافات {len(disc)}")
+
+    disc.sort(key=lambda x: (-x["score"],
+                             -{"packed": 3, "present": 2, "none": 0}.get(x["fuel"], 1)))
     disc = disc[:30]
-    
-    DISC_FILE.write_text(
-        json.dumps({
-            "date": datetime.now(ET).isoformat(),
-            "count": len(disc),
-            "items": disc
-        }, indent=2, ensure_ascii=False)
-    )
+    DISC_FILE.write_text(json.dumps({"date": datetime.now(ET).isoformat(),
+                                     "count": len(disc), "items": disc},
+                                    indent=2, ensure_ascii=False))
     LAST_SCAN.write_text(json.dumps({"ts": time.time()}))
-    
     print(f"[scan] {len(disc)} اكتشاف")
     return disc
 
-# ===== إرسال لتليجرام =====
 def send_tg(msg):
-    if not (TG_TOKEN and TG_CHAT):
-        return
+    if not (TG_TOKEN and TG_CHAT): return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
-            timeout=15
-        )
-    except Exception as e:
-        print("[tg]", e)
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}, timeout=15)
+    except Exception as e: print("[tg]", e)
 
 def auto_watchlist(disc):
-    if not BOT_URL:
-        return
+    if not BOT_URL: return
     added = 0
     for d in disc[:15]:
         sup = d.get("sup")
-        if not sup:
-            continue
+        if not sup: continue
         try:
-            r = requests.post(
-                BOT_URL + "/add",
-                json={"sym": d["sym"], "sup": sup, "res": round(sup * 1.3, 3)},
-                timeout=15
-            )
-            if r.status_code == 200 and r.json().get("ok"):
-                added += 1
-        except Exception:
-            pass
+            r = requests.post(BOT_URL + "/add",
+                              json={"sym": d["sym"], "sup": sup, "res": round(sup * 1.3, 3)},
+                              timeout=15)
+            if r.status_code == 200 and r.json().get("ok"): added += 1
+        except Exception: pass
         time.sleep(0.5)
-    if added:
-        print(f"[watch] أُضيف {added} سهماً لقائمة البوت")
+    if added: print(f"[watch] أُضيف {added} سهماً لقائمة البوت")
 
 def notify(disc):
     if not disc:
         send_tg("🛰️ <b>مسح اليوم</b>: لا اكتشافات مكتملة المعادلة")
         return
-    
     packed = [d for d in disc if d["fuel"] == "packed"]
     present = [d for d in disc if d["fuel"] == "present"]
-    
     lines = [f"🛰️ <b>اكتشافات اليوم ({len(disc)})</b>", ""]
-    
     if packed:
         lines.append(f"🚀 <b>وقود محشور ({len(packed)}):</b>")
         for d in packed[:8]:
-            ne = "+" if d["positive_news"] else ""
-            lines.append(
-                f"• <b>{d['sym']}</b>: {d['score']}/100 | ${d['price']} | "
-                f"RSI {d['rsi']} | شورت {d['short_pct']}% {ne}"
-            )
-    
+            ne = "📰+" if d["positive_news"] else ""
+            lines.append(f"• <b>{d['sym']}</b>: {d['score']}/100 | ${d['price']} | RSI {d['rsi']} | شورت {d['short_pct']}% {ne}")
     if present:
         lines.append(f"\n⛽ <b>وقود متوسط ({len(present)}):</b>")
         for d in present[:8]:
-            ne = "+" if d["positive_news"] else ""
-            lines.append(
-                f"• <b>{d['sym']}</b>: {d['score']}/100 | ${d['price']} | "
-                f"RSI {d['rsi']} | شورت {d['short_pct']}% {ne}"
-            )
-    
+            ne = "📰+" if d["positive_news"] else ""
+            lines.append(f"• <b>{d['sym']}</b>: {d['score']}/100 | ${d['price']} | RSI {d['rsi']} | شورت {d['short_pct']}% {ne}")
     lines.append("\n💡 أرسل /s SYM للتحليل الكامل")
     send_tg("\n".join(lines))
 
-# ===== الجدولة =====
 def last_scan_age_hours():
-    if not LAST_SCAN.exists():
-        return 999
-    try:
-        return (time.time() - json.loads(LAST_SCAN.read_text())["ts"]) / 3600
-    except Exception:
-        return 999
+    if not LAST_SCAN.exists(): return 999
+    try: return (time.time() - json.loads(LAST_SCAN.read_text())["ts"]) / 3600
+    except Exception: return 999
 
 def should_scan():
     now = datetime.now(ET)
-    # ✅ تم إزالة شرط عطلة نهاية الأسبوع — يعمل كل يوم
-    if now.hour < 6 or now.hour >= 22:
-        return False
+    if now.hour < 6 or now.hour >= 22: return False
     return last_scan_age_hours() >= SCAN_EVERY_HOURS
 
 def scheduler_loop():
@@ -529,7 +397,7 @@ def scheduler_loop():
                 print("[sched] اكتمل المسح")
         except Exception as e:
             print("[sched] error:", e)
-        time.sleep(900)
+        time.sleep(300)
 
 def run_once():
     disc = daily_scan()
@@ -537,7 +405,6 @@ def run_once():
     auto_watchlist(disc)
     return disc
 
-# ===== FastAPI =====
 app = FastAPI()
 
 @app.get("/ping", response_class=PlainTextResponse)
@@ -546,51 +413,39 @@ def ping():
 
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "last_scan_hours_ago": round(last_scan_age_hours(), 1)
-    }
+    return {"ok": True, "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
 
 @app.get("/")
 def root():
     n = 0
     if POOL_FILE.exists():
-        try:
-            n = len(json.loads(POOL_FILE.read_text()))
-        except Exception:
-            pass
-    return {
-        "engine": "finnhub-discovery-v2",
-        "pool": n,
-        "last_scan_hours_ago": round(last_scan_age_hours(), 1)
-    }
+        try: n = len(json.loads(POOL_FILE.read_text()))
+        except Exception: pass
+    return {"engine": "finnhub-discovery-v3", "pool": n,
+            "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
 
 @app.get("/latest")
 def latest():
     if not DISC_FILE.exists():
-        return {
-            "ok": False,
-            "msg": "لا مسح سابق بعد — أول مسح تلقائي يعمل",
-            "items": []
-        }
+        return {"ok": False, "msg": "لا مسح سابق بعد — أول مسح تلقائي يعمل", "items": []}
     try:
         data = json.loads(DISC_FILE.read_text())
-        return {
-            "ok": True,
-            "date": data.get("date"),
-            "count": data.get("count", 0),
-            "age_hours": round(last_scan_age_hours(), 1),
-            "items": data.get("items", [])
-        }
+        return {"ok": True, "date": data.get("date"), "count": data.get("count", 0),
+                "age_hours": round(last_scan_age_hours(), 1), "items": data.get("items", [])}
     except Exception:
         return {"ok": False, "items": []}
+
+@app.get("/scan")
+def trigger_scan_browser():
+    threading.Thread(target=run_once, daemon=True).start()
+    return {"started": True,
+            "msg": "المسح بدأ في الخلفية — راقب السجلات، وافتح /latest بعد انتهائه"}
 
 @app.post("/scan")
 def trigger_scan():
     disc = run_once()
     return {"discoveries": len(disc), "items": disc[:10]}
 
-# ===== بدء الجدولة التلقائية =====
 if os.environ.get("START_SCHEDULER", "1") == "1":
     threading.Thread(target=scheduler_loop, daemon=True).start()
     print("[init] الجدولة التلقائية مفعّلة")
