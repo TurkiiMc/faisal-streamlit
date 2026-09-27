@@ -5,6 +5,7 @@ import requests
 import time
 import threading
 import io
+import csv
 import os
 from datetime import datetime, timedelta
 from collections import deque
@@ -65,6 +66,7 @@ st.markdown("""<style>
 .plan-box{background:#f0f7ff;padding:15px;border-radius:10px;margin:10px 0;border:2px solid #0984e3}
 .news-item{background:#fff;padding:10px;border-radius:6px;margin:5px 0;border-right:3px solid #0984e3;font-size:14px}
 .filter-box{background:#fff8e1;padding:15px;border-radius:10px;margin:10px 0;border:2px solid #fdcb6e}
+.live-box{background:#e3f2fd;padding:15px;border-radius:10px;margin:10px 0;border:2px solid #2196f3}
 .plan-table{width:100%;border-collapse:collapse;margin-top:10px}
 .plan-table td{padding:8px;border-bottom:1px solid #d0e4f5;font-size:16px}
 </style>""", unsafe_allow_html=True)
@@ -161,71 +163,71 @@ def get_realtime_price(symbol):
         except Exception: pass
     return None
 
-YAHOO_SCREENS = ["day_losers", "most_actives", "small_cap_gainers",
-                 "aggressive_small_caps", "most_shorted_stocks"]
-
-def yahoo_universe(limit=500):
-    st.session_state.pop("yahoo_errors", None)
-    sess = requests.Session()
-    sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                         "Accept": "application/json"})
-    crumb = None
+# ===== Finnhub primitives للمسح الحي =====
+def finnhub_get(path, params=None):
+    if not FINNHUB_KEY: return None
+    finnhub_limiter.wait()
     try:
-        sess.get("https://fc.yahoo.com", timeout=20)
-        rc = sess.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=20)
-        if rc.status_code == 200 and rc.text and len(rc.text.strip()) < 30:
-            crumb = rc.text.strip()
-    except Exception:
-        crumb = None
+        r = requests.get(f"https://finnhub.io/api/v1{path}",
+                         params={**(params or {}), "token": FINNHUB_KEY}, timeout=20)
+        if r.status_code == 200: return r.json()
+    except Exception: pass
+    return None
+
+def finnhub_all_symbols():
+    """كل رموز US الحقيقية (شركات فقط، بورصات منظمة)"""
+    data = finnhub_get("/stock/symbol", {"exchange": "US"})
+    if not data: return []
+    ok_mic = {"XNAS", "XNYS", "ARCX", "BATS", "XASE"}
     out = []
-    for scr in YAHOO_SCREENS:
+    for s in data:
+        if s.get("type") != "Common Stock": continue
+        if s.get("mic") not in ok_mic: continue
+        sym = s.get("symbol")
+        if sym: out.append(sym)
+    return out
+
+def finnhub_metrics_live(sym):
+    m = finnhub_get("/stock/metric", {"symbol": sym, "metric": "all"})
+    return (m or {}).get("metric", {})
+
+def proxy_bulk_quotes(symbols):
+    """اقتباسات مجمّعة عبر البروكسي (بلا استهلاك Finnhub)"""
+    out = {}
+    for i in range(0, len(symbols), 200):
+        chunk = symbols[i:i+200]
         try:
-            url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-            params = {"scrIds": scr, "count": 250}
-            if crumb: params["crumb"] = crumb
-            r = sess.get(url, params=params, timeout=20)
-            if r.status_code in (401, 403) and not crumb:
-                rc = sess.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=20)
-                if rc.status_code == 200 and rc.text and len(rc.text.strip()) < 30:
-                    crumb = rc.text.strip()
-                    params["crumb"] = crumb
-                    r = sess.get(url, params=params, timeout=20)
-            if r.status_code != 200:
-                st.session_state.setdefault("yahoo_errors", []).append(f"{scr}: HTTP {r.status_code}")
-                continue
-            data = r.json()
-            quotes = data.get("quotes") or data.get("finance", {}).get("result") or []
-            if not quotes:
-                st.session_state.setdefault("yahoo_errors", []).append(f"{scr}: 200 بلا quotes")
-                continue
-            for q in quotes:
-                sym = q.get("symbol")
-                price = q.get("regularMarketPrice") or 0
-                vol = q.get("regularMarketVolume") or 0
-                cap = q.get("marketCap") or 0
-                if not sym: continue
-                if price and not (0.5 <= price <= PRICE_MAX): continue
-                if vol and vol < VOLUME_MIN: continue
-                if cap and cap > MARKET_CAP_MAX: continue
-                out.append(sym)
-        except Exception as e:
-            st.session_state.setdefault("yahoo_errors", []).append(f"{scr}: {type(e).__name__}")
-    return list(dict.fromkeys(out))[:limit]
+            r = requests.get(PROXY_URL + "/yahoo/last",
+                             params={"symbols": ",".join(chunk)}, timeout=120)
+            if r.status_code == 200:
+                for k, v in r.json().get("quotes", {}).items():
+                    out[k] = {"close": v.get("price", 0), "volume": v.get("volume", 0)}
+        except Exception: pass
+        time.sleep(0.5)
+    return out
 
-def get_dynamic_universe(limit=500):
-    cache_key = f"universe_{limit}"
-    if cache_key not in st.session_state: st.session_state[cache_key] = {"data": None, "ts": 0}
-    now = datetime.now().timestamp()
-    cache = st.session_state[cache_key]
-    if cache["data"] and (now - cache["ts"]) < 3600: return cache["data"]
-    yu = yahoo_universe(limit)
-    if yu:
-        st.session_state[cache_key] = {"data": yu, "ts": now}
-        st.session_state["universe_source"] = "Yahoo Live"
-        return yu
-    st.session_state["universe_source"] = "لا مصدر حي"
-    return []
+def stooq_bulk(symbols):
+    """اقتباسات stooq الجماعية — بديل إن فشل البروكسي"""
+    out = {}
+    for i in range(0, len(symbols), 150):
+        chunk = symbols[i:i+150]
+        q = ",".join(s.lower() + ".us" for s in chunk)
+        try:
+            r = requests.get("https://stooq.com/q/l/",
+                             params={"s": q, "f": "sd2t2ohlcv", "h": "1", "e": "csv"},
+                             timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200: continue
+            for row in csv.DictReader(io.StringIO(r.text)):
+                sym = (row.get("Symbol") or "").upper().replace(".US", "")
+                try:
+                    c = float(row.get("Close") or 0); v = float(row.get("Volume") or 0)
+                except Exception: continue
+                if c > 0: out[sym] = {"close": c, "volume": v}
+        except Exception: continue
+        time.sleep(0.5)
+    return out
 
+# ===== الدوال الأساسية للتحليل (من النسخة السابقة) =====
 def _metrics_uncached(symbol):
     info = {"floatShares": 0, "shortPercentOfFloat": 0, "sharesShort": 0, "marketCap": 0}
     if not FINNHUB_KEY: return info
@@ -491,7 +493,6 @@ def detect_failed_spike(hist):
     return None
 
 def spike_context(hist):
-    """يصنف Failed Spike: قاعدة مكسورة (إقصاء) أم عودة لقاعدة ثابتة (اختبار دعم)"""
     fs = detect_failed_spike(hist)
     if not fs: return None
     recent = hist.tail(20)
@@ -518,7 +519,6 @@ def ladder_summary(lad, n=3):
     return " | ".join(parts)
 
 def accumulation_zone(hist, lookback=40):
-    """منطقة تركيز المضارب: الشريحة السعرية التي تجمّع فيها أكبر فوليوم"""
     if len(hist) < 20: return None
     win = hist.tail(lookback)
     lo, hi = float(win["Low"].min()), float(win["High"].max())
@@ -538,11 +538,9 @@ def accumulation_zone(hist, lookback=40):
     return {"low": round(z_lo, 3), "high": round(z_hi, 3), "avg": round((z_lo + z_hi) / 2, 3)}
 
 def expected_sweep_zone(zone_avg):
-    """وقوفات الأفراد تنام 10-15% تحت المتوسط — هناك يسحب المضارب"""
     return round(zone_avg * 0.85, 3), round(zone_avg * 0.90, 3)
 
 def wick_rebound_trigger(hist):
-    """ذيل سفلي طويل وارتد السعر فوقه ≥5% = إيجابي"""
     if len(hist) < 5: return None
     for i in range(-5, 0):
         c = hist.iloc[i]
@@ -1265,9 +1263,9 @@ with st.sidebar:
     st.markdown("### 🔌 المصادر")
     st.markdown(f"**Finnhub:** {'🟢' if FINNHUB_KEY else '🔴'}")
     st.markdown(f"**Proxy:** {'🟢' if PROXY_URL else '🔴'}")
-    st.markdown(f"**CORE_LIST:** {'🟢 ' + str(len([t for t in CORE_LIST_RAW.replace(';', ',').split(',') if t.strip()])) + ' رمز' if CORE_LIST_RAW.strip() else '🔴 فارغة'}")
+    st.markdown(f"**CORE_LIST:** {'🟢 ' + str(len([t for t in CORE_LIST_RAW.replace(';', ',').split(',') if t.strip()])) + ' رمز' if CORE_LIST_RAW.strip() else '🔴 فارغة (اختياري)'}")
 
-tab1, tab2 = st.tabs(["📈 تحليل سهم", "🛰️ الرادار الموحد"])
+tab1, tab2, tab3 = st.tabs(["📈 تحليل سهم", "🛰️ الرادار الموحد", "🌊 مسح حي من السوق"])
 
 with tab1:
     col1, col2 = st.columns([3, 1])
@@ -1315,7 +1313,8 @@ with tab1:
 with tab2:
     st.markdown("### 🛰️ الرادار الموحد — نظرية الارتكاز (الشورت محوراً)")
     st.markdown(
-        '<div class="filter-box"><b>🌐 الكون:</b> Yahoo Live → CORE_LIST الأساسية → ذاتية/دفتر → إضافية (<b>بلا شبكة طوارئ في هذه النسخة — عن قصد للاختبار</b>)<br>'
+        '<div class="filter-box"><b>🌐 الكون:</b> Yahoo Live → CORE_LIST الأساسية → ذاتية/دفتر → إضافية (<b>بلا شبكة طوارئ</b>)<br>'
+        '<b>💡 للمسح الحي من السوق مباشرة:</b> استخدم تبويب <b>🌊 مسح حي من السوق</b><br>'
         '<b>🎯 وقود الشورت:</b> 🚀 محشور ≥30% | 🧹 استنفاد | ⛽ متوسط | 🎈 بلا وقود<br>'
         '<b>🎯 الزناد الفني:</b> كسر عنق W | اختراق رأس شمعة هابطة قوية | اختراق قمة القاعدة (كسر حديث ≤8%)<br>'
         '<b>📈 نافذة الإشعال:</b> RSI 45-57 + تراكم (قيعان أعلى + صعود ≥8 + سعر ملتف) = يد على الزناد<br>'
@@ -1327,27 +1326,21 @@ with tab2:
 
     if st.button("🛰️ امسح بالرادار الموحد", key="uni"):
         with st.spinner("تحميل القائمة..."):
-            universe = get_dynamic_universe(limit=300)
+            universe = []
         core = []
         for tok in CORE_LIST_RAW.replace(";", ",").split(","):
             s = tok.split(":")[0].strip().upper()
             if s: core.append(s)
         grown = list(st.session_state.get("discovered", set())) + \
                 [e.get("السهم") for e in st.session_state.get("journal", [])]
-        n_yahoo, n_grown = len(universe), len([s for s in grown if s])
-        universe = list(dict.fromkeys(universe + core + [s for s in grown if s]))
+        n_core, n_grown = len(core), len([s for s in grown if s])
+        universe = list(dict.fromkeys(core + [s for s in grown if s]))
         if extra.strip():
             universe = list(dict.fromkeys([u.strip().upper() for u in extra.split(",") if u.strip()] + universe))
         n_extra = len([u for u in extra.split(",") if u.strip()]) if extra.strip() else 0
-        st.info(f"🧬 تركيبة الكون: Yahoo {n_yahoo} + أساسية {len(core)} + ذاتية/دفتر {n_grown} + إضافية {n_extra}")
-        partial = st.session_state.get("yahoo_errors", [])
-        if st.session_state.get("universe_source") != "Yahoo Live":
-            why = "; ".join(partial) or st.session_state.get("universe_error", "غير معروف")
-            st.warning(f"⚠️ فشل المصدر الحي Yahoo: {why} — الاعتماد على الأساسية والذاتية ({len(universe)} رمز)")
-        elif partial:
-            st.info(f"ℹ️ Yahoo: {len(partial)} قائمة معطوبة ({', '.join(partial)}) — بقية القوائم نجحت")
+        st.info(f"🧬 تركيبة الكون: أساسية {n_core} + ذاتية/دفتر {n_grown} + إضافية {n_extra}")
         if not universe:
-            st.error("🛑 **الكون فارغ تماماً:** لا Yahoo ولا CORE_LIST ولا قائمة ذاتية. اضبط CORE_LIST في Environment (Render) أو Secrets (Streamlit) ثم أعد المسح. لا قائمة طوارئ في هذه النسخة — عن قصد، حتى لا تختبئ الأعطال تحتها.")
+            st.error("🛑 **الكون فارغ.** إما اضبط CORE_LIST أو استخدم تبويب 🌊 مسح حي من السوق لاكتشاف الأسهم مباشرة من Finnhub.")
         else:
             pg = st.progress(0)
             raw = scan_parallel(universe, "6mo", progress_cb=lambda i, n: pg.progress(i / n))
@@ -1503,6 +1496,212 @@ with tab2:
             with st.expander(f"🚫 المقصيون وأسبابهم ({len(excluded)})"):
                 for e in excluded:
                     st.markdown(f"- **{e['symbol']}**: {e['reason']}")
+
+# ===== TAB 3: المسح الحي من السوق =====
+with tab3:
+    st.markdown("### 🌊 مسح حي من السوق — Finnhub Discovery")
+    st.markdown(
+        '<div class="live-box"><b>🌍 المصدر:</b> Finnhub يجلب <b>كل رموز US الحية</b> (شركات فقط، بورصات منظمة) كل ضغطة<br>'
+        '<b>🔍 الفلترة:</b> كاب ≤$20M | سعر $0.50-$5 | حجم ≥50K | عائمة ≤5M | شورت ≥10%<br>'
+        '<b>⏱️ الزمن المتوقع:</b> ~10-20 دقيقة (300-600 مرشح)<br>'
+        '<b>💡 الميزة:</b> لا قوائم محفوظة — كل مسح يرى ما <b>في السوق الآن</b> فعلاً</div>',
+        unsafe_allow_html=True)
+
+    if not FINNHUB_KEY:
+        st.error("🔴 مفتاح Finnhub غير مضبوط — المسح الحي يحتاجه لجلب رموز السوق.")
+    elif not PROXY_URL:
+        st.error("🔴 رابط البروكسي غير مضبوط — المسح الحي يحتاجه للاقتباسات المجمّعة.")
+    else:
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            max_candidates = st.slider("الحد الأقصى للمرشحين للفحص", 50, 600, 300, 50,
+                                        help="كلما زاد العدد زاد الوقت واكتُشفت فرص أكثر")
+        with col2:
+            st.write("")
+            st.write("")
+            live_btn = st.button("🌊 ابدأ مسحاً حياً", key="live_scan", type="primary")
+
+        if live_btn:
+            with st.spinner("جلب رموز السوق الحية من Finnhub..."):
+                all_syms = finnhub_all_symbols()
+            if not all_syms:
+                st.error("❌ فشل جلب الرموز من Finnhub — تأكد من صلاحية المفتاح.")
+            else:
+                st.info(f"📡 جلبنا <b>{len(all_syms)}</b> رمزاً حياً من Finnhub")
+
+                with st.spinner(f"اقتباسات مجمّعة لـ {len(all_syms)} رمز (سعر + حجم)..."):
+                    quotes = proxy_bulk_quotes(all_syms)
+                    if not quotes:
+                        st.warning("⚠️ البروكسي لم يرد — نجرب stooq بديلاً")
+                        quotes = stooq_bulk(all_syms)
+                st.info(f"💰 اقتباسات: {len(quotes)} رمز")
+
+                # التصفية السريعة
+                pre_filtered = []
+                for sym, q in quotes.items():
+                    p, v = q.get("close", 0), q.get("volume", 0)
+                    if 0.5 <= p <= 5.0 and v >= 50_000:
+                        pre_filtered.append(sym)
+                st.info(f"🔎 اجتاز السعر+الحجم: {len(pre_filtered)} رمز")
+
+                if not pre_filtered:
+                    st.error("❌ لا رموز اجتازت التصفية الأولية — السوق هادئ اليوم.")
+                else:
+                    # قص إلى الحد الأقصى
+                    pre_filtered = pre_filtered[:max_candidates]
+                    st.info(f"⚙️ سنفحص {len(pre_filtered)} رمزاً بعمق (metrics + news + candles)")
+
+                    candidates, excluded_live = [], []
+                    pg = st.progress(0)
+                    status = st.empty()
+
+                    # المرحلة 1: metrics فقط (سريعة نسبياً)
+                    status.info(f"📊 المرحلة 1/3: جلب metrics لـ {len(pre_filtered)} رمز...")
+                    sym_with_metrics = []
+                    for i, sym in enumerate(pre_filtered):
+                        pg.progress((i + 1) / len(pre_filtered) * 0.3)
+                        m = finnhub_metrics_live(sym)
+                        if not m: continue
+                        mc_raw = m.get("marketCapitalization") or 0
+                        mc = mc_raw * 1e6 if mc_raw and mc_raw < 100000 else mc_raw
+                        fs_raw = m.get("freeFloat") or 0
+                        fs = fs_raw * 1e6 if fs_raw and fs_raw < 1000 else fs_raw
+                        sp_raw = m.get("shortPercentOfFloat") or 0
+                        sp = sp_raw / 100 if sp_raw > 1 else sp_raw
+                        if not (1_000_000 <= mc <= MARKET_CAP_MAX): continue
+                        if not (0 < fs <= FLOAT_MAX): continue
+                        if sp < 0.10: continue
+                        sym_with_metrics.append((sym, m))
+                    st.info(f"✅ اجتاز metrics: {len(sym_with_metrics)} رمز (كاب/عائمة/شورت)")
+
+                    # المرحلة 2: candles + news
+                    status.info(f"🕯️ المرحلة 2/3: شموع + أخبار لـ {len(sym_with_metrics)} رمز...")
+                    final = []
+                    for i, (sym, m) in enumerate(sym_with_metrics):
+                        pg.progress(0.3 + (i + 1) / max(len(sym_with_metrics), 1) * 0.7)
+                        q = finnhub_get("/quote", {"symbol": sym}) or {}
+                        if not q.get("c"): continue
+                        cs_raw = []
+                        try:
+                            r = requests.get(PROXY_URL + "/yahoo/candles",
+                                             params={"symbol": sym, "period": "6mo"}, timeout=60)
+                            if r.status_code == 200:
+                                data = r.json()
+                                if data.get("success") and data.get("candles"):
+                                    cs_raw = data["candles"]
+                                    splits_raw = data.get("splits", [])
+                        except Exception: pass
+                        if len(cs_raw) < 30: continue
+
+                        hist = pd.DataFrame(cs_raw)
+                        hist["date"] = pd.to_datetime(hist["date"])
+                        hist = hist.set_index("date").sort_index()
+                        hist.columns = [c.capitalize() for c in hist.columns]
+
+                        # أخبار
+                        news_items = []
+                        try:
+                            today = datetime.now().strftime("%Y-%m-%d")
+                            week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+                            nr = finnhub_get("/company-news",
+                                             {"symbol": sym, "from": week_ago, "to": today})
+                            if nr: news_items = nr
+                        except Exception: pass
+
+                        # فحص سريع للإقصاءات
+                        crit = ["bankruptcy", "delisting", "delisted", "fraud", "trading halt", "chapter 11"]
+                        off_k = ["public offering", "private placement", "dilution", "shelf offering"]
+                        is_crit = any(any(k in ((it.get("headline") or "") + " " + (it.get("summary") or "")).lower() for k in crit) for it in news_items[:10])
+                        is_off = any(any(k in ((it.get("headline") or "") + " " + (it.get("summary") or "")).lower() for k in off_k) for it in news_items[:10])
+                        if is_crit or is_off:
+                            excluded_live.append({"symbol": sym, "reason": "طرح/إفلاس"})
+                            continue
+
+                        # تحليل كامل
+                        info_dict = {
+                            "floatShares": (m.get("freeFloat") or 0) * 1e6 if (m.get("freeFloat") or 0) < 1000 else (m.get("freeFloat") or 0),
+                            "shortPercentOfFloat": (m.get("shortPercentOfFloat") or 0) / 100 if (m.get("shortPercentOfFloat") or 0) > 1 else (m.get("shortPercentOfFloat") or 0),
+                            "sharesShort": m.get("sharesShort") or 0,
+                            "marketCap": (m.get("marketCapitalization") or 0) * 1e6 if (m.get("marketCapitalization") or 0) < 100000 else (m.get("marketCapitalization") or 0),
+                        }
+                        r = score(sym, hist, info_dict, splits_raw, None, None)
+                        if r["hard_veto"]:
+                            excluded_live.append({"symbol": sym, "reason": " | ".join(veto_reasons(r, None, None)) or "إقصاء"})
+                            continue
+                        if r["total"] < 40:
+                            excluded_live.append({"symbol": sym, "reason": f"نقاط {r['total']} < 40"})
+                            continue
+
+                        fuel_kind, fuel_txt = short_fuel(r)
+                        fam = detect_families(hist, r)
+                        final.append({
+                            "symbol": sym, "total": r["total"], "price": r["price"],
+                            "rsi": r["rsi"], "fuel_kind": fuel_kind, "fuel_txt": fuel_txt,
+                            "short_pct": r["short_pct"], "float_m": round((r["float"] or 0)/1e6, 2),
+                            "support": r["support"], "dist_sup": r["dist_sup"],
+                            "fam": fam, "verdict": r["verdict"],
+                        })
+
+                    pg.empty()
+                    status.empty()
+
+                    final.sort(key=lambda x: (-{"packed": 3, "present": 2, "exhausted": 1, "missing": 1, "none": 0}.get(x["fuel_kind"], 0), -x["total"]))
+                    st.session_state["live_results"] = final
+                    st.session_state["live_excluded"] = excluded_live
+                    st.success(f"🌊 المسح الحي اكتمل: <b>{len(final)}</b> اكتشاف | {len(excluded_live)} مقصيّ", icon="🎯")
+
+        if "live_results" in st.session_state:
+            final = st.session_state["live_results"]
+            excluded_live = st.session_state.get("live_excluded", [])
+
+            if not final:
+                st.warning("⏳ لا اكتشافات مكتملة المعادلة في هذا المسح — السوق هادئ.")
+            else:
+                packed = [x for x in final if x["fuel_kind"] == "packed"]
+                exhausted = [x for x in final if x["fuel_kind"] == "exhausted"]
+                present = [x for x in final if x["fuel_kind"] in ("present", "missing")]
+
+                cols = st.columns(3)
+                with cols[0]:
+                    st.markdown(f'<div style="background:#d6303115;border:1.5px solid #d63031;border-radius:12px;padding:12px;text-align:center"><div style="font-size:28px;font-weight:bold;color:#d63031">{len(packed)}</div><div>🚀 وقود محشور</div></div>', unsafe_allow_html=True)
+                with cols[1]:
+                    st.markdown(f'<div style="background:#00b89415;border:1.5px solid #00b894;border-radius:12px;padding:12px;text-align:center"><div style="font-size:28px;font-weight:bold;color:#00b894">{len(exhausted)}</div><div>🧹 استنفاد شورت</div></div>', unsafe_allow_html=True)
+                with cols[2]:
+                    st.markdown(f'<div style="background:#0984e315;border:1.5px solid #0984e3;border-radius:12px;padding:12px;text-align:center"><div style="font-size:28px;font-weight:bold;color:#0984e3">{len(present)}</div><div>⛽ وقود متوسط</div></div>', unsafe_allow_html=True)
+
+                # جدول الاكتشافات
+                st.markdown("### 📋 جدول الاكتشافات الحية")
+                rows = []
+                for x in final[:50]:
+                    fuel_emoji = {"packed": "🚀", "exhausted": "🧹", "present": "⛽", "none": "🎈", "missing": "❓"}.get(x["fuel_kind"], "")
+                    rows.append({
+                        "الرمز": x["symbol"],
+                        "النقاط": x["total"],
+                        "السعر": f"${x['price']:.3f}",
+                        "RSI": x["rsi"],
+                        "الوقود": fuel_emoji + " " + str(round(x["short_pct"], 1)) + "%",
+                        "العائمة": f"{x['float_m']}M",
+                        "الفصيلة": " | ".join(x["fam"][:2]) if x["fam"] else "—",
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=500)
+
+                # تفاصيل لكل سهم
+                st.markdown("### 🔬 تفاصيل الاكتشافات")
+                for x in final[:20]:
+                    fuel_emoji = {"packed": "🚀", "exhausted": "🧹", "present": "⛽", "none": "🎈", "missing": "❓"}.get(x["fuel_kind"], "")
+                    with st.expander(f"{fuel_emoji} **{x['symbol']}** — {x['total']}/100 ({x['verdict']}) | ${x['price']:.3f} | RSI {x['rsi']} | شورت {round(x['short_pct'],1)}%"):
+                        st.markdown(f'<div class="info-box">🎯 <b>{x["fuel_txt"]}</b></div>', unsafe_allow_html=True)
+                        if x["fam"]:
+                            st.markdown(f'<div class="info-box">🧬 <b>فصيلة ما قبل الانفجار:</b> {" | ".join(x["fam"])}</div>', unsafe_allow_html=True)
+                        if x["support"]:
+                            ds = x["dist_sup"]
+                            st.markdown(f"📍 دعم: ${x['support']:.3f} ({ds:+.1f}%)")
+                        st.markdown(f'<div class="success-box">💡 للتحليل الكامل: افتح تبويب <b>📈 تحليل سهم</b> واكتب <code>{x["symbol"]}</code></div>', unsafe_allow_html=True)
+
+                if excluded_live:
+                    with st.expander(f"🚫 المقصيون ({len(excluded_live)})"):
+                        for e in excluded_live[:50]:
+                            st.markdown(f"- **{e['symbol']}**: {e['reason']}")
 
 st.markdown("---")
 st.caption("⚠️ تعليمي فقط - ليس توصية استثمارية | نظرية الارتكاز: وايكوف + إليوت + كلاسيكي + الشورت محوراً")
