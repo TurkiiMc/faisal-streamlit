@@ -1,5 +1,5 @@
 """
-Finnhub Discovery Engine v5 — شبكة واسعة، إقصاء حقيقي، لا جولتين
+Finnhub Discovery Engine v6 — كاش اقتباسات + تبريد + مقاومة خنق Yahoo
 """
 import os, time, json, requests, threading, io, csv
 from datetime import datetime, timedelta
@@ -19,13 +19,16 @@ CORE_LIST_RAW = os.environ.get("CORE_LIST", "")
 POOL_FILE = Path("universe_pool.json")
 DISC_FILE = Path("discoveries.json")
 LAST_SCAN = Path("last_scan.json")
+QUOTE_CACHE = Path("quotes_cache.json")   # ✅ جديد: كاش الاقتباسات
 ET = ZoneInfo("America/New_York")
 SCAN_EVERY_HOURS = 6
-POOL_CAP = 400
+POOL_CAP = 250          # ✅ خُفّض من 400
 NEWS_CAP = 80
 MIN_SCORE = 40
 MC_MIN, MC_MAX = 1_000_000, 50_000_000
 PENNY_DANGER = 0.10
+COOLDOWN_SEC = 90       # ✅ تبريد بعد Sweep حي
+CANDLE_WORKERS = 4      # ✅ خُفّض من 10
 
 _scanning = False
 _scan_lock = threading.Lock()
@@ -88,14 +91,12 @@ def candles(sym, period="6mo"):
                 if d.get("success") and d.get("candles"):
                     return d["candles"]
         except Exception: pass
-        if attempt == 0: time.sleep(2)
+        if attempt == 0: time.sleep(3)   # ✅ انتظار أطول بين المحاولات
     return []
 
-# ===== قراءة موحدة للاقتباس (يصلح price/close) =====
 def _q_price(q): return float(q.get("price") or q.get("close") or 0)
 def _q_vol(q):   return float(q.get("volume") or 0)
 
-# ===== تطبيع صحيح: freeFloat نسبة → أسهم =====
 def normalize_metrics(m):
     if not m: return None
     mc_raw = m.get("marketCapitalization") or 0
@@ -103,17 +104,16 @@ def normalize_metrics(m):
     sp_raw = m.get("shortPercentOfFloat") or 0
     sp = sp_raw / 100 if sp_raw > 1 else sp_raw
     sh = m.get("sharesShort") or 0
-    ff_pct = m.get("freeFloat") or 0          # نسبة 0-100
+    ff_pct = m.get("freeFloat") or 0
     shares_out = (m.get("dilutedAverageShares") or m.get("basicAverageShares") or 0)
     if 0 < ff_pct <= 100 and shares_out > 0:
-        fs = shares_out * (ff_pct / 100.0)    # أسهم عائمة حقيقية
+        fs = shares_out * (ff_pct / 100.0)
     elif ff_pct > 100:
-        fs = ff_pct                            # جاء كأسهم مباشرة (نادراً)
+        fs = ff_pct
     else:
-        fs = 0                                 # غير متاح → لا رفض
+        fs = 0
     return {"fs": fs, "sp": sp, "sh": sh, "mc": mc}
 
-# ===== اقتباسات =====
 def stooq_probe(symbols_150):
     q = ",".join(s.lower() + ".us" for s in symbols_150)
     try:
@@ -147,7 +147,18 @@ def proxy_bulk(symbols):
         time.sleep(0.3)
     return out
 
-# ===== حسابات فنية =====
+def load_quotes_cache():
+    if QUOTE_CACHE.exists():
+        age = (time.time() - QUOTE_CACHE.stat().st_mtime) / 3600
+        if age < 24:
+            try:
+                d = json.loads(QUOTE_CACHE.read_text())
+                if isinstance(d, dict) and len(d) > 500:
+                    return d
+            except Exception: pass
+    return None
+
+# ===== فنية =====
 def rsi(closes, p=14):
     if len(closes) < p + 1: return 50.0
     d = [closes[i] - closes[i-1] for i in range(1, len(closes))]
@@ -204,7 +215,6 @@ def is_positive_news(items):
     return any(any(w in t for w in k)
                for t in [(it.get("headline") or "").lower() for it in items[:10]])
 
-# ===== التقييم: شبكة واسعة، إقصاء حقيقي فقط =====
 def score(sym, nm, price, cs, nws, verbose=False):
     if not cs or len(cs) < 30:
         if verbose: print(f"[diag] {sym}: شموع غير كافية ({len(cs) if cs else 0})")
@@ -212,20 +222,16 @@ def score(sym, nm, price, cs, nws, verbose=False):
     if price <= 0:
         if verbose: print(f"[diag] {sym}: سعر غير صالح")
         return None, "bad_price"
-    if price < PENNY_DANGER:                      # حماية شطب فقط
+    if price < PENNY_DANGER:
         if verbose: print(f"[diag] {sym}: تحت $0.10 خطر شطب")
         return None, "penny_danger"
-
     mc = nm["mc"]
     if not (MC_MIN <= mc <= MC_MAX):
         if verbose: print(f"[diag] {sym}: كاب خارج النطاق ({mc/1e6:.1f}M)")
         return None, "market_cap"
-
     closes = [c["close"] for c in cs]
     r = rsi(closes); sup = support(cs)
     s20 = sma(closes, 20); s50 = sma(closes, 50)
-
-    # الإقصاءات الفنية الحقيقية فقط
     if detect_failed_spike(cs):
         if verbose: print(f"[diag] {sym}: Failed Spike")
         return None, "failed_spike"
@@ -241,8 +247,6 @@ def score(sym, nm, price, cs, nws, verbose=False):
     if nws and has_offering_news(nws):
         if verbose: print(f"[diag] {sym}: طرح")
         return None, "offering"
-
-    # النقاط (لا ترفض — تميّز فقط)
     fs, sp, sh = nm["fs"], nm["sp"], nm["sh"]
     pts = 0
     if 23 <= r <= 27: pts += 25
@@ -255,7 +259,7 @@ def score(sym, nm, price, cs, nws, verbose=False):
     elif sp > 0.30: pts += 15
     elif sp > 0.20: pts += 10
     elif sp > 0.10: pts += 5
-    if 0.5 <= price <= 5.0: pts += 8             # bonus penny بدل رفض
+    if 0.5 <= price <= 5.0: pts += 8
     if s20 and price < s20: pts += 5
     if s50 and price < s50: pts += 5
     stab = stability(cs, sup) if sup else 0
@@ -263,11 +267,9 @@ def score(sym, nm, price, cs, nws, verbose=False):
     elif stab >= 2: pts += 7
     pos = is_positive_news(nws) if nws else False
     if pos: pts += 10
-
     if pts < MIN_SCORE:
         if verbose: print(f"[diag] {sym}: نقاط {pts} < {MIN_SCORE} (RSI={r:.0f}, stab={stab}, sp={sp*100:.0f}%)")
         return None, f"score_{pts}"
-
     eff = max(sp, sh / fs if fs else 0)
     fuel = "packed" if eff >= 0.30 else ("present" if eff >= 0.10 else "none")
     return {"sym": sym, "price": round(price, 3), "rsi": round(r, 1), "score": pts,
@@ -276,13 +278,12 @@ def score(sym, nm, price, cs, nws, verbose=False):
             "float_m": round(fs / 1e6, 2), "short_pct": round(eff * 100, 1),
             "stab": stab, "positive_news": pos}, "ok"
 
-# ===== بناء الـ Pool (يتجاهل الكاش الصغير تلقائياً) =====
 def build_pool(force=False):
     if POOL_FILE.exists() and not force:
         age_h = (time.time() - POOL_FILE.stat().st_mtime) / 3600
         try:
             cached = json.loads(POOL_FILE.read_text())
-            if age_h < 144 and len(cached) >= 50:   # ✅ تجاهل الكاش الفارغ/الصغير
+            if age_h < 144 and len(cached) >= 50:
                 return cached
         except Exception: pass
 
@@ -293,24 +294,39 @@ def build_pool(force=False):
         syms = sec_tickers()
     print(f"[pool] {len(syms)} رمز خام")
 
-    probe = stooq_probe(syms[:150])
-    if probe:
-        print("[pool] stooq يستجيب — استخدامه")
-        quotes = dict(probe)
-        for i in range(150, len(syms), 150):
-            quotes.update(stooq_probe(syms[i:i+150]))
-            if (i // 150) % 6 == 0:
-                print(f"[pool] stooq {i}/{len(syms)} — {len(quotes)} اقتباس")
+    # ✅ كاش الاقتباسات: لا ننهك Yahoo مرتين
+    quotes = load_quotes_cache()
+    swept_live = False
+    if quotes:
+        print(f"[pool] اقتباسات من الكاش ({len(quotes)}) — توفير ~5000 طلب Yahoo")
     else:
-        print("[pool] stooq صامت — البروكسي مباشرة")
-        quotes = proxy_bulk(syms)
+        probe = stooq_probe(syms[:150])
+        if probe:
+            print("[pool] stooq يستجيب — استخدامه")
+            quotes = dict(probe)
+            for i in range(150, len(syms), 150):
+                quotes.update(stooq_probe(syms[i:i+150]))
+                if (i // 150) % 6 == 0:
+                    print(f"[pool] stooq {i}/{len(syms)} — {len(quotes)} اقتباس")
+        else:
+            print("[pool] stooq صامت — البروكسي مباشرة")
+            quotes = proxy_bulk(syms)
+        swept_live = True
+        try:
+            QUOTE_CACHE.write_text(json.dumps(quotes))
+            print(f"[pool] كُتب كاش الاقتباسات ({len(quotes)})")
+        except Exception as e:
+            print("[pool] فشل كتابة الكاش:", e)
+        # ✅ تبريد قبل مرحلة الشموع
+        print(f"[pool] تبريد {COOLDOWN_SEC} ثانية لاستعادة حد Yahoo...")
+        time.sleep(COOLDOWN_SEC)
     print(f"[pool] {len(quotes)} اقتباس")
 
     pre = [s for s, q in quotes.items()
            if _q_price(q) >= PENNY_DANGER and _q_vol(q) >= 50_000]
     pre.sort(key=lambda s: -_q_vol(quotes[s]))
     pre = pre[:POOL_CAP]
-    print(f"[pool] {len(pre)} اجتاز السعر+الحجم (الأعلى حجماً)")   # يجب أن يكون مئات
+    print(f"[pool] {len(pre)} اجتاز السعر+الحجم (الأعلى حجماً)")
 
     pool = []
     for i, s in enumerate(pre):
@@ -333,27 +349,32 @@ def build_pool(force=False):
     POOL_FILE.write_text(json.dumps(pool))
     return pool
 
-# ===== المسح: مرحلتان (نقاط أولية → أخبار → نهائي) =====
 def daily_scan():
     pool = build_pool()
-    print(f"[scan] جلب شموع متوازي لـ {len(pool)} مرشح...")
+    print(f"[scan] جلب شموع متوازي (workers={CANDLE_WORKERS}) لـ {len(pool)} مرشح...")
     candles_map = {}
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=CANDLE_WORKERS) as ex:
         futs = {ex.submit(candles, p["sym"], "6mo"): p["sym"] for p in pool}
         done = 0
         for f in as_completed(futs):
             done += 1
             if done % 50 == 0: print(f"[scan] شموع {done}/{len(pool)}")
-            try: candles_map[futs[f]] = f.result()
+            try:
+                res = f.result()
+                if res: candles_map[futs[f]] = res
             except Exception: pass
-    print(f"[scan] شموع جاهزة: {len(candles_map)}/{len(pool)}")
+    got = len(candles_map)
+    print(f"[scan] شموع جاهزة: {got}/{len(pool)}")
+    if len(pool) > 0 and got / len(pool) < 0.5:
+        print(f"[warn] ⚠️ خنق Yahoo محتمل: رجعت {got}/{len(pool)} شموع فقط — سيقل الاكتشاف")
 
-    # المرحلة أ: نقاط أولية بدون أخبار
     prelim = []
     rejections = {}
     for i, p in enumerate(pool):
         cs = candles_map.get(p["sym"])
-        if not cs: continue
+        if not cs:
+            rejections["no_candles"] = rejections.get("no_candles", 0) + 1
+            continue
         price = cs[-1]["close"]
         nm = {"fs": p["fs"], "sp": p["sp"], "sh": p["sh"], "mc": p["mc"]}
         verbose = i < 30
@@ -368,8 +389,6 @@ def daily_scan():
     prelim.sort(key=lambda x: -x[3]["score"])
     prelim = prelim[:NEWS_CAP]
     print(f"[scan] أخبار لـ {len(prelim)} مرشح نهائي...")
-
-    # المرحلة ب: أخبار + تقييم نهائي
     disc = []
     for p, price, cs, _ in prelim:
         nws = news(p["sym"], 7)
@@ -417,7 +436,7 @@ def auto_watchlist(disc):
 
 def notify(disc):
     if not disc:
-        send_tg("🛰️ <b>مسح اليوم</b>: لا اكتشافات — راجع ملخص الرفض في السجلات")
+        send_tg("🛰️ <b>مسح اليوم</b>: لا اكتشافات — راجع [warn]/ملخص الرفض في السجلات")
         return
     packed = [d for d in disc if d["fuel"] == "packed"]
     present = [d for d in disc if d["fuel"] == "present"]
@@ -486,8 +505,12 @@ def root():
     if POOL_FILE.exists():
         try: n = len(json.loads(POOL_FILE.read_text()))
         except Exception: pass
-    return {"engine": "finnhub-discovery-v5", "pool": n, "scanning": _scanning,
-            "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
+    qc = 0
+    if QUOTE_CACHE.exists():
+        try: qc = len(json.loads(QUOTE_CACHE.read_text()))
+        except Exception: pass
+    return {"engine": "finnhub-discovery-v6", "pool": n, "quotes_cached": qc,
+            "scanning": _scanning, "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
 
 @app.get("/latest")
 def latest():
