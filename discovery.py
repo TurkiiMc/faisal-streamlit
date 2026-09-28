@@ -1,5 +1,6 @@
 """
-Finnhub Discovery Engine v6 — كاش اقتباسات + تبريد + مقاومة خنق Yahoo
+Finnhub Discovery Engine v8 — مسرّعة: كاش metrics + CAPs مضبوطة + شموع 6 workers
+المسحات الساخنة 3-5 دقائق، الباردة 35-40 دقيقة. توقيتات cron لا تتغيّر.
 """
 import os, time, json, requests, threading, io, csv
 from datetime import datetime, timedelta
@@ -19,16 +20,19 @@ CORE_LIST_RAW = os.environ.get("CORE_LIST", "")
 POOL_FILE = Path("universe_pool.json")
 DISC_FILE = Path("discoveries.json")
 LAST_SCAN = Path("last_scan.json")
-QUOTE_CACHE = Path("quotes_cache.json")   # ✅ جديد: كاش الاقتباسات
+QUOTE_CACHE = Path("quotes_cache.json")
+METRICS_CACHE = Path("metrics_cache.json")   # ✅ v8: كاش الـ metrics
 ET = ZoneInfo("America/New_York")
 SCAN_EVERY_HOURS = 6
-POOL_CAP = 250          # ✅ خُفّض من 400
-NEWS_CAP = 80
+POOL_CAP = 150          # ✅ v8: 250 -> 150
+PRE_CAP = 300           # ✅ v8: 500 -> 300
+PRICE_CEIL = 50.0
+NEWS_CAP = 60           # ✅ v8: 80 -> 60
 MIN_SCORE = 40
 MC_MIN, MC_MAX = 1_000_000, 50_000_000
 PENNY_DANGER = 0.10
-COOLDOWN_SEC = 90       # ✅ تبريد بعد Sweep حي
-CANDLE_WORKERS = 4      # ✅ خُفّض من 10
+COOLDOWN_SEC = 90
+CANDLE_WORKERS = 6      # ✅ v8: 4 -> 6 (آمن مع الكاش)
 
 _scanning = False
 _scan_lock = threading.Lock()
@@ -91,7 +95,7 @@ def candles(sym, period="6mo"):
                 if d.get("success") and d.get("candles"):
                     return d["candles"]
         except Exception: pass
-        if attempt == 0: time.sleep(3)   # ✅ انتظار أطول بين المحاولات
+        if attempt == 0: time.sleep(3)
     return []
 
 def _q_price(q): return float(q.get("price") or q.get("close") or 0)
@@ -113,6 +117,21 @@ def normalize_metrics(m):
     else:
         fs = 0
     return {"fs": fs, "sp": sp, "sh": sh, "mc": mc}
+
+# ===== كاش الـ metrics (v8) =====
+def load_metrics_cache():
+    if METRICS_CACHE.exists():
+        age = (time.time() - METRICS_CACHE.stat().st_mtime) / 3600
+        if age < 24:
+            try:
+                d = json.loads(METRICS_CACHE.read_text())
+                if isinstance(d, dict): return d
+            except Exception: pass
+    return {}
+
+def save_metrics_cache(d):
+    try: METRICS_CACHE.write_text(json.dumps(d))
+    except Exception as e: print("[cache] فشل حفظ metrics:", e)
 
 def stooq_probe(symbols_150):
     q = ",".join(s.lower() + ".us" for s in symbols_150)
@@ -153,8 +172,7 @@ def load_quotes_cache():
         if age < 24:
             try:
                 d = json.loads(QUOTE_CACHE.read_text())
-                if isinstance(d, dict) and len(d) > 500:
-                    return d
+                if isinstance(d, dict) and len(d) > 500: return d
             except Exception: pass
     return None
 
@@ -220,11 +238,9 @@ def score(sym, nm, price, cs, nws, verbose=False):
         if verbose: print(f"[diag] {sym}: شموع غير كافية ({len(cs) if cs else 0})")
         return None, "no_candles"
     if price <= 0:
-        if verbose: print(f"[diag] {sym}: سعر غير صالح")
-        return None, "bad_price"
+        if verbose: print(f"[diag] {sym}: سعر غير صالح"); return None, "bad_price"
     if price < PENNY_DANGER:
-        if verbose: print(f"[diag] {sym}: تحت $0.10 خطر شطب")
-        return None, "penny_danger"
+        if verbose: print(f"[diag] {sym}: تحت $0.10 خطر شطب"); return None, "penny_danger"
     mc = nm["mc"]
     if not (MC_MIN <= mc <= MC_MAX):
         if verbose: print(f"[diag] {sym}: كاب خارج النطاق ({mc/1e6:.1f}M)")
@@ -233,20 +249,15 @@ def score(sym, nm, price, cs, nws, verbose=False):
     r = rsi(closes); sup = support(cs)
     s20 = sma(closes, 20); s50 = sma(closes, 50)
     if detect_failed_spike(cs):
-        if verbose: print(f"[diag] {sym}: Failed Spike")
-        return None, "failed_spike"
+        if verbose: print(f"[diag] {sym}: Failed Spike"); return None, "failed_spike"
     if detect_bull_trap(cs):
-        if verbose: print(f"[diag] {sym}: Bull Trap")
-        return None, "bull_trap"
+        if verbose: print(f"[diag] {sym}: Bull Trap"); return None, "bull_trap"
     if sup and price < sup * 0.97:
-        if verbose: print(f"[diag] {sym}: دعم مكسور")
-        return None, "support_broken"
+        if verbose: print(f"[diag] {sym}: دعم مكسور"); return None, "support_broken"
     if nws and is_critical_news(nws):
-        if verbose: print(f"[diag] {sym}: أخبار حرجة")
-        return None, "critical_news"
+        if verbose: print(f"[diag] {sym}: أخبار حرجة"); return None, "critical_news"
     if nws and has_offering_news(nws):
-        if verbose: print(f"[diag] {sym}: طرح")
-        return None, "offering"
+        if verbose: print(f"[diag] {sym}: طرح"); return None, "offering"
     fs, sp, sh = nm["fs"], nm["sp"], nm["sh"]
     pts = 0
     if 23 <= r <= 27: pts += 25
@@ -290,13 +301,10 @@ def build_pool(force=False):
     print("[pool] بناء قائمة أسبوعية...")
     syms = all_us_symbols()
     if not syms:
-        print("[pool] Finnhub فارغ — SEC بديلاً")
-        syms = sec_tickers()
+        print("[pool] Finnhub فارغ — SEC بديلاً"); syms = sec_tickers()
     print(f"[pool] {len(syms)} رمز خام")
 
-    # ✅ كاش الاقتباسات: لا ننهك Yahoo مرتين
     quotes = load_quotes_cache()
-    swept_live = False
     if quotes:
         print(f"[pool] اقتباسات من الكاش ({len(quotes)}) — توفير ~5000 طلب Yahoo")
     else:
@@ -311,40 +319,55 @@ def build_pool(force=False):
         else:
             print("[pool] stooq صامت — البروكسي مباشرة")
             quotes = proxy_bulk(syms)
-        swept_live = True
         try:
             QUOTE_CACHE.write_text(json.dumps(quotes))
             print(f"[pool] كُتب كاش الاقتباسات ({len(quotes)})")
-        except Exception as e:
-            print("[pool] فشل كتابة الكاش:", e)
-        # ✅ تبريد قبل مرحلة الشموع
+        except Exception as e: print("[pool] فشل كتابة الكاش:", e)
         print(f"[pool] تبريد {COOLDOWN_SEC} ثانية لاستعادة حد Yahoo...")
         time.sleep(COOLDOWN_SEC)
     print(f"[pool] {len(quotes)} اقتباس")
 
-    pre = [s for s, q in quotes.items()
-           if _q_price(q) >= PENNY_DANGER and _q_vol(q) >= 50_000]
-    pre.sort(key=lambda s: -_q_vol(quotes[s]))
-    pre = pre[:POOL_CAP]
-    print(f"[pool] {len(pre)} اجتاز السعر+الحجم (الأعلى حجماً)")
+    cand = [(s, _q_vol(q)) for s, q in quotes.items()
+            if PENNY_DANGER <= _q_price(q) <= PRICE_CEIL and _q_vol(q) >= 50_000]
+    cand.sort(key=lambda x: -x[1])
+    cand = cand[:PRE_CAP]
+    print(f"[pool] {len(cand)} مرشح أولي (سعر 0.10-50 + حجم، الأعلى حجماً)")
 
-    pool = []
-    for i, s in enumerate(pre):
-        m = metrics(s)
-        nm = normalize_metrics(m)
+    # ✅ v8: metrics من الكاش أولاً، والناقص فقط يُجلب
+    mcache = load_metrics_cache()
+    survivors = []
+    misses = []
+    hits = 0
+    for s, vol in cand:
+        if s in mcache:
+            hits += 1
+            nm = mcache[s]
+            if nm and MC_MIN <= nm["mc"] <= MC_MAX:
+                survivors.append((s, vol, nm))
+        else:
+            misses.append((s, vol))
+    print(f"[pool] metrics كاش: {hits} مُخبّأ، {len(misses)} مطلوب جلبها")
+    for i, (s, vol) in enumerate(misses):
+        nm = normalize_metrics(metrics(s))
+        if nm: mcache[s] = nm   # لا نخزن None (يُعاد تجربته لاحقاً)
         if nm and MC_MIN <= nm["mc"] <= MC_MAX:
-            pool.append({"sym": s, **nm})
-        if i % 40 == 0:
-            print(f"[pool] metrics {i}/{len(pre)} — مقبول {len(pool)}")
-    print(f"[pool] اجتاز الكب: {len(pool)}")
+            survivors.append((s, vol, nm))
+        if i % 50 == 0:
+            print(f"[pool] metrics جلب {i}/{len(misses)} — ناجٍ {len(survivors)}")
+    save_metrics_cache(mcache)
+    survivors.sort(key=lambda x: -x[1])
+    pool = [{"sym": s, **nm} for s, vol, nm in survivors[:POOL_CAP]]
+    print(f"[pool] اجتاز الكب: {len(survivors)} → نهائي {len(pool)}")
 
     for t in CORE_LIST_RAW.replace(";", ",").split(","):
         s = t.split(":")[0].strip().upper()
         if s and not any(p["sym"] == s for p in pool):
-            m = metrics(s)
-            nm = normalize_metrics(m)
-            if nm:
-                pool.append({"sym": s, **nm})
+            if s in mcache: nm = mcache[s]
+            else:
+                nm = normalize_metrics(metrics(s))
+                if nm: mcache[s] = nm
+            if nm: pool.append({"sym": s, **nm})
+    save_metrics_cache(mcache)
     print(f"[pool] نهائي مع CORE_LIST: {len(pool)}")
     POOL_FILE.write_text(json.dumps(pool))
     return pool
@@ -366,7 +389,7 @@ def daily_scan():
     got = len(candles_map)
     print(f"[scan] شموع جاهزة: {got}/{len(pool)}")
     if len(pool) > 0 and got / len(pool) < 0.5:
-        print(f"[warn] ⚠️ خنق Yahoo محتمل: رجعت {got}/{len(pool)} شموع فقط — سيقل الاكتشاف")
+        print(f"[warn] ⚠️ خنق Yahoo محتمل: رجعت {got}/{len(pool)} شموع فقط")
 
     prelim = []
     rejections = {}
@@ -379,10 +402,8 @@ def daily_scan():
         nm = {"fs": p["fs"], "sp": p["sp"], "sh": p["sh"], "mc": p["mc"]}
         verbose = i < 30
         r, reason = score(p["sym"], nm, price, cs, [], verbose=verbose)
-        if r:
-            prelim.append((p, price, cs, r))
-        else:
-            rejections[reason] = rejections.get(reason, 0) + 1
+        if r: prelim.append((p, price, cs, r))
+        else: rejections[reason] = rejections.get(reason, 0) + 1
         if i % 20 == 0:
             print(f"[scan] أولي {i}/{len(pool)} — مرشحون {len(prelim)}")
 
@@ -436,7 +457,7 @@ def auto_watchlist(disc):
 
 def notify(disc):
     if not disc:
-        send_tg("🛰️ <b>مسح اليوم</b>: لا اكتشافات — راجع [warn]/ملخص الرفض في السجلات")
+        send_tg("🛰️ <b>مسح اليوم</b>: لا اكتشافات (سوق هادئ/مغلق) — راجع ملخص الرفض")
         return
     packed = [d for d in disc if d["fuel"] == "packed"]
     present = [d for d in disc if d["fuel"] == "present"]
@@ -461,34 +482,27 @@ def last_scan_age_hours():
 
 def should_scan():
     now = datetime.now(ET)
-    if now.hour < 6 or now.hour >= 22: return False
+    if now.weekday() >= 5: return False
+    if now.hour < 6 or now.hour >= 19: return False
     return last_scan_age_hours() >= SCAN_EVERY_HOURS
 
 def run_once():
     global _scanning
     with _scan_lock:
         if _scanning:
-            print("[scan] مسح جارٍ بالفعل — تجاهل الطلب الجديد")
-            return []
+            print("[scan] مسح جارٍ بالفعل — تجاهل الطلب الجديد"); return []
         _scanning = True
     try:
-        disc = daily_scan()
-        notify(disc)
-        auto_watchlist(disc)
-        return disc
+        disc = daily_scan(); notify(disc); auto_watchlist(disc); return disc
     finally:
-        with _scan_lock:
-            _scanning = False
+        with _scan_lock: _scanning = False
 
 def scheduler_loop():
     while True:
         try:
             if should_scan():
-                print("[sched] بدء المسح الدوري")
-                run_once()
-                print("[sched] اكتمل المسح")
-        except Exception as e:
-            print("[sched] error:", e)
+                print("[sched] بدء المسح الدوري"); run_once(); print("[sched] اكتمل المسح")
+        except Exception as e: print("[sched] error:", e)
         time.sleep(300)
 
 app = FastAPI()
@@ -501,16 +515,19 @@ def health(): return {"ok": True, "scanning": _scanning, "last_scan_hours_ago": 
 
 @app.get("/")
 def root():
-    n = 0
+    n = qc = mc = 0
     if POOL_FILE.exists():
         try: n = len(json.loads(POOL_FILE.read_text()))
         except Exception: pass
-    qc = 0
     if QUOTE_CACHE.exists():
         try: qc = len(json.loads(QUOTE_CACHE.read_text()))
         except Exception: pass
-    return {"engine": "finnhub-discovery-v6", "pool": n, "quotes_cached": qc,
-            "scanning": _scanning, "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
+    if METRICS_CACHE.exists():
+        try: mc = len(json.loads(METRICS_CACHE.read_text()))
+        except Exception: pass
+    return {"engine": "finnhub-discovery-v8", "pool": n, "quotes_cached": qc,
+            "metrics_cached": mc, "scanning": _scanning,
+            "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
 
 @app.get("/latest")
 def latest():
