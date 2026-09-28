@@ -1,9 +1,11 @@
 """
-Finnhub Discovery Engine v8.2 — سوق حي بلا ذاكرة
+Finnhub Discovery Engine v8.4 — سوق حي بلا ذاكرة + مرور هادئ على Yahoo
 - لا قراءة universe_pool.json: كل مسح يبني قائمته من اقتباسات السوق الأحدث
 - لا CORE_LIST: السوق فقط، لا أسهم محفوظة
-- كاش اقتباسات/مetrics نفس اليوم للسرعة فقط (لا يؤثر على مصدر Universe)
-- إقصاءات مطابقة للمحلل: failed_spike أوسع + broken_base جديد
+- كاش اقتباسات/مetrics نفس اليوم للسرعة فقط
+- إقصاءات مطابقة للمحلل: failed_spike أوسع + broken_base
+- v8.4: دفعات اقتباس 60 رمزاً (تتسع داخل المهلة) + تباعد 2s
+        + تبريد 180 ثانية قبل الشموع + عمال شموع 3 (لا دفعات متروكة تحرق البيت)
 - /reset لمسح كل الذاكرة يدوياً
 """
 import os, time, json, requests, threading, io, csv
@@ -35,7 +37,8 @@ MIN_SCORE = 40
 MC_MIN, MC_MAX = 1_000_000, 50_000_000
 PENNY_DANGER = 0.10
 COOLDOWN_SEC = 90
-CANDLE_WORKERS = 6
+CANDLE_COOLDOWN_SEC = 180   # v8.4: تبريد قبل الشموع
+CANDLE_WORKERS = 3          # v8.4: سيل بطيء بدل دفعة تنبه الجدار
 
 _scanning = False
 _scan_lock = threading.Lock()
@@ -155,7 +158,8 @@ def stooq_probe(symbols_150):
 
 def proxy_bulk(symbols):
     out = {}
-    chunks = [symbols[i:i+150] for i in range(0, len(symbols), 150)]
+    # v8.4: دفعات 60 رمزاً — تكتمل داخل مهلة الـ120 ثانية فلا تُترك طلبات متروكة
+    chunks = [symbols[i:i+60] for i in range(0, len(symbols), 60)]
     for ci, chunk in enumerate(chunks):
         try:
             r = requests.get(PROXY + "/yahoo/last",
@@ -163,9 +167,9 @@ def proxy_bulk(symbols):
             if r.status_code == 200:
                 out.update(r.json().get("quotes", {}))
         except Exception: pass
-        if ci % 4 == 0 or ci == len(chunks) - 1:
+        if ci % 8 == 0 or ci == len(chunks) - 1:
             print(f"[pool] بروكسي دفعة {ci+1}/{len(chunks)} — {len(out)} اقتباس")
-        time.sleep(0.3)
+        time.sleep(2.0)   # v8.4: بصمة أهدأ على Yahoo
     return out
 
 def load_quotes_cache():
@@ -210,6 +214,12 @@ def detect_broken_base(cs):
     cur = cs[-1]["close"]
     if base <= 0: return False
     return mx > base * 1.8 and cur < base * 1.05
+
+def detect_bull_trap(cs):
+    if len(cs) < 25: return False
+    res = max(c["high"] for c in cs[-20:])
+    if not any(c["high"] > res * 0.98 for c in cs[-5:]): return False
+    return cs[-1]["close"] < res * 0.97
 
 def stability(cs, sup):
     if not sup or len(cs) < 5: return 0
@@ -297,12 +307,6 @@ def score(sym, nm, price, cs, nws, verbose=False):
             "float_m": round(fs / 1e6, 2), "short_pct": round(eff * 100, 1),
             "stab": stab, "positive_news": pos}, "ok"
 
-def detect_bull_trap(cs):
-    if len(cs) < 25: return False
-    res = max(c["high"] for c in cs[-20:])
-    if not any(c["high"] > res * 0.98 for c in cs[-5:]): return False
-    return cs[-1]["close"] < res * 0.97
-
 def build_pool():
     # v8.2: لا قراءة لأي pool مخزن — بناء من السوق الحي كل مسح
     print("[pool] بناء قائمة من السوق الحي (بلا ذاكرة)...")
@@ -367,6 +371,9 @@ def build_pool():
 
 def daily_scan():
     pool = build_pool()
+    # v8.4: برد الجدار قبل مرحلة الشموع
+    print(f"[scan] تبريد {CANDLE_COOLDOWN_SEC} ثانية قبل الشموع (تهدئة Yahoo)...")
+    time.sleep(CANDLE_COOLDOWN_SEC)
     print(f"[scan] جلب شموع متوازي (workers={CANDLE_WORKERS}) لـ {len(pool)} مرشح...")
     candles_map = {}
     with ThreadPoolExecutor(max_workers=CANDLE_WORKERS) as ex:
@@ -518,7 +525,7 @@ def root():
     if METRICS_CACHE.exists():
         try: mc = len(json.loads(METRICS_CACHE.read_text()))
         except Exception: pass
-    return {"engine": "finnhub-discovery-v8.2", "pool_diag": n, "quotes_cached": qc,
+    return {"engine": "finnhub-discovery-v8.4", "pool_diag": n, "quotes_cached": qc,
             "metrics_cached": mc, "scanning": _scanning,
             "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
 
