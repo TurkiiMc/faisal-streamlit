@@ -98,6 +98,7 @@ def stooq_candles(symbol, period="1y"):
     except Exception: return pd.DataFrame()
 
 def _candles_uncached(symbol, period="6mo"):
+    # 1. المحاولة الأولى: البروكسي (المصدر الموثوق)
     if PROXY_URL:
         for attempt in range(2):
             try:
@@ -112,23 +113,19 @@ def _candles_uncached(symbol, period="6mo"):
                         df = df.set_index("date").sort_index()
                         df.columns = [c.capitalize() for c in df.columns]
                         return df, data.get("splits", []), "yahoo_proxy"
+                else:
+                    print(f"[APP] Proxy failed for {symbol}: HTTP {r.status_code}")
                 if r.status_code in (429, 503): time.sleep(3)
-            except Exception: time.sleep(2)
-    if not ON_RENDER:
-        try:
-            import yfinance as yf
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period=period)
-            if not df.empty:
-                df.columns = [c.capitalize() for c in df.columns]
-                splits_list = []
-                for date, ratio in ticker.splits.items():
-                    num, den = (1, int(round(1/ratio))) if (ratio and ratio < 1) else (int(ratio), 1)
-                    splits_list.append({"date": date.strftime("%Y-%m-%d"), "numerator": num, "denominator": den})
-                return df, splits_list, "yfinance"
-        except Exception: pass
+            except Exception as e:
+                print(f"[APP] Proxy exception for {symbol}: {e}")
+                time.sleep(2)
+    
+    # 2. المحاولة الثانية: Stooq (كاحتياطي أخير فقط)
     df = stooq_candles(symbol, period)
-    if not df.empty: return df, [], "stooq"
+    if not df.empty: 
+        return df, [], "stooq"
+    
+    print(f"[APP] All data sources failed for {symbol}")
     return pd.DataFrame(), [], "none"
 
 def get_candles_unified(symbol, period="6mo"):
@@ -175,7 +172,6 @@ def finnhub_get(path, params=None):
     return None
 
 def finnhub_all_symbols():
-    """كل رموز US الحقيقية (شركات فقط، بورصات منظمة)"""
     data = finnhub_get("/stock/symbol", {"exchange": "US"})
     if not data: return []
     ok_mic = {"XNAS", "XNYS", "ARCX", "BATS", "XASE"}
@@ -192,7 +188,6 @@ def finnhub_metrics_live(sym):
     return (m or {}).get("metric", {})
 
 def proxy_bulk_quotes(symbols):
-    """اقتباسات مجمّعة عبر البروكسي (بلا استهلاك Finnhub)"""
     out = {}
     for i in range(0, len(symbols), 200):
         chunk = symbols[i:i+200]
@@ -207,7 +202,6 @@ def proxy_bulk_quotes(symbols):
     return out
 
 def stooq_bulk(symbols):
-    """اقتباسات stooq الجماعية — بديل إن فشل البروكسي"""
     out = {}
     for i in range(0, len(symbols), 150):
         chunk = symbols[i:i+150]
@@ -227,7 +221,7 @@ def stooq_bulk(symbols):
         time.sleep(0.5)
     return out
 
-# ===== الدوال الأساسية للتحليل (من النسخة السابقة) =====
+# ===== الدوال الأساسية للتحليل =====
 def _metrics_uncached(symbol):
     info = {"floatShares": 0, "shortPercentOfFloat": 0, "sharesShort": 0, "marketCap": 0}
     if not FINNHUB_KEY: return info
@@ -1002,7 +996,8 @@ def sweep_mode_candidate(h4, hist, support, dist_sup):
         if float(h4["Low"].tail(10).min()) < support * 0.99: return True
     return bool(detect_liquidity_sweep(hist))
 
-def render_full_analysis(sym, hist, splits, info, news, offering, r):
+# ===== FIX 1: إضافة portfolio_size و risk_percent كمعاملات =====
+def render_full_analysis(sym, hist, splits, info, news, offering, r, portfolio_size, risk_percent):
     st.markdown(f'<div class="score-card"><div class="score-big" style="color:{r["color"]}">{r["total"]}/100</div><div class="verdict">{r["verdict"]}</div></div>', unsafe_allow_html=True)
 
     if r.get("hard_veto"):
@@ -1284,7 +1279,8 @@ with tab1:
                 offering = check_offering(sym)
                 news = check_news(sym)
                 r = score(sym, hist, info, splits, news, offering=offering)
-                render_full_analysis(sym, hist, splits, info, news, offering, r)
+                # ===== FIX 2: تمرير المتغيرات المفقودة للدالة =====
+                render_full_analysis(sym, hist, splits, info, news, offering, r, portfolio_size, risk_percent)
 
     with st.expander("📓 دفتر المتابعة اليومي"):
         with st.form("journal_form"):
@@ -1536,7 +1532,6 @@ with tab3:
                         quotes = stooq_bulk(all_syms)
                 st.info(f"💰 اقتباسات: {len(quotes)} رمز")
 
-                # التصفية السريعة
                 pre_filtered = []
                 for sym, q in quotes.items():
                     p, v = q.get("close", 0), q.get("volume", 0)
@@ -1547,7 +1542,6 @@ with tab3:
                 if not pre_filtered:
                     st.error("❌ لا رموز اجتازت التصفية الأولية — السوق هادئ اليوم.")
                 else:
-                    # قص إلى الحد الأقصى
                     pre_filtered = pre_filtered[:max_candidates]
                     st.info(f"⚙️ سنفحص {len(pre_filtered)} رمزاً بعمق (metrics + news + candles)")
 
@@ -1555,7 +1549,6 @@ with tab3:
                     pg = st.progress(0)
                     status = st.empty()
 
-                    # المرحلة 1: metrics فقط (سريعة نسبياً)
                     status.info(f"📊 المرحلة 1/3: جلب metrics لـ {len(pre_filtered)} رمز...")
                     sym_with_metrics = []
                     for i, sym in enumerate(pre_filtered):
@@ -1574,7 +1567,6 @@ with tab3:
                         sym_with_metrics.append((sym, m))
                     st.info(f"✅ اجتاز metrics: {len(sym_with_metrics)} رمز (كاب/عائمة/شورت)")
 
-                    # المرحلة 2: candles + news
                     status.info(f"🕯️ المرحلة 2/3: شموع + أخبار لـ {len(sym_with_metrics)} رمز...")
                     final = []
                     for i, (sym, m) in enumerate(sym_with_metrics):
@@ -1598,7 +1590,6 @@ with tab3:
                         hist = hist.set_index("date").sort_index()
                         hist.columns = [c.capitalize() for c in hist.columns]
 
-                        # أخبار
                         news_items = []
                         try:
                             today = datetime.now().strftime("%Y-%m-%d")
@@ -1608,7 +1599,6 @@ with tab3:
                             if nr: news_items = nr
                         except Exception: pass
 
-                        # فحص سريع للإقصاءات
                         crit = ["bankruptcy", "delisting", "delisted", "fraud", "trading halt", "chapter 11"]
                         off_k = ["public offering", "private placement", "dilution", "shelf offering"]
                         is_crit = any(any(k in ((it.get("headline") or "") + " " + (it.get("summary") or "")).lower() for k in crit) for it in news_items[:10])
@@ -1617,7 +1607,6 @@ with tab3:
                             excluded_live.append({"symbol": sym, "reason": "طرح/إفلاس"})
                             continue
 
-                        # تحليل كامل
                         info_dict = {
                             "floatShares": (m.get("freeFloat") or 0) * 1e6 if (m.get("freeFloat") or 0) < 1000 else (m.get("freeFloat") or 0),
                             "shortPercentOfFloat": (m.get("shortPercentOfFloat") or 0) / 100 if (m.get("shortPercentOfFloat") or 0) > 1 else (m.get("shortPercentOfFloat") or 0),
@@ -1669,7 +1658,6 @@ with tab3:
                 with cols[2]:
                     st.markdown(f'<div style="background:#0984e315;border:1.5px solid #0984e3;border-radius:12px;padding:12px;text-align:center"><div style="font-size:28px;font-weight:bold;color:#0984e3">{len(present)}</div><div>⛽ وقود متوسط</div></div>', unsafe_allow_html=True)
 
-                # جدول الاكتشافات
                 st.markdown("### 📋 جدول الاكتشافات الحية")
                 rows = []
                 for x in final[:50]:
@@ -1685,7 +1673,6 @@ with tab3:
                     })
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=500)
 
-                # تفاصيل لكل سهم
                 st.markdown("### 🔬 تفاصيل الاكتشافات")
                 for x in final[:20]:
                     fuel_emoji = {"packed": "🚀", "exhausted": "🧹", "present": "⛽", "none": "🎈", "missing": "❓"}.get(x["fuel_kind"], "")
