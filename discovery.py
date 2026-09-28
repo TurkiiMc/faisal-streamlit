@@ -1,10 +1,11 @@
 """
-Finnhub Discovery Engine v10.1 — شكل نقي + متوسطات حيّة
+Finnhub Discovery Engine v10.7 — شكل نقي + متوسطات + أنماط + فلوت ≤5M
 - universe = بورصة ناسداك (XNAS) + بورصة نيويورك (XNYS)
 - لا شورت، لا CORE_LIST، لا ذاكرة — شكل نقي فقط
-- نطاق الصيد 0.50-6.00 | كاب 1M-20M
-- v10.1: المتوسطات كسياق ارتكاز (جيب SMA20 + هيكل سليم)
-         + هدف فني واقعي (أقرب SMA فوق السعر) يذهب للبوت وتليجرام
+- نطاق الصيد: سعر 1.0-7.0$ | كاب 500K-50M | فلوت ≤5M
+- MIN_SCORE = 30 (شبكة أوسع)
+- v10.7: فلوت أقصى 5M + نقاط MACD/RVOL/W/ذيل + stab4h اختياري
+- v10.2: متوسطات حية (SMA20/50 + هدف فني res)
 - دفعات 60 + تباعد 2s + تبريد 180s قبل الشموع + عمال 3
 """
 import os, time, json, requests, threading, io, csv
@@ -12,6 +13,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
+import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
@@ -21,7 +24,7 @@ TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 BOT_URL = os.environ.get("BOT_URL", "").rstrip("/")
 
-POOL_FILE = Path("universe_pool.json")      # تشخيص فقط — لا يُقرأ
+POOL_FILE = Path("universe_pool.json")
 DISC_FILE = Path("discoveries.json")
 LAST_SCAN = Path("last_scan.json")
 QUOTE_CACHE = Path("quotes_cache.json")
@@ -30,11 +33,12 @@ ET = ZoneInfo("America/New_York")
 SCAN_EVERY_HOURS = 6
 POOL_CAP = 150
 PRE_CAP = 300
-PRICE_CEIL = 6.0
-PENNY_DANGER = 0.50
+PRICE_CEIL = 7.0
+PENNY_DANGER = 1.0
+FLOAT_MAX = 5_000_000
 NEWS_CAP = 60
-MIN_SCORE = 40
-MC_MIN, MC_MAX = 1_000_000, 50_000_000
+MIN_SCORE = 30
+MC_MIN, MC_MAX = 500_000, 50_000_000
 COOLDOWN_SEC = 90
 CANDLE_COOLDOWN_SEC = 180
 CANDLE_WORKERS = 3
@@ -65,7 +69,6 @@ def fh_get(path, params=None):
     return None
 
 def all_us_symbols():
-    # v10: universe = أسهم بورصة ناسداك (XNAS) + بورصة نيويورك (XNYS)
     data = fh_get("/stock/symbol", {"exchange": "US"})
     if not data: return []
     return [s["symbol"] for s in data
@@ -107,11 +110,12 @@ def _q_price(q): return float(q.get("price") or q.get("close") or 0)
 def _q_vol(q):   return float(q.get("volume") or 0)
 
 def normalize_metrics(m):
-    # v10: الكاب فقط (بوابة) — لا شورت ولا فلوت
     if not m: return None
     mc_raw = m.get("marketCapitalization") or 0
     mc = mc_raw * 1e6 if 0 < mc_raw < 100000 else mc_raw
-    return {"mc": mc}
+    ff_raw = m.get("freeFloat") or 0
+    fs = ff_raw * 1e6 if 0 < ff_raw < 1000 else ff_raw
+    return {"mc": mc, "fs": fs}
 
 def load_metrics_cache():
     if METRICS_CACHE.exists():
@@ -170,7 +174,7 @@ def load_quotes_cache():
             except Exception: pass
     return None
 
-# ===== فنية (شكل نقي + متوسطات) =====
+# ===== دوال فنية =====
 def rsi(closes, p=14):
     if len(closes) < p + 1: return 50.0
     d = [closes[i] - closes[i-1] for i in range(1, len(closes))]
@@ -235,6 +239,90 @@ def is_positive_news(items):
     return any(any(w in t for w in k)
                for t in [(it.get("headline") or "").lower() for it in items[:10]])
 
+# ===== دوال v10.7: MACD, W Pattern, Wick Rebound =====
+def macd(close, fast=12, slow=26, signal=9):
+    if len(close) < slow: return False, False, 0.0
+    e12 = close.ewm(span=fast, adjust=False).mean()
+    e26 = close.ewm(span=slow, adjust=False).mean()
+    m = e12 - e26
+    s = m.ewm(span=signal, adjust=False).mean()
+    h = m - s
+    return m.iloc[-1] > s.iloc[-1], h.iloc[-1] > (h.iloc[-3] if len(h) > 3 else h.iloc[-1]), float(h.iloc[-1])
+
+def detect_w_pattern(hist):
+    if len(hist) < 40: return None
+    h = hist["Close"].tail(60)
+    lows = h[(h.shift(1) > h) & (h.shift(-1) > h)]
+    if len(lows) < 2: return None
+    last_two = lows.tail(2)
+    if abs(last_two.iloc[0] - last_two.iloc[1]) / last_two.iloc[0] * 100 < 4:
+        neckline = float(h.loc[last_two.index[0]:last_two.index[1]].max())
+        return {"bottom1": round(float(last_two.iloc[0]), 3),
+                "bottom2": round(float(last_two.iloc[1]), 3),
+                "neckline": round(neckline, 3)}
+    return None
+
+def wick_rebound_trigger(hist):
+    if len(hist) < 5: return None
+    for i in range(-5, 0):
+        c = hist.iloc[i]
+        o, cl, lo = float(c["Open"]), float(c["Close"]), float(c["Low"])
+        body = abs(cl - o)
+        lw = min(o, cl) - lo
+        if lw > 0 and lw >= 2 * max(body, 1e-9):
+            price = float(hist["Close"].iloc[-1])
+            if price >= lo * 1.05:
+                return {"wick_low": round(lo, 3),
+                        "rebound_pct": round((price - lo) / lo * 100, 1)}
+    return None
+
+# ===== v10.2: شموع 4H =====
+def _aggregate_4h(candles_1h):
+    if not candles_1h or len(candles_1h) < 16:
+        return []
+    df = pd.DataFrame(candles_1h)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    df.columns = [c.capitalize() for c in df.columns]
+    df["_d"] = df.index.normalize()
+    df["_c"] = df.groupby("_d").cumcount() // 4
+    g = df.groupby(["_d", "_c"])
+    h4 = g.agg(
+        Open=("Open", "first"), High=("High", "max"),
+        Low=("Low", "min"), Close=("Close", "last"),
+        Volume=("Volume", "sum")
+    ).reset_index(drop=True)
+    return h4.to_dict("records")
+
+def _fetch_4h_candles(sym):
+    try:
+        r = requests.get(PROXY + "/yahoo/candles",
+                         params={"symbol": sym, "period": "3mo", "interval": "1h"},
+                         timeout=60)
+        if r.status_code == 200:
+            d = r.json()
+            if d.get("success") and d.get("candles"):
+                return _aggregate_4h(d["candles"])
+    except Exception:
+        pass
+    return []
+
+def _stability_4h(candles_4h, sup):
+    if not candles_4h or not sup or len(candles_4h) < 5:
+        return 0
+    threshold = sup * 0.98
+    held = 0
+    for c in reversed(candles_4h[-8:]):
+        if c["Close"] >= threshold:
+            held += 1
+        else:
+            break
+    if held >= 4: return 10
+    if held >= 3: return 7
+    if held >= 2: return 4
+    return 0
+
+# ===== دالة التقييم الرئيسية =====
 def score(sym, nm, price, cs, nws, verbose=False):
     if not cs or len(cs) < 30:
         if verbose: print(f"[diag] {sym}: شموع غير كافية ({len(cs) if cs else 0})")
@@ -242,14 +330,23 @@ def score(sym, nm, price, cs, nws, verbose=False):
     if price <= 0:
         if verbose: print(f"[diag] {sym}: سعر غير صالح"); return None, "bad_price"
     if price < PENNY_DANGER:
-        if verbose: print(f"[diag] {sym}: تحت $0.50"); return None, "penny_danger"
-    mc = nm["mc"]
+        if verbose: print(f"[diag] {sym}: تحت ${PENNY_DANGER}"); return None, "penny_danger"
+    mc = nm.get("mc", 0)
     if not (MC_MIN <= mc <= MC_MAX):
         if verbose: print(f"[diag] {sym}: كاب خارج النطاق ({mc/1e6:.1f}M)")
         return None, "market_cap"
+    # v10.7: بوابة الفلوت
+    fs = nm.get("fs", 0)
+    if fs > FLOAT_MAX:
+        if verbose: print(f"[diag] {sym}: فلوت كبير ({fs/1e6:.1f}M > 5M)")
+        return None, "float_too_large"
+    
     closes = [c["close"] for c in cs]
+    closes_pd = pd.Series(closes)
     r = rsi(closes); sup = support(cs)
     s20 = sma(closes, 20); s50 = sma(closes, 50)
+    
+    # فلاتر الشكل الأساسية
     if detect_failed_spike(cs):
         if verbose: print(f"[diag] {sym}: Failed Spike"); return None, "failed_spike"
     if detect_bull_trap(cs):
@@ -262,36 +359,88 @@ def score(sym, nm, price, cs, nws, verbose=False):
         if verbose: print(f"[diag] {sym}: أخبار حرجة"); return None, "critical_news"
     if nws and has_offering_news(nws):
         if verbose: print(f"[diag] {sym}: طرح"); return None, "offering"
+    
     pts = 0
+    # RSI
     if 23 <= r <= 27: pts += 25
     elif 20 <= r < 23 or 27 < r <= 30: pts += 15
     elif 30 < r <= 35: pts += 10
     elif 45 <= r <= 57: pts += 5
+    
+    # سعر
     if PENNY_DANGER <= price <= PRICE_CEIL: pts += 8
-    # ===== v10.1: المتوسطات كسياق ارتكاز =====
+    
+    # متوسطات حية (v10.2)
     if s20:
-        if price < s20: pts += 5                      # في منطقة البيع تحت المتوسط
-        if s20 * 0.92 <= price < s20: pts += 4        # لمس SMA20 من الأسفل = ارتداد وشيك
-    if s50 and price < s50: pts += 3                  # تحت المتوسط الطويل (قاع)
-    if s20 and s50 and s20 > s50: pts += 3            # هيكل أعلى سليم رغم القاع
-    # الهدف الفني: أقرب متوسط فوق السعر، وإلا sup*1.3
+        if price < s20: pts += 5
+        if s20 * 0.92 <= price < s20: pts += 4
+    if s50 and price < s50: pts += 3
+    if s20 and s50 and s20 > s50: pts += 3
+    
+    # الهدف الفني
     cands = [x for x in (s20, s50) if x and x > price * 1.02]
     res_target = round(min(cands), 3) if cands else (round(sup * 1.3, 3) if sup else None)
+    
+    # ثبات يومي
     stab = stability(cs, sup) if sup else 0
     if stab >= 3: pts += 10
     elif stab >= 2: pts += 7
+    
+    # v10.7: نقاط إضافية من faisal-app (بدون إقصاء)
+    # MACD
+    mp, mi, macd_hist = macd(closes_pd)
+    if mp and mi: pts += 15
+    elif mi: pts += 8
+    
+    # RVOL
+    avg_vol = sum(c["volume"] for c in cs[-20:]) / 20 if len(cs) >= 20 else 0
+    last_vol = cs[-1]["volume"] if cs else 0
+    rvol = last_vol / avg_vol if avg_vol > 0 else 0
+    if rvol > 5: pts += 5
+    elif rvol >= 2: pts += 3
+    
+    # W Pattern
+    hist_pd = pd.DataFrame(cs)
+    hist_pd["date"] = pd.to_datetime(hist_pd["date"])
+    hist_pd = hist_pd.set_index("date").sort_index()
+    hist_pd.columns = [c.capitalize() for c in hist_pd.columns]
+    w_pat = detect_w_pattern(hist_pd)
+    if w_pat: pts += 10
+    
+    # ارتداد الذيل
+    wick_rb = wick_rebound_trigger(hist_pd)
+    if wick_rb: pts += 5
+    
+    # أخبار إيجابية
     pos = is_positive_news(nws) if nws else False
     if pos: pts += 10
+    
+    # v10.5: الثبات 4H فقط للمرشحين ≥25 نقطة (تسريع)
+    stab4h = 0
+    if sup and pts >= 25:
+        try:
+            h4 = _fetch_4h_candles(sym)
+            stab4h = _stability_4h(h4, sup)
+            pts += stab4h
+        except Exception:
+            pass
+    
     if pts < MIN_SCORE:
         if verbose: print(f"[diag] {sym}: نقاط {pts} < {MIN_SCORE} (RSI={r:.0f}, stab={stab})")
         return None, f"score_{pts}"
+    
     return {"sym": sym, "price": round(price, 3), "rsi": round(r, 1), "score": pts,
             "sup": round(sup, 3) if sup else None,
             "res": res_target,
             "sma20": round(s20, 3) if s20 else None,
             "sma50": round(s50, 3) if s50 else None,
             "dist_sup": round((price - sup) / sup * 100, 1) if sup else None,
-            "stab": stab, "positive_news": pos}, "ok"
+            "stab": stab, "stab4h": stab4h,
+            "macd_pos": mp, "macd_imp": mi,
+            "w_pattern": w_pat is not None,
+            "wick_rebound": wick_rb is not None,
+            "rvol": round(rvol, 2),
+            "positive_news": pos}, "ok"
 
 def build_pool():
     print("[pool] بناء قائمة من السوق الحي (Nasdaq + NYSE)...")
@@ -327,7 +476,7 @@ def build_pool():
             if PENNY_DANGER <= _q_price(q) <= PRICE_CEIL and _q_vol(q) >= 50_000]
     cand.sort(key=lambda x: -x[1])
     cand = cand[:PRE_CAP]
-    print(f"[pool] {len(cand)} مرشح أولي (سعر 0.50-6 + حجم)")
+    print(f"[pool] {len(cand)} مرشح أولي (سعر {PENNY_DANGER}-{PRICE_CEIL} + حجم)")
 
     mcache = load_metrics_cache()
     survivors = []; misses = []; hits = 0
@@ -335,7 +484,7 @@ def build_pool():
         if s in mcache:
             hits += 1
             nm = mcache[s]
-            if nm and MC_MIN <= nm["mc"] <= MC_MAX:
+            if nm and MC_MIN <= nm["mc"] <= MC_MAX and nm.get("fs", 0) <= FLOAT_MAX:
                 survivors.append((s, vol, nm))
         else:
             misses.append((s, vol))
@@ -343,14 +492,14 @@ def build_pool():
     for i, (s, vol) in enumerate(misses):
         nm = normalize_metrics(metrics(s))
         if nm: mcache[s] = nm
-        if nm and MC_MIN <= nm["mc"] <= MC_MAX:
+        if nm and MC_MIN <= nm["mc"] <= MC_MAX and nm.get("fs", 0) <= FLOAT_MAX:
             survivors.append((s, vol, nm))
         if i % 50 == 0:
             print(f"[pool] metrics {i}/{len(misses)} — ناجٍ {len(survivors)}")
     save_metrics_cache(mcache)
     survivors.sort(key=lambda x: -x[1])
     pool = [{"sym": s, **nm} for s, vol, nm in survivors[:POOL_CAP]]
-    print(f"[pool] اجتاز الكب: {len(survivors)} → نهائي: {len(pool)}")
+    print(f"[pool] اجتاز الكب+الفلوت: {len(survivors)} → نهائي: {len(pool)}")
     POOL_FILE.write_text(json.dumps(pool))
     return pool
 
@@ -383,7 +532,7 @@ def daily_scan():
             rejections["no_candles"] = rejections.get("no_candles", 0) + 1
             continue
         price = cs[-1]["close"]
-        nm = {"mc": p["mc"]}
+        nm = {"mc": p["mc"], "fs": p.get("fs", 0)}
         verbose = i < 30
         r, reason = score(p["sym"], nm, price, cs, [], verbose=verbose)
         if r: prelim.append((p, price, cs, r))
@@ -392,13 +541,13 @@ def daily_scan():
             print(f"[scan] أولي {i}/{len(pool)} — مرشحون {len(prelim)}")
 
     prelim.sort(key=lambda x: -x[3]["score"])
-    prelim = prelim[:NEWS_CAP]   # v10: لا بوابة وقود — الشكل مباشرة للأخبار
+    prelim = prelim[:NEWS_CAP]
 
     print(f"[scan] أخبار لـ {len(prelim)} مرشح نهائي...")
     disc = []
     for p, price, cs, _ in prelim:
         nws = news(p["sym"], 7)
-        nm = {"mc": p["mc"]}
+        nm = {"mc": p["mc"], "fs": p.get("fs", 0)}
         r, reason = score(p["sym"], nm, price, cs, nws)
         if r: disc.append(r)
         else: rejections[reason] = rejections.get(reason, 0) + 1
@@ -425,12 +574,11 @@ def send_tg(msg):
     except Exception as e: print("[tg]", e)
 
 def auto_watchlist(disc):
-    # v10.1: الهدف الفني من score (res) بدل sup*1.3 الاعتباطي
     if not BOT_URL: return
     added = 0
     for d in disc[:15]:
         sup = d.get("sup"); res = d.get("res")
-        if not sup or not res: continue          # بلا هدف فني لا نضيف
+        if not sup or not res: continue
         try:
             r = requests.post(BOT_URL + "/add",
                               json={"sym": d["sym"], "sup": sup, "res": res},
@@ -445,11 +593,17 @@ def notify(disc):
         send_tg("🛰️ <b>مسح اليوم</b>: لا اكتشافات (سوق هادئ/مغلق) — راجع ملخص الرفض")
         return
     lines = [f"🛰️ <b>اكتشافات اليوم ({len(disc)})</b>", ""]
-    for d in disc[:12]:
+    for d in disc[:15]:
         ne = " 📰+" if d["positive_news"] else ""
         ds = f" | دعم {d['dist_sup']}%" if d.get("dist_sup") is not None else ""
-        tg = f" | 🎯 هدف ${d['res']}" if d.get("res") else ""
-        lines.append(f"• <b>{d['sym']}</b>: {d['score']}/100 | ${d['price']} | RSI {d['rsi']} | ثبات {d['stab']}{ds}{tg}{ne}")
+        s4 = f" +4H:{d.get('stab4h',0)}" if d.get("stab4h", 0) > 0 else ""
+        tg = f" | 🎯 ${d['res']}" if d.get("res") else ""
+        patterns = []
+        if d.get("macd_pos") and d.get("macd_imp"): patterns.append("MACD+")
+        if d.get("w_pattern"): patterns.append("W")
+        if d.get("wick_rebound"): patterns.append("ذيل")
+        pat = f" | {','.join(patterns)}" if patterns else ""
+        lines.append(f"• <b>{d['sym']}</b>: {d['score']}/100 | ${d['price']} | RSI {d['rsi']}{pat}{s4}{ds}{tg}{ne}")
     lines.append("\n💡 أرسل /s SYM للتحليل الكامل")
     send_tg("\n".join(lines))
 
@@ -503,7 +657,7 @@ def root():
     if METRICS_CACHE.exists():
         try: mc = len(json.loads(METRICS_CACHE.read_text()))
         except Exception: pass
-    return {"engine": "finnhub-discovery-v10.1", "pool_diag": n, "quotes_cached": qc,
+    return {"engine": "finnhub-discovery-v10.7", "pool_diag": n, "quotes_cached": qc,
             "metrics_cached": mc, "scanning": _scanning,
             "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
 
