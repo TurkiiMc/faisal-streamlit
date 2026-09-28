@@ -1,6 +1,10 @@
 """
-Finnhub Discovery Engine v8 — مسرّعة: كاش metrics + CAPs مضبوطة + شموع 6 workers
-المسحات الساخنة 3-5 دقائق، الباردة 35-40 دقيقة. توقيتات cron لا تتغيّر.
+Finnhub Discovery Engine v8.2 — سوق حي بلا ذاكرة
+- لا قراءة universe_pool.json: كل مسح يبني قائمته من اقتباسات السوق الأحدث
+- لا CORE_LIST: السوق فقط، لا أسهم محفوظة
+- كاش اقتباسات/مetrics نفس اليوم للسرعة فقط (لا يؤثر على مصدر Universe)
+- إقصاءات مطابقة للمحلل: failed_spike أوسع + broken_base جديد
+- /reset لمسح كل الذاكرة يدوياً
 """
 import os, time, json, requests, threading, io, csv
 from datetime import datetime, timedelta
@@ -15,24 +19,23 @@ PROXY = os.environ.get("PROXY_URL", "https://faisal-proxy.onrender.com").rstrip(
 TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 BOT_URL = os.environ.get("BOT_URL", "").rstrip("/")
-CORE_LIST_RAW = os.environ.get("CORE_LIST", "")
 
-POOL_FILE = Path("universe_pool.json")
+POOL_FILE = Path("universe_pool.json")      # يُكتب للتشخيص فقط — لا يُقرأ أبداً
 DISC_FILE = Path("discoveries.json")
 LAST_SCAN = Path("last_scan.json")
 QUOTE_CACHE = Path("quotes_cache.json")
-METRICS_CACHE = Path("metrics_cache.json")   # ✅ v8: كاش الـ metrics
+METRICS_CACHE = Path("metrics_cache.json")
 ET = ZoneInfo("America/New_York")
 SCAN_EVERY_HOURS = 6
-POOL_CAP = 150          # ✅ v8: 250 -> 150
-PRE_CAP = 300           # ✅ v8: 500 -> 300
+POOL_CAP = 150
+PRE_CAP = 300
 PRICE_CEIL = 50.0
-NEWS_CAP = 60           # ✅ v8: 80 -> 60
+NEWS_CAP = 60
 MIN_SCORE = 40
 MC_MIN, MC_MAX = 1_000_000, 50_000_000
 PENNY_DANGER = 0.10
 COOLDOWN_SEC = 90
-CANDLE_WORKERS = 6      # ✅ v8: 4 -> 6 (آمن مع الكاش)
+CANDLE_WORKERS = 6
 
 _scanning = False
 _scan_lock = threading.Lock()
@@ -118,7 +121,6 @@ def normalize_metrics(m):
         fs = 0
     return {"fs": fs, "sp": sp, "sh": sh, "mc": mc}
 
-# ===== كاش الـ metrics (v8) =====
 def load_metrics_cache():
     if METRICS_CACHE.exists():
         age = (time.time() - METRICS_CACHE.stat().st_mtime) / 3600
@@ -192,18 +194,22 @@ def support(cs, w=20):
     return min(c["low"] for c in cs[-w:]) if len(cs) >= w else None
 
 def detect_failed_spike(cs):
+    # v8.1: نافذة أوسع وعتبات أدنى لمحاكاة المحلل
     if len(cs) < 20: return False
-    rec = cs[-20:]
+    rec = cs[-60:] if len(cs) >= 60 else cs[-20:]
     mx = max(c["high"] for c in rec); mn = min(c["low"] for c in rec)
     cur = cs[-1]["close"]
     if mn <= 0: return False
-    return (mx - mn) / mn * 100 > 50 and (mx - cur) / mx * 100 > 40
+    return (mx - mn) / mn * 100 > 40 and (mx - cur) / mx * 100 > 35
 
-def detect_bull_trap(cs):
-    if len(cs) < 25: return False
-    res = max(c["high"] for c in cs[-20:])
-    if not any(c["high"] > res * 0.98 for c in cs[-5:]): return False
-    return cs[-1]["close"] < res * 0.97
+def detect_broken_base(cs):
+    # v8.1: سبايك كبير ثم عودة تحت القاعدة القديمة = قاعدة مكسورة
+    if len(cs) < 60: return False
+    base = min(c["low"] for c in cs[-60:-20])
+    mx = max(c["high"] for c in cs[-40:])
+    cur = cs[-1]["close"]
+    if base <= 0: return False
+    return mx > base * 1.8 and cur < base * 1.05
 
 def stability(cs, sup):
     if not sup or len(cs) < 5: return 0
@@ -252,6 +258,8 @@ def score(sym, nm, price, cs, nws, verbose=False):
         if verbose: print(f"[diag] {sym}: Failed Spike"); return None, "failed_spike"
     if detect_bull_trap(cs):
         if verbose: print(f"[diag] {sym}: Bull Trap"); return None, "bull_trap"
+    if detect_broken_base(cs):
+        if verbose: print(f"[diag] {sym}: قاعدة مكسورة"); return None, "broken_base"
     if sup and price < sup * 0.97:
         if verbose: print(f"[diag] {sym}: دعم مكسور"); return None, "support_broken"
     if nws and is_critical_news(nws):
@@ -289,16 +297,15 @@ def score(sym, nm, price, cs, nws, verbose=False):
             "float_m": round(fs / 1e6, 2), "short_pct": round(eff * 100, 1),
             "stab": stab, "positive_news": pos}, "ok"
 
-def build_pool(force=False):
-    if POOL_FILE.exists() and not force:
-        age_h = (time.time() - POOL_FILE.stat().st_mtime) / 3600
-        try:
-            cached = json.loads(POOL_FILE.read_text())
-            if age_h < 144 and len(cached) >= 50:
-                return cached
-        except Exception: pass
+def detect_bull_trap(cs):
+    if len(cs) < 25: return False
+    res = max(c["high"] for c in cs[-20:])
+    if not any(c["high"] > res * 0.98 for c in cs[-5:]): return False
+    return cs[-1]["close"] < res * 0.97
 
-    print("[pool] بناء قائمة أسبوعية...")
+def build_pool():
+    # v8.2: لا قراءة لأي pool مخزن — بناء من السوق الحي كل مسح
+    print("[pool] بناء قائمة من السوق الحي (بلا ذاكرة)...")
     syms = all_us_symbols()
     if not syms:
         print("[pool] Finnhub فارغ — SEC بديلاً"); syms = sec_tickers()
@@ -306,7 +313,7 @@ def build_pool(force=False):
 
     quotes = load_quotes_cache()
     if quotes:
-        print(f"[pool] اقتباسات من الكاش ({len(quotes)}) — توفير ~5000 طلب Yahoo")
+        print(f"[pool] اقتباسات من كاش اليوم ({len(quotes)}) — توفير طلبات Yahoo")
     else:
         probe = stooq_probe(syms[:150])
         if probe:
@@ -333,11 +340,8 @@ def build_pool(force=False):
     cand = cand[:PRE_CAP]
     print(f"[pool] {len(cand)} مرشح أولي (سعر 0.10-50 + حجم، الأعلى حجماً)")
 
-    # ✅ v8: metrics من الكاش أولاً، والناقص فقط يُجلب
     mcache = load_metrics_cache()
-    survivors = []
-    misses = []
-    hits = 0
+    survivors = []; misses = []; hits = 0
     for s, vol in cand:
         if s in mcache:
             hits += 1
@@ -349,7 +353,7 @@ def build_pool(force=False):
     print(f"[pool] metrics كاش: {hits} مُخبّأ، {len(misses)} مطلوب جلبها")
     for i, (s, vol) in enumerate(misses):
         nm = normalize_metrics(metrics(s))
-        if nm: mcache[s] = nm   # لا نخزن None (يُعاد تجربته لاحقاً)
+        if nm: mcache[s] = nm
         if nm and MC_MIN <= nm["mc"] <= MC_MAX:
             survivors.append((s, vol, nm))
         if i % 50 == 0:
@@ -357,19 +361,8 @@ def build_pool(force=False):
     save_metrics_cache(mcache)
     survivors.sort(key=lambda x: -x[1])
     pool = [{"sym": s, **nm} for s, vol, nm in survivors[:POOL_CAP]]
-    print(f"[pool] اجتاز الكب: {len(survivors)} → نهائي {len(pool)}")
-
-    for t in CORE_LIST_RAW.replace(";", ",").split(","):
-        s = t.split(":")[0].strip().upper()
-        if s and not any(p["sym"] == s for p in pool):
-            if s in mcache: nm = mcache[s]
-            else:
-                nm = normalize_metrics(metrics(s))
-                if nm: mcache[s] = nm
-            if nm: pool.append({"sym": s, **nm})
-    save_metrics_cache(mcache)
-    print(f"[pool] نهائي مع CORE_LIST: {len(pool)}")
-    POOL_FILE.write_text(json.dumps(pool))
+    print(f"[pool] اجتاز الكب: {len(survivors)} → نهائي (سوق حي فقط): {len(pool)}")
+    POOL_FILE.write_text(json.dumps(pool))   # تشخيص فقط — لا يُقرأ أبداً
     return pool
 
 def daily_scan():
@@ -525,7 +518,7 @@ def root():
     if METRICS_CACHE.exists():
         try: mc = len(json.loads(METRICS_CACHE.read_text()))
         except Exception: pass
-    return {"engine": "finnhub-discovery-v8", "pool": n, "quotes_cached": qc,
+    return {"engine": "finnhub-discovery-v8.2", "pool_diag": n, "quotes_cached": qc,
             "metrics_cached": mc, "scanning": _scanning,
             "last_scan_hours_ago": round(last_scan_age_hours(), 1)}
 
@@ -549,6 +542,16 @@ def trigger_scan_browser():
 def trigger_scan():
     disc = run_once()
     return {"discoveries": len(disc), "items": disc[:10]}
+
+@app.post("/reset")
+def reset_memory():
+    removed = []
+    for f in (POOL_FILE, DISC_FILE, LAST_SCAN, QUOTE_CACHE, METRICS_CACHE):
+        try:
+            if f.exists():
+                f.unlink(); removed.append(f.name)
+        except Exception: pass
+    return {"ok": True, "removed": removed}
 
 if os.environ.get("START_SCHEDULER", "1") == "1":
     threading.Thread(target=scheduler_loop, daemon=True).start()
