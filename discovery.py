@@ -1,12 +1,11 @@
 """
 Finnhub Discovery Engine v10.7 — شكل نقي + متوسطات + أنماط + فلوت ≤5M
 - universe = بورصة ناسداك (XNAS) + بورصة نيويورك (XNYS)
-- لا شورت، لا CORE_LIST، لا ذاكرة — شكل نقي فقط
 - نطاق الصيد: سعر 1.0-7.0$ | كاب 500K-50M | فلوت ≤5M
 - MIN_SCORE = 30 (شبكة أوسع)
 - v10.7: فلوت أقصى 5M + نقاط MACD/RVOL/W/ذيل + stab4h اختياري
 - v10.2: متوسطات حية (SMA20/50 + هدف فني res)
-- دفعات 60 + تباعد 2s + تبريد 180s قبل الشموع + عمال 3
+- إصلاح: /reset يقبل GET و POST
 """
 import os, time, json, requests, threading, io, csv
 from datetime import datetime, timedelta
@@ -335,6 +334,7 @@ def score(sym, nm, price, cs, nws, verbose=False):
     if not (MC_MIN <= mc <= MC_MAX):
         if verbose: print(f"[diag] {sym}: كاب خارج النطاق ({mc/1e6:.1f}M)")
         return None, "market_cap"
+    
     # v10.7: بوابة الفلوت
     fs = nm.get("fs", 0)
     if fs > FLOAT_MAX:
@@ -370,7 +370,7 @@ def score(sym, nm, price, cs, nws, verbose=False):
     # سعر
     if PENNY_DANGER <= price <= PRICE_CEIL: pts += 8
     
-    # متوسطات حية (v10.2)
+    # متوسطات حية
     if s20:
         if price < s20: pts += 5
         if s20 * 0.92 <= price < s20: pts += 4
@@ -386,36 +386,32 @@ def score(sym, nm, price, cs, nws, verbose=False):
     if stab >= 3: pts += 10
     elif stab >= 2: pts += 7
     
-    # v10.7: نقاط إضافية من faisal-app (بدون إقصاء)
-    # MACD
+    # v10.7: نقاط إضافية من faisal-app
     mp, mi, macd_hist = macd(closes_pd)
     if mp and mi: pts += 15
     elif mi: pts += 8
     
-    # RVOL
     avg_vol = sum(c["volume"] for c in cs[-20:]) / 20 if len(cs) >= 20 else 0
     last_vol = cs[-1]["volume"] if cs else 0
     rvol = last_vol / avg_vol if avg_vol > 0 else 0
     if rvol > 5: pts += 5
     elif rvol >= 2: pts += 3
     
-    # W Pattern
     hist_pd = pd.DataFrame(cs)
     hist_pd["date"] = pd.to_datetime(hist_pd["date"])
     hist_pd = hist_pd.set_index("date").sort_index()
     hist_pd.columns = [c.capitalize() for c in hist_pd.columns]
+    
     w_pat = detect_w_pattern(hist_pd)
     if w_pat: pts += 10
     
-    # ارتداد الذيل
     wick_rb = wick_rebound_trigger(hist_pd)
     if wick_rb: pts += 5
     
-    # أخبار إيجابية
     pos = is_positive_news(nws) if nws else False
     if pos: pts += 10
     
-    # v10.5: الثبات 4H فقط للمرشحين ≥25 نقطة (تسريع)
+    # الثبات 4H فقط للمرشحين ≥25 نقطة (تسريع)
     stab4h = 0
     if sup and pts >= 25:
         try:
@@ -682,6 +678,8 @@ def trigger_scan():
     disc = run_once()
     return {"discoveries": len(disc), "items": disc[:10]}
 
+# ===== إصلاح: السماح بـ GET و POST لمسح الذاكرة من المتصفح =====
+@app.get("/reset")
 @app.post("/reset")
 def reset_memory():
     removed = []
