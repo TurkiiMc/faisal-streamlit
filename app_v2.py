@@ -115,8 +115,12 @@ def _candles_uncached(symbol, period="6mo"):
                     data = r.json()
                     if data.get("success") and data.get("candles"):
                         df = pd.DataFrame(data["candles"])
-                        df["date"] = pd.to_datetime(df["date"])
+                        if "time" in df.columns:   # صيغة faisal-proxy: ثوانٍ Unix
+                            df["date"] = pd.to_datetime(df["time"], unit="s"); df = df.drop(columns=["time"])
+                        else:
+                            df["date"] = pd.to_datetime(df["date"])
                         df = df.set_index("date").sort_index()
+                        df.index = df.index.normalize()
                         df.columns = [c.capitalize() for c in df.columns]
                         return df, data.get("splits", []), "yahoo_proxy"
                 else:
@@ -723,7 +727,10 @@ def get_4h(symbol):
         data = r.json()
         if not data.get("success") or not data.get("candles"): return None
         df = pd.DataFrame(data["candles"])
-        df["date"] = pd.to_datetime(df["date"])
+        if "time" in df.columns:   # صيغة faisal-proxy: ثوانٍ Unix
+            df["date"] = pd.to_datetime(df["time"], unit="s"); df = df.drop(columns=["time"])
+        else:
+            df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date").sort_index()
         df.columns = [c.capitalize() for c in df.columns]
         df["_d"] = df.index.normalize()
