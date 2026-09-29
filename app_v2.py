@@ -212,6 +212,62 @@ def sec_all_symbols():
         return list(dict.fromkeys(out))
     except Exception: return []
 
+# ===== كون الأسهم المقسّمة من SEC (بحث نصي كامل، مجاني بلا مفتاح) =====
+import re as _re
+SEC_UA = _env("SEC_UA", "FaisalBot contact@example.com")
+EFTS_URL = "https://efts.sec.gov/LATEST/search-index"
+SPLIT_QUERIES = [
+    ('"reverse stock split"', "8-K,6-K", "done"),
+    ('"reverse share split"', "8-K,6-K", "done"),
+    ('"share consolidation"', "8-K,6-K", "done"),      # صيغة الشركات الأجنبية (كايمن مثلاً)
+    ('"reverse stock split"', "DEF 14A,PRE 14A,DEF 14C,PRE 14C", "upcoming"),
+]
+
+
+SPLIT_MAX_DAYS = 89   # نافذة التقسيم: أقل من 90 يوماً
+
+
+@st.cache_data(ttl=6 * 3600)
+def sec_split_universe(days_done=SPLIT_MAX_DAYS, days_upcoming=90):
+    """{ticker: {kind: done|upcoming, form, date, filings}} — done = إفصاح عن تقسيم خلال المدة، upcoming = دعوة تصويت"""
+    out = {}
+    end = datetime.now()
+    for q, forms, kind in SPLIT_QUERIES:
+        start = (end - timedelta(days=days_done if kind == "done" else days_upcoming)).strftime("%Y-%m-%d")
+        for off in range(0, 1000, 100):
+            try:
+                r = requests.get(EFTS_URL, params={"q": q, "forms": forms, "dateRange": "custom", "startdt": start,
+                                                   "enddt": end.strftime("%Y-%m-%d"), "from": off},
+                                 headers={"User-Agent": SEC_UA, "Accept": "application/json"}, timeout=20)
+                hits = r.json().get("hits", {}).get("hits", []) if r.status_code == 200 else []
+            except Exception:
+                hits = []
+            if not hits:
+                break
+            for h in hits:
+                src = h.get("_source", {})
+                form = src.get("form") or ""
+                date = src.get("file_date") or ""
+                for name in src.get("display_names", []):
+                    m = _re.search(r"\(([A-Z0-9 ,.\-]+)\)\s*\(CIK", name)
+                    if not m:
+                        continue
+                    for t in (x.strip() for x in m.group(1).split(",")):
+                        if not _re.fullmatch(r"[A-Z]{1,5}", t):
+                            continue
+                        rec = out.get(t)
+                        if not rec:
+                            out[t] = {"kind": kind, "form": form, "date": date, "filings": 1}
+                        else:
+                            rec["filings"] += 1
+                            if kind == "done" and (rec["kind"] != "done" or date > rec["date"]):
+                                rec.update(kind="done", form=form, date=date)
+                            elif kind == rec["kind"] and date > rec["date"]:
+                                rec.update(form=form, date=date)
+            time.sleep(0.15)   # حد SEC: 10 طلبات/ثانية
+    return out
+
+
 def market_universe():
     """Finnhub أولاً، ثم SEC كبديل مجاني"""
     if FINNHUB_KEY:
@@ -628,6 +684,26 @@ def detect_candle_patterns(hist):
                     patterns.append("Bullish Engulfing")
         except Exception: continue
     return patterns if patterns else None
+
+def post_split_runup(hist, anchor_date, explode_runup=80.0, explode_day=50.0):
+    """هل انفجر السهم منذ التقسيم؟
+    runup = أقصى صعود من أدنى قاع سابق إلى قمة لاحقة (بعد التقسيم)، day = أكبر صعود يومي بالإغلاق.
+    انفجر = runup ≥ 80% أو يوم واحد ≥ 50%."""
+    try:
+        post = hist[hist.index >= pd.Timestamp(anchor_date)]
+    except Exception:
+        return None
+    if len(post) < 2:
+        return {"sessions": len(post), "runup_pct": 0.0, "max_day_pct": 0.0, "exploded": False,
+                "from_low_pct": 0.0}
+    lows = post["Low"].cummin()
+    runup = float(((post["High"] / lows) - 1).max() * 100)
+    day = float((post["Close"].pct_change().max() or 0) * 100)
+    low = float(post["Low"].min())
+    return {"sessions": len(post), "runup_pct": round(runup, 1), "max_day_pct": round(day, 1),
+            "from_low_pct": round((float(post["Close"].iloc[-1]) / low - 1) * 100, 1) if low > 0 else 0.0,
+            "exploded": runup >= explode_runup or day >= explode_day}
+
 
 def detect_reverse_split(splits, max_days=365):
     if not splits: return {"has_split": False, "days_since": 9999}
@@ -1599,10 +1675,23 @@ with tab3:
     with col3:
         st.write("")
         live_btn = st.button("🌊 ابدأ مسحاً حياً", key="live_scan", type="primary")
+    uni_mode = st.radio("الكون", ["🔀 المقسّمة فقط (SEC)", "كل السوق"], horizontal=True, key="uni_mode")
+    split_only = uni_mode.startswith("🔀")
+    not_exploded_only = st.checkbox("لم ينفجر بعد التقسيم فقط (لا صعود ≥80% ولا يوم ≥50% منذ التقسيم)",
+                                    value=True, disabled=not split_only, key="not_exploded")
 
     if live_btn:
-        with st.spinner("جلب كون السوق..."):
-            all_syms, uni_src = market_universe()
+        split_map = {}
+        if split_only:
+            with st.spinner("بحث SEC عن التقسيمات العكسية (آخر 89 يوماً + القادمة)..."):
+                split_map = sec_split_universe()
+            st.session_state["split_map"] = split_map
+            all_syms, uni_src = [t for t, v in split_map.items() if v["kind"] == "done"], "SEC (تقسيم عكسي)"
+            if not split_map:
+                st.error("❌ بحث SEC لم يُرجع نتائج — تحقق من SEC_UA أو الشبكة.")
+        else:
+            with st.spinner("جلب كون السوق..."):
+                all_syms, uni_src = market_universe()
         if not all_syms:
             st.error("❌ فشل جلب الرموز من Finnhub وSEC معاً — تحقق من الشبكة.")
         else:
@@ -1636,15 +1725,19 @@ with tab3:
                     for i, sym in enumerate(pre_filtered):
                         pg.progress((i + 1) / len(pre_filtered) * 0.4)
                         m = finnhub_metrics_live(sym)
-                        if not m: continue
+                        if not m:
+                            if split_only:
+                                sym_with_metrics.append((sym, {"floatShares": 0, "shortPercentOfFloat": 0, "sharesShort": 0, "marketCap": 0}))
+                            continue
                         info_dict = normalize_metrics(m)
                         mc, fs = info_dict["marketCap"], info_dict["floatShares"]
                         sp, sh = info_dict["shortPercentOfFloat"], info_dict["sharesShort"]
-                        if not (1_000_000 <= mc <= MARKET_CAP_MAX): continue
-                        if not (0 < fs <= FLOAT_MAX): continue
+                        if not split_only:   # بعد التقسيم قد تكون العائمة/الكاب في Finnhub قديمة — لا نُقصي بها
+                            if not (1_000_000 <= mc <= MARKET_CAP_MAX): continue
+                            if not (0 < fs <= FLOAT_MAX): continue
                         eff = max(sp, (sh / fs) if fs else 0)
                         if eff <= 0: n_short_missing += 1
-                        elif eff < SHORT_MIN: continue
+                        elif eff < SHORT_MIN and not split_only: continue
                         sym_with_metrics.append((sym, info_dict))
                     st.info(f"✅ اجتاز metrics: {len(sym_with_metrics)} رمز (منها {n_short_missing} بشورت مفقود — افحصها يدوياً)")
                 else:
@@ -1671,6 +1764,25 @@ with tab3:
                         dead = tradeability_veto(hist, splits_raw)
                         if dead:
                             excluded_live.append({"symbol": sym, "reason": dead}); continue
+
+                        psr, anchor_src = None, None
+                        if split_only:
+                            rs = detect_reverse_split(splits_raw, max_days=SPLIT_MAX_DAYS)
+                            ss = split_map.get(sym) or {}
+                            anchor, anchor_src = (rs["date"], "البروكسي") if rs.get("has_split") else (ss.get("date"), "إفصاح SEC")
+                            psr = post_split_runup(hist, anchor) if anchor else None
+                            if psr is not None:
+                                psr["anchor"], psr["anchor_src"] = anchor, anchor_src
+                            try:
+                                too_old = anchor and (datetime.now() - datetime.strptime(anchor[:10], "%Y-%m-%d")).days > SPLIT_MAX_DAYS
+                            except Exception:
+                                too_old = False
+                            if too_old:
+                                excluded_live.append({"symbol": sym, "reason": f"التقسيم أقدم من {SPLIT_MAX_DAYS} يوماً ({anchor})"})
+                                continue
+                            if not_exploded_only and psr and psr["exploded"]:
+                                excluded_live.append({"symbol": sym, "reason": f"انفجر بعد التقسيم: أقصى صعود +{psr['runup_pct']}% · أكبر يوم +{psr['max_day_pct']}%"})
+                                continue
 
                         if not skip_news and FINNHUB_KEY:
                             news_items = []
@@ -1701,6 +1813,7 @@ with tab3:
                             "support": r["support"], "dist_sup": r["dist_sup"],
                             "fam": fam, "verdict": r["verdict"], "src": src,
                             "stability": bool(r["stability"]), "tech": technical_trigger(hist, r),
+                            "sec_split": split_map.get(sym), "psr": psr,
                         })
                     except Exception: continue
 
@@ -1746,6 +1859,7 @@ with tab3:
                     "بُعد الدعم": f"{x['dist_sup']:+.1f}%" if x.get("dist_sup") is not None else "—",
                     "ثبات": "✅" if x.get("stability") else "—",
                     "زناد": "🎯" if x.get("tech") else "—",
+                    "منذ التقسيم": (f"{x['psr']['sessions']} جلسة · أقصى +{x['psr']['runup_pct']}%" if x.get("psr") else "—"),
                     "الفصيلة": " | ".join(x["fam"][:2]) if x["fam"] else "—",
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=500)
@@ -1765,8 +1879,25 @@ with tab3:
                     if x["support"]:
                         ds = x["dist_sup"]
                         st.markdown(f"📍 دعم: ${x['support']:.3f} ({ds:+.1f}%)")
+                    if x.get("sec_split"):
+                        ss = x["sec_split"]
+                        st.markdown(f'<div class="split-box">🔀 <b>تقسيم عكسي (SEC):</b> آخر إفصاح {ss["form"]} بتاريخ {ss["date"]} · عدد الإيداعات المرتبطة {ss["filings"]}</div>', unsafe_allow_html=True)
+                    if x.get("psr"):
+                        ps = x["psr"]
+                        st.markdown(f'<div class="info-box">⏳ <b>منذ التقسيم</b> ({ps.get("anchor")}، المرجع: {ps.get("anchor_src")}): '
+                                    f'{ps["sessions"]} جلسة · أقصى صعود +{ps["runup_pct"]}% · أكبر يوم +{ps["max_day_pct"]}% · '
+                                    f'السعر فوق أدنى قاع +{ps["from_low_pct"]}% — <b>لم ينفجر بعد</b></div>' if not ps["exploded"] else
+                                    f'<div class="warn-box">⚠️ <b>انفجر سابقاً بعد التقسيم:</b> أقصى صعود +{ps["runup_pct"]}%</div>',
+                                    unsafe_allow_html=True)
                     st.markdown(f'<div class="success-box">💡 للتحليل الكامل: افتح تبويب <b>📈 تحليل سهم</b> واكتب <code>{x["symbol"]}</code></div>', unsafe_allow_html=True)
 
+            upc = {t: v for t, v in st.session_state.get("split_map", {}).items() if v["kind"] == "upcoming"}
+            if upc:
+                with st.expander(f"🗳️ تقسيمات قادمة — دعوات تصويت ({len(upc)})"):
+                    st.caption("شركات تطلب موافقة المساهمين على تقسيم عكسي. لا تحليل الآن — راقبها لتبدأ دورة ما بعد التقسيم من يومها الأول.")
+                    st.dataframe(pd.DataFrame([{"الرمز": t, "النموذج": v["form"], "التاريخ": v["date"]}
+                                               for t, v in sorted(upc.items(), key=lambda kv: kv[1]["date"], reverse=True)]),
+                                 use_container_width=True, hide_index=True)
             if excluded_live:
                 with st.expander(f"🚫 المقصيون ({len(excluded_live)})"):
                     for e in excluded_live[:50]:
