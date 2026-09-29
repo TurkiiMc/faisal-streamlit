@@ -121,6 +121,7 @@ def _candles_uncached(symbol, period="6mo"):
                             df["date"] = pd.to_datetime(df["date"])
                         df = df.set_index("date").sort_index()
                         df.index = df.index.normalize()
+                        df = drop_incomplete_today(df)
                         df.columns = [c.capitalize() for c in df.columns]
                         return df, data.get("splits", []), "yahoo_proxy"
                 else:
@@ -217,11 +218,15 @@ import re as _re
 SEC_UA = _env("SEC_UA", "FaisalBot contact@example.com")
 EFTS_URL = "https://efts.sec.gov/LATEST/search-index"
 SPLIT_QUERIES = [
-    ('"reverse stock split"', "8-K,6-K", "done"),
-    ('"reverse share split"', "8-K,6-K", "done"),
-    ('"share consolidation"', "8-K,6-K", "done"),      # صيغة الشركات الأجنبية (كايمن مثلاً)
-    ('"reverse stock split"', "DEF 14A,PRE 14A,DEF 14C,PRE 14C", "upcoming"),
+    # (الاستعلام، النماذج، النوع، القوة) — "likely" = دليل تنفيذ (CUSIP جديد)، "mention" = مجرد ذكر
+    ('"reverse stock split" CUSIP', "8-K,6-K", "done", "likely"),
+    ('"reverse share split" CUSIP', "8-K,6-K", "done", "likely"),
+    ('"share consolidation" CUSIP', "8-K,6-K", "done", "likely"),   # صيغة الشركات الأجنبية
+    ('"reverse stock split"', "8-K,6-K", "done", "mention"),
+    ('"share consolidation"', "8-K,6-K", "done", "mention"),
+    ('"reverse stock split"', "DEF 14A,PRE 14A,DEF 14C,PRE 14C", "upcoming", None),
 ]
+_STRENGTH = {"likely": 2, "mention": 1, None: 0}
 
 
 SPLIT_MAX_DAYS = 89   # نافذة التقسيم: أقل من 90 يوماً
@@ -229,10 +234,12 @@ SPLIT_MAX_DAYS = 89   # نافذة التقسيم: أقل من 90 يوماً
 
 @st.cache_data(ttl=6 * 3600)
 def sec_split_universe(days_done=SPLIT_MAX_DAYS, days_upcoming=90):
-    """{ticker: {kind: done|upcoming, form, date, filings}} — done = إفصاح عن تقسيم خلال المدة، upcoming = دعوة تصويت"""
+    """{ticker: {kind: done|upcoming, strength, form, date, filings}}
+    done+likely = تقسيم منفذ مرجّح (CUSIP جديد أو بند 5.03) · done+mention = مجرد ذكر → يُعامل كنية
+    upcoming = دعوة تصويت أو نية"""
     out = {}
     end = datetime.now()
-    for q, forms, kind in SPLIT_QUERIES:
+    for q, forms, kind, strength in SPLIT_QUERIES:
         start = (end - timedelta(days=days_done if kind == "done" else days_upcoming)).strftime("%Y-%m-%d")
         for off in range(0, 1000, 100):
             try:
@@ -248,6 +255,8 @@ def sec_split_universe(days_done=SPLIT_MAX_DAYS, days_upcoming=90):
                 src = h.get("_source", {})
                 form = src.get("form") or ""
                 date = src.get("file_date") or ""
+                items = src.get("items") or []
+                hit_strength = "likely" if (kind == "done" and "5.03" in [str(i) for i in items]) else strength
                 for name in src.get("display_names", []):
                     m = _re.search(r"\(([A-Z0-9 ,.\-]+)\)\s*\(CIK", name)
                     if not m:
@@ -257,14 +266,21 @@ def sec_split_universe(days_done=SPLIT_MAX_DAYS, days_upcoming=90):
                             continue
                         rec = out.get(t)
                         if not rec:
-                            out[t] = {"kind": kind, "form": form, "date": date, "filings": 1}
-                        else:
-                            rec["filings"] += 1
-                            if kind == "done" and (rec["kind"] != "done" or date > rec["date"]):
-                                rec.update(kind="done", form=form, date=date)
-                            elif kind == rec["kind"] and date > rec["date"]:
-                                rec.update(form=form, date=date)
+                            out[t] = {"kind": kind, "strength": hit_strength, "form": form, "date": date, "filings": 1}
+                            continue
+                        rec["filings"] += 1
+                        better = _STRENGTH[hit_strength] > _STRENGTH[rec.get("strength")]
+                        same_newer = hit_strength == rec.get("strength") and date > rec["date"]
+                        if kind == "done" and (rec["kind"] != "done" or better or same_newer):
+                            rec.update(kind="done", strength=hit_strength if (rec["kind"] != "done" or better) else rec["strength"],
+                                       form=form, date=date)
+                        elif kind == rec["kind"] == "upcoming" and date > rec["date"]:
+                            rec.update(form=form, date=date)
             time.sleep(0.15)   # حد SEC: 10 طلبات/ثانية
+    # مجرد الذكر دون دليل تنفيذ = نية/إشعار امتثال → ينتقل لقائمة القادمة
+    for t, rec in out.items():
+        if rec["kind"] == "done" and rec.get("strength") == "mention":
+            rec["kind"], rec["intent"] = "upcoming", True
     return out
 
 
@@ -684,6 +700,18 @@ def detect_candle_patterns(hist):
                     patterns.append("Bullish Engulfing")
         except Exception: continue
     return patterns if patterns else None
+
+def drop_incomplete_today(df):
+    """قبل افتتاح السوق: شمعة اليوم (إن وُجدت) ناقصة — تُحذف حتى لا تشوّه الدعم والمؤشرات"""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+        if len(df) and df.index[-1].date() == now.date() and (now.hour * 60 + now.minute) < 570:
+            return df.iloc[:-1]
+    except Exception:
+        pass
+    return df
+
 
 def post_split_runup(hist, anchor_date, explode_runup=80.0, explode_day=50.0):
     """هل انفجر السهم منذ التقسيم؟
@@ -1679,6 +1707,8 @@ with tab3:
     split_only = uni_mode.startswith("🔀")
     not_exploded_only = st.checkbox("لم ينفجر بعد التقسيم فقط (لا صعود ≥80% ولا يوم ≥50% منذ التقسيم)",
                                     value=True, disabled=not split_only, key="not_exploded")
+    show_unconfirmed = st.checkbox("إظهار غير المؤكد (إفصاحات تذكر التقسيم دون دليل تنفيذ)",
+                                   value=False, disabled=not split_only, key="show_unconf")
 
     if live_btn:
         split_map = {}
@@ -1686,7 +1716,9 @@ with tab3:
             with st.spinner("بحث SEC عن التقسيمات العكسية (آخر 89 يوماً + القادمة)..."):
                 split_map = sec_split_universe()
             st.session_state["split_map"] = split_map
-            all_syms, uni_src = [t for t, v in split_map.items() if v["kind"] == "done"], "SEC (تقسيم عكسي)"
+            all_syms = [t for t, v in split_map.items()
+                        if v["kind"] == "done" or (show_unconfirmed and v.get("intent"))]
+            uni_src = "SEC (تقسيم عكسي منفذ)" + (" + غير المؤكد" if show_unconfirmed else "")
             if not split_map:
                 st.error("❌ بحث SEC لم يُرجع نتائج — تحقق من SEC_UA أو الشبكة.")
         else:
@@ -1765,10 +1797,20 @@ with tab3:
                         if dead:
                             excluded_live.append({"symbol": sym, "reason": dead}); continue
 
-                        psr, anchor_src = None, None
+                        psr, anchor_src, split_conf = None, None, None
                         if split_only:
                             rs = detect_reverse_split(splits_raw, max_days=SPLIT_MAX_DAYS)
                             ss = split_map.get(sym) or {}
+                            if splits_raw and not rs.get("has_split"):
+                                # البروكسي أرجع سجل تقسيمات ولا تقسيم عكسي خلال المدة → هو الحَكَم
+                                excluded_live.append({"symbol": sym, "reason": f"البروكسي: لا تقسيم عكسي خلال {SPLIT_MAX_DAYS} يوماً"})
+                                continue
+                            if rs.get("has_split"):
+                                split_conf = f"✅ مؤكد {rs['ratio']}"
+                            elif ss.get("strength") == "likely":
+                                split_conf = "🟡 مرجّح (SEC)"
+                            else:
+                                split_conf = "⚪ غير مؤكد"
                             anchor, anchor_src = (rs["date"], "البروكسي") if rs.get("has_split") else (ss.get("date"), "إفصاح SEC")
                             psr = post_split_runup(hist, anchor) if anchor else None
                             if psr is not None:
@@ -1813,7 +1855,7 @@ with tab3:
                             "support": r["support"], "dist_sup": r["dist_sup"],
                             "fam": fam, "verdict": r["verdict"], "src": src,
                             "stability": bool(r["stability"]), "tech": technical_trigger(hist, r),
-                            "sec_split": split_map.get(sym), "psr": psr,
+                            "sec_split": split_map.get(sym), "psr": psr, "split_conf": split_conf,
                         })
                     except Exception: continue
 
@@ -1859,6 +1901,7 @@ with tab3:
                     "بُعد الدعم": f"{x['dist_sup']:+.1f}%" if x.get("dist_sup") is not None else "—",
                     "ثبات": "✅" if x.get("stability") else "—",
                     "زناد": "🎯" if x.get("tech") else "—",
+                    "التقسيم": x.get("split_conf") or "—",
                     "منذ التقسيم": (f"{x['psr']['sessions']} جلسة · أقصى +{x['psr']['runup_pct']}%" if x.get("psr") else "—"),
                     "الفصيلة": " | ".join(x["fam"][:2]) if x["fam"] else "—",
                 })
@@ -1893,9 +1936,10 @@ with tab3:
 
             upc = {t: v for t, v in st.session_state.get("split_map", {}).items() if v["kind"] == "upcoming"}
             if upc:
-                with st.expander(f"🗳️ تقسيمات قادمة — دعوات تصويت ({len(upc)})"):
+                with st.expander(f"🗳️ تقسيمات قادمة أو محتملة ({len(upc)})"):
                     st.caption("شركات تطلب موافقة المساهمين على تقسيم عكسي. لا تحليل الآن — راقبها لتبدأ دورة ما بعد التقسيم من يومها الأول.")
-                    st.dataframe(pd.DataFrame([{"الرمز": t, "النموذج": v["form"], "التاريخ": v["date"]}
+                    st.dataframe(pd.DataFrame([{"الرمز": t, "النوع": "نية/إشعار" if v.get("intent") else "دعوة تصويت",
+                                                "النموذج": v["form"], "التاريخ": v["date"]}
                                                for t, v in sorted(upc.items(), key=lambda kv: kv[1]["date"], reverse=True)]),
                                  use_container_width=True, hide_index=True)
             if excluded_live:
